@@ -1,5 +1,6 @@
 """NodeCircle CRUD + manual rotation trigger."""
 import json
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,8 @@ from app.models import Node, NodeCircle
 from app.schemas import NodeCircleCreate, NodeCircleRead, NodeCircleUpdate
 
 router = APIRouter(prefix="/nodecircle", tags=["nodecircle"])
+
+logger = logging.getLogger(__name__)
 
 # Hard cap on per-node latency for circle membership (since v1.4.7).
 # A NodeCircle rotates between its members on a schedule — high-RTT
