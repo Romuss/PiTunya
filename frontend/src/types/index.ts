@@ -70,6 +70,9 @@ export interface Node {
   last_check?: string
   is_online: boolean
   order: number
+  // v1.5.0 — speed test results
+  speed_mbps?: number | null
+  last_speed_test?: string | null
   chain_node_id?: number | null
   // Optional link to a Server (the VPS hosting this node's upstream).
   // Purely informational — does not affect routing/connection.

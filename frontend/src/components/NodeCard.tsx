@@ -111,6 +111,31 @@ export function NodeCard({
             </div>
             <div className="mt-2 flex items-center gap-2 flex-wrap">
               <StatusBadge online={node.is_online} latency={node.latency_ms ?? undefined} />
+              {/* v1.5.0 — speed test result badge */}
+              {node.speed_mbps != null && node.speed_mbps > 0 ? (
+                <span
+                  className={clsx(
+                    'inline-flex items-center gap-1 text-xs font-mono',
+                    node.speed_mbps >= 5 ? 'text-green-400'
+                    : node.speed_mbps >= 1 ? 'text-yellow-400'
+                    : 'text-red-400',
+                  )}
+                  title={node.last_speed_test
+                    ? `Last tested: ${new Date(node.last_speed_test).toLocaleString()}`
+                    : 'Speed test result'}
+                >
+                  <Zap className="h-3 w-3" />
+                  {node.speed_mbps >= 100
+                    ? `${Math.round(node.speed_mbps)} MB/s`
+                    : `${node.speed_mbps.toFixed(1)} MB/s`}
+                </span>
+              ) : null}
+              {speedLoading && (
+                <span className="inline-flex items-center gap-1 text-xs font-mono text-blue-400">
+                  <Zap className="h-3 w-3 animate-pulse" />
+                  testing…
+                </span>
+              )}
               {/* Source label — "from <server name>" — for nodes
                   exported from a server-side multi-client deployment
                   (WireGuard, since v1.3.0-beta.4). */}
