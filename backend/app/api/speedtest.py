@@ -1,22 +1,18 @@
 """Node speed test endpoint (v1.5.0).
 
 Downloads a fixed-size test file through the node's outbound via
-PiTun's SOCKS5 inbound (port 1080) and measures throughput in
-megabytes per second. The result is persisted on the Node row as
-`speed_mbps` + `last_speed_test` and used by the smart-rotation
-logic in circle_scheduler to decide whether to skip rotation.
+PiTun's SOCKS5 inbound (port 1080) and measures throughput.
 """
 import asyncio
 import logging
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import select
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.database import get_session, get_async_engine
-from app.models import Node
+from app.database import get_async_engine
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -28,27 +24,18 @@ router = APIRouter()
 
 
 async def _speed_test_via_socks(node_id: int, socks_port: int) -> float:
-    """Download via SOCKS5 and return MB/s."""
     import httpx
-
     socks_url = f"socks5://127.0.0.1:{socks_port}"
     start = time.monotonic()
     try:
-        async with httpx.AsyncClient(
-            proxy=socks_url,
-            timeout=_TEST_TIMEOUT,
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(proxy=socks_url, timeout=_TEST_TIMEOUT, follow_redirects=True) as client:
             resp = await client.get(_TEST_URL)
             resp.raise_for_status()
             elapsed = time.monotonic() - start
             total_bytes = int(resp.headers.get("content-length", len(resp.content)))
             if elapsed > 0 and total_bytes > 0:
                 mbps = (total_bytes / 1_000_000) / elapsed
-                logger.info(
-                    "Speed test node %d: %.1f MB/s (%d bytes in %.2fs)",
-                    node_id, mbps, total_bytes, elapsed,
-                )
+                logger.info("Speed test node %d: %.1f MB/s", node_id, mbps)
                 return round(mbps, 1)
             return 0.0
     except Exception as exc:
@@ -56,69 +43,52 @@ async def _speed_test_via_socks(node_id: int, socks_port: int) -> float:
         return 0.0
 
 
+async def _save_speed_result(node_id: int, speed: float) -> str:
+    """Save speed result via raw SQL — avoids all ORM greenlet issues."""
+    async with AsyncSession(get_async_engine()) as session:
+        result = await session.exec(
+            text("UPDATE node SET speed_mbps = :speed, last_speed_test = :ts WHERE id = :id"),
+            params={"speed": speed, "ts": datetime.now(tz=timezone.utc), "id": node_id},
+        )
+        await session.commit()
+        # Fetch name via raw SQL too
+        row = (await session.exec(
+            text("SELECT name FROM node WHERE id = :id"),
+            params={"id": node_id},
+        )).first()
+        return row[0] if row else "?"
+
+
 @router.post("/nodes/{node_id}/speed-test")
-async def speed_test_node(
-    node_id: int,
-):
-    """Run a speed test on a specific node.
-
-    Opens its own AsyncSession instead of using Depends(get_session)
-    — the dependency-injected session can hit MissingGreenlet when
-    the speed test's httpx await overlaps with session update.
-    """
+async def speed_test_node(node_id: int):
+    """Run a speed test on a specific node."""
     socks_port = int(settings.socks_port)
-
-    # Run the download first (no DB interaction during it)
     start = time.monotonic()
     speed = await _speed_test_via_socks(node_id, socks_port)
     duration = time.monotonic() - start
-
-    # Open a fresh session for the DB update — avoids greenlet issues
-    # that arise from mixing httpx awaits with the dependency-injected
-    # session's connection lifecycle.
-    from sqlmodel.ext.asyncio.session import AsyncSession
-    async with AsyncSession(get_async_engine()) as session:
-        node = (await session.exec(
-            select(Node).where(Node.id == node_id)
-        )).first()
-        if not node:
-            raise HTTPException(404, "Node not found")
-
-        node.speed_mbps = speed
-        node.last_speed_test = datetime.now(tz=timezone.utc)
-        session.add(node)
-        await session.commit()
-
+    name = await _save_speed_result(node_id, speed)
     return {
         "speed_mbps": speed,
         "duration_s": round(duration, 2),
         "node_id": node_id,
-        "node_name": node.name if node else "?",
+        "node_name": name,
     }
 
 
 @router.post("/nodes/speed-test-all")
 async def speed_test_all():
     """Run speed tests on all enabled nodes sequentially."""
-    from sqlmodel.ext.asyncio.session import AsyncSession
-
+    from sqlalchemy import text as sql_text
     async with AsyncSession(get_async_engine()) as session:
-        nodes = (await session.exec(
-            select(Node).where(Node.enabled == True)  # noqa: E712
-            .order_by(Node.latency_ms.asc().nulls_last())
+        rows = (await session.exec(
+            sql_text("SELECT id, name FROM node WHERE enabled = 1 ORDER BY latency_ms ASC NULLS LAST")
         )).all()
 
-        results = []
-        for node in nodes:
-            speed = await _speed_test_via_socks(node.id, int(settings.socks_port))
-            node.speed_mbps = speed
-            node.last_speed_test = datetime.now(tz=timezone.utc)
-            session.add(node)
-            results.append({
-                "node_id": node.id,
-                "node_name": node.name,
-                "speed_mbps": speed,
-            })
+    results = []
+    for row in rows:
+        nid, nm = row[0], row[1]
+        speed = await _speed_test_via_socks(nid, int(settings.socks_port))
+        await _save_speed_result(nid, speed)
+        results.append({"node_id": nid, "node_name": nm, "speed_mbps": speed})
 
-        await session.commit()
     return {"results": results, "total": len(results)}
