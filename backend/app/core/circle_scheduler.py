@@ -335,6 +335,18 @@ class CircleScheduler:
                     "speed_mbps": cand.speed_mbps,
                 })
 
+            # v1.5.0 — if min_speed_mbps > 0, filter out candidates whose
+            # measured speed is below the threshold. Only consider nodes that
+            # either haven't been speed-tested (None = unknown = allowed) or
+            # have measured speed >= min_speed_mbps.
+            min_speed_threshold = getattr(circle, 'min_speed_mbps', 0) or 0
+            if min_speed_threshold > 0:
+                filtered = [c for c in all_candidates if (c['speed_mbps'] is None or c['speed_mbps'] >= min_speed_threshold)]
+                if filtered:
+                    all_candidates = filtered  # only use qualifying candidates
+                # if ALL candidates are below threshold, keep them all
+                # (better to rotate to a slow node than keep a dead one)
+
             # Sort by quality: online first, then lowest latency, then highest speed
             all_candidates.sort(key=lambda c: (
                 not c["is_online"],          # online = False sorts after online = True
