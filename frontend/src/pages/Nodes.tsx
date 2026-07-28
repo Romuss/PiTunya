@@ -192,8 +192,14 @@ export function Nodes() {
       onSuccess: (r) => {
         setSpeedResults((prev) => ({
           ...prev,
-          [node.id]: r.download_mbps != null ? `${r.download_mbps} Mbps` : r.error ?? 'failed',
+          [node.id]: r.speed_mbps != null && r.speed_mbps > 0
+            ? `${r.speed_mbps} MB/s`
+            : 'failed',
         }))
+        // Invalidate nodes query so the speed_mbps field refreshes
+        // and the badge in NodeCard picks up the new value.
+        qc.invalidateQueries({ queryKey: ['nodes'] })
+        qc.invalidateQueries({ queryKey: ['nodesPage'] })
       },
       onError: () => {
         setSpeedResults((prev) => ({ ...prev, [node.id]: 'error' }))

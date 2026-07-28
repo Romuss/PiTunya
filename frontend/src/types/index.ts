@@ -639,7 +639,8 @@ export interface HealthResult {
 export interface SpeedTestResult {
   node_id: number
   node_name: string
-  download_mbps?: number
+  speed_mbps?: number
+  duration_s?: number
   error?: string
 }
 
