@@ -97,9 +97,18 @@ async def _refresh_naive_tproxy_bypass(session: AsyncSession) -> None:
 async def list_nodes(
     enabled: Optional[bool] = Query(None),
     group: Optional[str] = Query(None),
+    sort: str = Query("default", pattern="^(default|quality)$"),
     session: AsyncSession = Depends(get_session),
 ):
-    stmt = select(Node).order_by(Node.order, Node.id)
+    if sort == "quality":
+        stmt = select(Node).order_by(
+            Node.is_online.desc(),
+            Node.speed_mbps.desc().nulls_last(),
+            Node.latency_ms.asc().nulls_last(),
+            Node.id,
+        )
+    else:
+        stmt = select(Node).order_by(Node.order, Node.id)
     if enabled is not None:
         stmt = stmt.where(Node.enabled == enabled)
     if group is not None:
@@ -148,6 +157,16 @@ async def list_nodes_paginated(
             "imports where the operator wants to see what just landed. "
             "`asc` reverses to oldest-first. `Node.order` stays the "
             "primary sort key either way so drag-to-reorder still wins."
+        ),
+    ),
+    sort: str = Query(
+        "default",
+        pattern="^(default|quality)$",
+        description=(
+            "v1.5.0 — 'quality' sorts by combined availability + speed "
+            "+ latency: online first, then highest speed_mbps, then "
+            "lowest latency_ms. Overrides 'direction' / 'order' when "
+            "active. 'default' preserves the prior order-by behavior."
         ),
     ),
     session: AsyncSession = Depends(get_session),
@@ -199,8 +218,16 @@ async def list_nodes_paginated(
     # column is always the primary sort axis so manual drag-to-reorder
     # placement wins; `id` is just the tiebreaker for rows with equal
     # `order` values (subscription imports leave that field at 0).
-    id_axis = Node.id.desc() if direction == "desc" else Node.id.asc()  # type: ignore[union-attr]
-    stmt = select(Node).order_by(Node.order, id_axis)
+    if sort == "quality":
+        stmt = select(Node).order_by(
+            Node.is_online.desc(),
+            Node.speed_mbps.desc().nulls_last(),
+            Node.latency_ms.asc().nulls_last(),
+            Node.id,
+        )
+    else:
+        id_axis = Node.id.desc() if direction == "desc" else Node.id.asc()  # type: ignore[union-attr]
+        stmt = select(Node).order_by(Node.order, id_axis)
     for f in base_filters:
         stmt = stmt.where(f)
     if limit > 0:
