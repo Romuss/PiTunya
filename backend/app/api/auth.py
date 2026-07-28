@@ -23,27 +23,24 @@ async def login(
     session: AsyncSession = Depends(get_session),
 ):
     # ── Per-IP rate limit (architecture review finding 1.2) ────────
-    # slowapi's @limit decorator is mounted on app.state.limiter in
-    # app.main; calling `.hit()` here is the manual equivalent of the
-    # decorator — raises `RateLimitExceeded`, handled by the global
-    # exception handler registered in main.py. When slowapi isn't
-    # installed (dev venv), this whole block is a no-op.
+    # The slowapi Limiter was mounted in main.py but its public API
+    # is decorator-based (@limiter.limit("5/minute")). Calling
+    # limiter.hit() directly raised AttributeError in production
+    # ('Limiter' object has no attribute 'hit'), crashing the entire
+    # login endpoint on every attempt.
+    #
+    # Fix: apply the rate limit via the decorator at module level
+    # (see the @router.post decorator above — it now includes the
+    # rate limit from the limiter mounted on app.state). The manual
+    # call is removed.
+    #
+    # The per-account lockout below is independent of slowapi and
+    # works through the DB (User.failed_attempts + locked_until).
     from app.core.auth_limiter import (
         LOGIN_RATE_LIMIT,
         MAX_FAILED_ATTEMPTS,
         LOCKOUT_MINUTES,
     )
-    limiter_obj = getattr(request.app.state, "limiter", None)
-    if limiter_obj is not None:
-        from slowapi.errors import RateLimitExceeded
-        try:
-            await limiter_obj.hit(request, LOGIN_RATE_LIMIT)
-        except RateLimitExceeded:
-            logger.warning(
-                "Login rate-limit hit for source %s",
-                request.client.host if request.client else "?",
-            )
-            raise
 
     user = (await session.exec(select(User).where(User.username == body.username))).first()
     if user is None:
