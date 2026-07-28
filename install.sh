@@ -111,7 +111,7 @@
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
-GITHUB_REPO="DaveBugg/PiTun"
+GITHUB_REPO="${PITUN_REPO:-DaveBugg/PiTun}"
 INSTALL_DIR="${PITUN_DIR:-/opt/pitun}"
 VERSION="${PITUN_VERSION:-latest}"
 USE_BUILD="${PITUN_BUILD:-0}"
@@ -178,10 +178,20 @@ while [[ $# -gt 0 ]]; do
         --ipv6)            PITUN_FORCE_IPV6=1; shift ;;
         --fix-blockers)    FIX_BLOCKERS=1; shift ;;
         --dry-run)         DRY_RUN=1; shift ;;
+        --repo)            GITHUB_REPO="$2"; shift 2 ;;
+        --branch)          PITUN_BRANCH="$2"; shift 2 ;;
         --help|-h)         print_help ;;
         *) error "Unknown option: $1 (use --help)" ;;
     esac
 done
+
+# Finalise branch env (used by the source-tarball fetcher when no
+# release tag matches VERSION). Master is the fallback — the prior
+# behaviour — but operators using a fork like Romuss/PiTunya can now
+# specify `--branch v1.4.7` or `PITUN_BRANCH=v1.4.7` instead.
+PITUN_BRANCH="${PITUN_BRANCH:-master}"
+</parameter>
+<parameter name="path">PiTun/install.sh</parameter>
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "Run as root: sudo bash $0 [...]"
@@ -731,9 +741,9 @@ if [[ -z "$OFFLINE_DIR" ]] || [[ ! -e "$SRC_TARBALL" ]] || [[ "$USE_BUILD" != "1
         # Got here because USE_BUILD was set explicitly and we skipped
         # release resolution — there's no resolved tag to download an
         # archive from. Use the master branch instead.
-        info "No version resolved — using master branch tarball"
-        src_url="https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/master"
-        SRC_DESC="PiTun source (master)"
+        info "No version resolved — using ${PITUN_BRANCH} branch tarball"
+        src_url="https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/${PITUN_BRANCH}"
+        SRC_DESC="PiTun source (${PITUN_BRANCH})"
     else
         src_url="https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/tags/${VERSION}"
         SRC_DESC="PiTun source ($VERSION)"
