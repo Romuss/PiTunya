@@ -190,8 +190,6 @@ done
 # behaviour — but operators using a fork like Romuss/PiTunya can now
 # specify `--branch v1.4.7` or `PITUN_BRANCH=v1.4.7` instead.
 PITUN_BRANCH="${PITUN_BRANCH:-master}"
-</parameter>
-<parameter name="path">PiTun/install.sh</parameter>
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "Run as root: sudo bash $0 [...]"
