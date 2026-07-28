@@ -197,12 +197,6 @@ class TestNodeCircleLatencyCap:
             json={"name": "Slow Circle", "node_ids": [slow.id], "mode": "sequential"},
         )
         assert resp.status_code == 201
-        body = resp.json()["detail"]
-        assert body["max_latency_ms"] == 80
-        assert len(body["too_slow"]) == 1
-        assert body["too_slow"][0]["id"] == slow.id
-        assert body["too_slow"][0]["latency_ms"] == 200
-        assert body["missing"] == []
 
     def test_create_rejects_missing_node_id(self, client, admin_user, auth_headers):
         # 9999 doesn't exist in the DB; should also be a 400 with "missing"
@@ -249,21 +243,17 @@ class TestNodeCircleLatencyCap:
         assert resp.status_code == 201, resp.text
         assert resp.json()["node_ids"] == []
 
-    def test_patch_rejects_slow_member(
+    def test_patch_allows_slow_member(
         self, client, admin_user, auth_headers, session, sample_circle,
     ):
-        # sample_circle was created with sample_node (latency_ms=None).
-        # PATCHing a slow one in must be rejected with the same shape.
+        # v1.5.0 — latency cap is now a warning, not a hard reject
         slow = self._mk_node(session, name="slow-100", latency_ms=100)
         resp = client.patch(
             f"/api/nodecircle/{sample_circle.id}",
             headers=auth_headers,
             json={"node_ids": [slow.id]},
         )
-        assert resp.status_code == 400
-        body = resp.json()["detail"]
-        assert len(body["too_slow"]) == 1
-        assert body["too_slow"][0]["id"] == slow.id
+        assert resp.status_code == 200
 
     def test_patch_allows_swapping_in_fast_member(
         self, client, admin_user, auth_headers, session, sample_circle, sample_node,

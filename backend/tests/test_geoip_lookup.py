@@ -360,9 +360,9 @@ async def test_subscription_refresh_enriches_generic_names(
     import asyncio
     for _ in range(20):
         await asyncio.sleep(0.1)
-        rows = (await session.exec(
+        rows = list(session.exec(
             select(Node).where(Node.subscription_id == r.json()["id"])
-        )).all()
+        ))
         if rows:
             break
 
