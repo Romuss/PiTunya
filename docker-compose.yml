@@ -126,6 +126,11 @@ services:
     container_name: pitun-nginx
     restart: unless-stopped
     ports:
+      # When COMPOSE_PROFILES=tls is enabled, the https service takes
+      # over :443 and nginx only listens on :80 (for redirect + HTTP
+      # fallback during the caddy-cert bootstrap window). Without the
+      # profile, nginx owns :80 as before. There's no behaviour
+      # change for default installs.
       - "80:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
@@ -144,3 +149,59 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # ── Optional TLS terminator (architecture review 2.2) ──────────────────
+  # Enable via `COMPOSE_PROFILES=tls` in .env or on the docker compose
+  # command line. caddy fronts :443 with an internal CA (or user-
+  # supplied cert) and reverse-proxies to the plain nginx :80. Closes
+  # the "admin password + JWT travel plaintext on the LAN" risk
+  # inherent to the default `listen 80` setup.
+  #
+  # Two modes supported via Caddyfile.tls:
+  #   * Internal CA — caddy auto-generates and rotates a self-signed
+  #     cert matching `https://pitun.<domain>` (mTLS optional via
+  #     `client_auth`). Browsers will warn once; OS-level trust
+  #     install is one step. Good for home LAN.
+  #   * External cert — operator supplies a fullchain.pem + privkey.pem
+  #     via `PITUN_TLS_CERT` + `PITUN_TLS_KEY` environment + bind-mount,
+  #     which caddy uses directly. Good when the operator has a real
+  #     domain pointed at the box and a LE cert (caddy can also do
+  #     its own ACME if the box is internet-reachable, but that's a
+  #     deployment-specific call).
+  #
+  # Once the profile is on, clients use https://pitun.<host> instead of
+  # http://pitun.<host>. Auto-redirect from :80 is handled by nginx
+  # (a 301 to https) via the included nginx-tls.conf snippet, mounted
+  # as a second config file when the profile is active. Default
+  # installs keep the original nginx.conf.
+  https:
+    profiles: ["tls"]
+    image: caddy:2.8-alpine
+    container_name: pitun-https
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"  # only used when caddy is also doing ACME (public IP)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data  # persistent internal-CA store + ACME state
+      - ./data/caddy-config:/config
+    environment:
+      # Optional operator-supplied cert (fullchain + key paths inside
+      # the container, bind-mounted by the operator). When both are
+      # present and non-empty, Caddyfile.tls prefers them over the
+      # internal CA.
+      - PITUN_TLS_CERT=${PITUN_TLS_CERT:-}
+      - PITUN_TLS_KEY=${PITUN_TLS_KEY:-}
+      # The hostname caddy serves TLS for — matches what browsers
+      # will be pointed at. Defaults to the bare IP, which gets an
+      # internal-CA cert (browsers warn but accept).
+      - PITUN_TLS_HOST=${PITUN_TLS_HOST:-pitun.local}
+    depends_on:
+      nginx:
+        condition: service_started
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"

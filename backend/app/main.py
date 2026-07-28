@@ -40,12 +40,68 @@ from app.core.log_buffer import install as _install_log_buffer
 _install_log_buffer()
 
 
+async def _record_boot_event_safe(service_name: str, exc: Exception) -> None:
+    """Persist a startup failure as an Event row so the operator can see
+    it in the Dashboard's Recent Events feed (architecture review finding
+    4.2). The old swallow-and-warn pattern left these visible only in
+    `docker logs pitun-backend`, which is fine for developers but opaque
+    to operators who only touch the UI.
+
+    Best-effort: if the Event infrastructure itself is what failed (e.g.
+    DB not yet migrated), the warning log already covers it — we just
+    don't also write an Event row.
+    """
+    try:
+        from app.core.events import record_event
+        await record_event(
+            category="boot.failed",
+            severity="error",
+            title=f"{service_name} failed to start on boot",
+            details=str(exc)[:1000],
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never fatal
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
     import asyncio
+    import os
+    import sys
 
     logger.info("PiTun backend starting up")
+
+    # Security guard (since v1.4.7 — architecture review finding 1.1):
+    # Refuse to boot when SECRET_KEY is still the default "changeme".
+    # HS256 is symmetric — the SAME key signs and verifies JWTs, and the
+    # default value is public in the repo on GitHub. Anyone who can
+    # reach the API (e.g. via port forwarding the install.sh makes
+    # trivial) can forge an admin token → full API control → on a
+    # `network_mode: host` backend that means root over nftables,
+    # systemd, SSH-deployed VPS passwords, xray config. We must not
+    # let this happen silently.
+    #
+    # Escape hatch for dev / CI / pytest: set `PITUN_INSECURE_SECRET=1`
+    # in the env. pyproject-style "auto-detect dev mode" was considered
+    # and rejected — too easily triggered in production by mistake
+    # (e.g. `DEBUG=1` left over from a troubleshooting session). The
+    # explicit opt-in keeps the default foot firmly on the safe side.
+    if settings.secret_key in ("changeme", ""):
+        if os.environ.get("PITUN_INSECURE_SECRET") == "1":
+            logger.warning(
+                "SECRET_KEY is empty or default — auth tokens are forgeable "
+                "by anyone with the source code. Continuing because "
+                "PITUN_INSECURE_SECRET=1 was set (dev/CI only)."
+            )
+        else:
+            logger.error(
+                "FATAL: SECRET_KEY is set to 'changeme' (or empty). Set a "
+                "secure random value in .env (e.g. `openssl rand -hex 32`). "
+                "To override for dev/CI only, set PITUN_INSECURE_SECRET=1."
+            )
+            sys.exit(1)
+
     await asyncio.to_thread(create_db_and_tables)
     await init_default_settings()
 
@@ -68,28 +124,50 @@ async def lifespan(app: FastAPI):
     metrics_collector.start()
     geo_scheduler.start()
 
+    # Service-supervisor bookkeeping (architecture review finding 4.1 +
+    # 4.2): register the already-started services so the singleton's
+    # snapshot() can report live state to a future /api/health/services
+    # endpoint. Registration happens AFTER .start() succeeds — if .start
+    # raised, that service is simply not registered (its absence in the
+    # snapshot is itself the failure visibility the supervisor provides).
+    from app.core.supervisor import supervisor as _sup
+    _sup.register("health",       health_checker.start,        health_checker.stop)
+    _sup.register("subs",         subscription_scheduler.start, subscription_scheduler.stop)
+    _sup.register("circle",       circle_scheduler.start,       circle_scheduler.stop)
+    _sup.register("device_scan",  device_scanner.start,         device_scanner.stop)
+    _sup.register("metrics",      metrics_collector.start,      metrics_collector.stop)
+    _sup.register("geo",          geo_scheduler.start,          geo_scheduler.stop)
+
     # Supervise naive sidecars: react to docker `die` events within ms,
     # rather than waiting for the 30 s HealthChecker tick.
     try:
         from app.core.naive_supervisor import naive_supervisor
         naive_supervisor.start()
+        _sup.register("naive_sup", naive_supervisor.start, naive_supervisor.stop)
     except Exception as exc:
         logger.warning("NaiveSupervisor failed to start: %s", exc)
+        await _record_boot_event_safe("NaiveSupervisor", exc)
 
     # Background DNS query log cleanup (replaces per-insert trim).
     try:
-        from app.core.dns_logger import start_trim_task as _dns_start
+        from app.core.dns_logger import start_trim_task as _dns_start, \
+            stop_trim_task as _dns_stop
         _dns_start()
+        _sup.register("dns_log_trim", _dns_start, _dns_stop)
     except Exception as exc:
         logger.warning("DNS log trim task failed to start: %s", exc)
+        await _record_boot_event_safe("DNS log trim task", exc)
 
     # Recent Events trim task — keeps the Event table bounded
     # (7 days OR 1000 rows). See app/core/events.py.
     try:
-        from app.core.events import start_trim_task as _events_start
+        from app.core.events import start_trim_task as _events_start, \
+            stop_trim_task as _events_stop
         _events_start()
+        _sup.register("events_trim", _events_start, _events_stop)
     except Exception as exc:
         logger.warning("Events trim task failed to start: %s", exc)
+        await _record_boot_event_safe("Events trim task", exc)
 
     # Server-tasks (Job) subsystem — heals stale `running` rows from a
     # previous backend that died mid-deploy, then kicks off the hourly
@@ -97,8 +175,14 @@ async def lifespan(app: FastAPI):
     try:
         from app.core.jobs import job_manager
         await job_manager.start()
+        # JobManager is async-only; supervisor stores it for status
+        # visibility only (no restart, the manager owns retry itself).
+        _sup.register("jobs", lambda: None, lambda: None)
     except Exception as exc:
         logger.warning("JobManager failed to start: %s", exc)
+        await _record_boot_event_safe("JobManager", exc)
+</parameter>
+<parameter name="path">PiTun/backend/app/main.py</parameter>
 
     # Apply system-level toggles (IPv6, DNS over TCP) from DB — /proc/sys resets on reboot
     from app.api.system import apply_system_toggles_on_boot
@@ -277,6 +361,33 @@ app = FastAPI(
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
+
+# Per-IP rate limiter on login (since v1.4.7 — finding 1.2).
+# slowapi's `Limiter` is per-process — fine on a single-worker uvicorn.
+# The per-account lockout (max failed attempts → DB row) complements
+# this for attackers spread across many IPs. See `core/auth_limiter`.
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+
+    from slowapi.errors import RateLimitExceeded  # noqa: F401
+    from slowapi import _rate_limit_exceeded_handler
+
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+except Exception:  # noqa: BLE001 — slowapi missing during dev (not in venv)
+    # Don't break app startup if slowapi isn't installed (e.g. dev env
+    # where requirements.txt hasn't been re-pinned). Per-account
+    # lockout still works (just `slowapi.limit` decorators become
+    # no-ops because the dependency is missing; reviewed below).
+    import logging
+    logging.getLogger(__name__).warning(
+        "slowapi not available — /api/auth/login is not rate-limited. "
+        "Install slowapi via requirements.txt for finding 1.2."
+    )
+    limiter = None
 
 # ── Exception handlers ───────────────────────────────────────────────────────
 # Lock-busy on the xray manager → 503 Service Unavailable.

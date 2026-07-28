@@ -20,3 +20,16 @@ docker==7.1.0
 # is already pulled in transitively by python-jose. Pinned to 2.x — the
 # 1.x line had several auth bugs we don't want to accidentally regress to.
 asyncssh==2.23.0
+# slowapi: rate-limiter used to cap /api/auth/login to 5/min per IP
+# (architecture review finding 1.2). Without this, an attacker who can
+# reach port 80 can brute force the single admin user indefinitely —
+# bcrypt slows each attempt (~0.1s) but there's no exponential backoff,
+# no captcha, no throttle. slowapi also backs the optional API-wide
+# rate limiter (Postgres-backed lockout row in `User.failed_attempts`).
+slowapi==0.1.9
+# maxminddb: pure-Python MaxMind DB reader used by `app.core.geoip_lookup`
+# for the subscription-name enrichment (country flag + protocol + address).
+# Reads the GeoLite2-Country.mmdb bind-mounted from the host at
+# `settings.geoip_mmdb_path`. Lazy-imported at first lookup so the backend
+# still starts when the .mmdb file is missing (offline / pre-geodata-download).
+maxminddb==2.7.0

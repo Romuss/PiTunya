@@ -318,10 +318,17 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         err_msg: str = ""
 
         try:
+            # `allow_insecure` is per-subscription since v1.4.7 (finding
+            # 1.3). Default False → verify is on; subscriptions whose
+            # panel runs a self-signed cert must explicitly opt in via
+            # the UI / API. The blanket `verify=False` here was the
+            # worst credential-leak path in the project — it let any
+            # MITM between PiTun and the panel capture node UUIDs /
+            # panel credentials from the headers + response body.
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=30,
-                verify=False,  # many self-hosted panels use self-signed certs
+                verify=not getattr(sub, "allow_insecure", False),
             ) as client:
                 resp = await client.get(sub.url, headers=headers)
                 resp.raise_for_status()
@@ -466,6 +473,44 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
                 "(same fingerprint, different SNI/fp variants)",
                 sub_id, parsed_dedup_skipped,
             )
+
+        # ── Name enrichment (since v1.4.7) ─────────────────────────────
+        # Many panels (Happ, xtool, marzban, etc.) ship every node with a
+        # generic name — "proxy", "proxy-1", "Proxy 2", blank, "node-N".
+        # In the UI that becomes 10-1000 rows that look identical and the
+        # operator can't pick the right one. Enrich those generic names to
+        # "<protocol>-<🇩🇪>-<addr>:<port>" using the GeoLite2 mmdb already
+        # bind-mounted for xray geoip rules. Names that look meaningful
+        # ("Tokyo-1", "Frankfurt", "Happ/iOS", …) are kept verbatim — we
+        # never overwrite a name the operator (or a polite panel) curated.
+        # See `app.core.geoip_lookup.enrich_node_name` for the full
+        # rule list. Best-effort: if the mmdb file is missing (offline
+        # install, pre-GeoData-download) the flag is omitted and the
+        # name still gets "<protocol>-<addr>:<port>" — better than
+        # "proxy-3" any day.
+        try:
+            from app.core.geoip_lookup import enrich_node_name
+            enriched_count = 0
+            for n in parsed:
+                original = n.get("name", "")
+                new = enrich_node_name(
+                    current_name=original,
+                    protocol=n.get("protocol", ""),
+                    address=n.get("address", ""),
+                    port=n.get("port") or 0,
+                )
+                if new != original:
+                    n["name"] = new
+                    enriched_count += 1
+            if enriched_count:
+                logger.info(
+                    "Subscription %d: enriched %d generic node names to "
+                    "'<protocol>-<flag>-<addr>:<port>'",
+                    sub_id, enriched_count,
+                )
+        except Exception as exc:
+            # Enrichment must never block a refresh — name is cosmetic.
+            logger.warning("Subscription %d: name enrichment skipped: %s", sub_id, exc)
 
         old_nodes = (await session.exec(
             select(Node).where(Node.subscription_id == sub_id)

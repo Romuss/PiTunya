@@ -167,10 +167,26 @@ async def init_default_settings():
         "bypass_cn_dns": "false",
         "bypass_ru_dns": "false",
         "bypass_private": "true",
+        # DNS upstream route (since v1.4.7 — finding 3.1). Default
+        # "direct" preserves the existing fire-and-forget DNS-ride-the-
+        # host path (robust against VPN flakiness). Operators in
+        # censorship-sensitive environments who want to hide cleartext
+        # DNS queries from their ISP can flip this to "proxy" — the
+        # resolver's own connection then rides the active xray outbound,
+        # visible only to the upstream exit node.
+        # Values: "direct" | "proxy" | "node:<id>".
+        "dns_route_via": "direct",
         "log_level": settings.xray_log_level,
         "geoip_url": settings.geoip_url,
         "geosite_url": settings.geosite_url,
         "geoip_mmdb_url": settings.geoip_mmdb_url,
+        # v1.4.7 — finding 3.5. Default False: box-local app traffic
+        # (subscription/xui httpx fetches, etc.) goes DIRECT, not via
+        # the active xray outbound. Prevents panel IPs from leaking
+        # to the upstream VPN provider's logs and makes verify=True
+        # sufficient for TLS protection. Operators who want the box
+        # itself tunneled can flip via /settings.
+        "proxy_local_apps": "false",
         "inbound_mode": "tproxy",
         "tun_address": "10.0.0.1/30",
         "tun_address6": "fd59:7153:2388::1/126",
@@ -200,7 +216,17 @@ async def init_default_settings():
         # Health check
         "health_interval": str(settings.health_interval),
         "health_timeout": str(settings.health_timeout),
-        "disable_ipv6": "false",
+        # v1.4.7 — finding 3.2: disable IPv6 by default on NEW installs.
+        # PiTun's TPROXY pipeline is IPv4-only (no ip6 nft rules). With
+        # IPv6 enabled at the kernel level, LAN clients keep their RA-
+        # advertised v6 default route and AAAA-cached domains escape
+        # through the home router → past PiTun → straight to the
+        # internet (bypassing all routing rules). Defaulting to "true"
+        # closes the leak for the common case.
+        # Existing installs keep their prior choice (init_default_
+        # settings only seeds if the row is missing). Operators who
+        # actually need IPv6 can flip this back via Settings.
+        "disable_ipv6": "true",
         "dns_over_tcp": "false",
         # LAN proxy authentication (since v1.3.0-beta.6). Applies to
         # the explicit SOCKS5 + HTTP inbounds (not TPROXY — that one

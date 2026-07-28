@@ -446,6 +446,7 @@ async def _apply_nftables(session: AsyncSession, settings_map: dict) -> str:
         block_quic=settings_map.get("block_quic", "true").lower() == "true",
         kill_switch=settings_map.get("kill_switch", "false").lower() == "true",
         routing_set_specs=routing_set_specs,
+        proxy_local_apps=settings_map.get("proxy_local_apps", "false").lower() == "true",
     )
     return inbound_mode
 
@@ -659,6 +660,10 @@ async def get_settings(session: AsyncSession = Depends(get_session)):
         geoip_url=m.get("geoip_url", ""),
         geosite_url=m.get("geosite_url", ""),
         geoip_mmdb_url=m.get("geoip_mmdb_url") or None,
+        # v1.4.7 — finding 3.1. Persisted in init_default_settings.
+        dns_route_via=m.get("dns_route_via", "direct") or "direct",
+        # v1.4.7 — finding 3.5. Default False = box-local traffic bypasses xray.
+        proxy_local_apps=m.get("proxy_local_apps", "false").lower() == "true",
         inbound_mode=m.get("inbound_mode", "tproxy"),
         tun_address=m.get("tun_address", "10.0.0.1/30"),
         tun_mtu=_int("tun_mtu", 9000),

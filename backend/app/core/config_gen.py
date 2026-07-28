@@ -686,7 +686,7 @@ def _build_dns_section(
             ip = m.group(1)
             dns_hosts[ip] = ip  # identity mapping — skip resolution
 
-    # Pin every DNS server entry to the `direct` outbound (since v1.3.5).
+    # Pin every DNS server entry to a fixed outbound (since v1.3.5).
     #
     # xray-core treats DNS-upstream connections as regular outbound dials
     # — meaning they pass through the user's routing rules. That's a
@@ -702,25 +702,54 @@ def _build_dns_section(
     #
     # The `outboundTag` field on a DNS server config is exactly the
     # escape hatch — xray short-circuits routing for THAT server's
-    # upstream connections and dials via the named outbound. Pinning
-    # to `direct` means DNS always resolves over the host's normal
-    # network path, regardless of what the user's routing rules say.
-    # Privacy-wise this is the standard pattern: DNS-over-TCP/53 is
-    # not encrypted anyway, and forcing it through the proxy adds a
-    # circular dependency (the proxy node's address itself needs to
-    # be resolved before the proxy can be used).
+    # upstream connections and dials via the named outbound.
+    #
+    # ── v1.4.7 (finding 3.1) ─────────────────────────────────────────
+    # The outbound is now `dns_route_via`-configurable:
+    #   * "direct" (default) — DNS over the host's normal path, robust
+    #     against VPN flakiness. The previous blanket pin.
+    #   * "proxy" — DNS rides the active node's outbound (same as a
+    #     `proxy` routing rule, but applied *only* to the resolver
+    #     connection, not the user's traffic that followed the
+    #     resolved IP). Hides cleartext DNS / DoH-from-the-box from
+    #     the local ISP — important under aggressive DPI regimes.
+    #   * "node:<id>" — DNS rides a *specific* node's outbound, useful
+    #     when the operator wants DNS-via-stable-VPS but proxy traffic
+    #     via a different / rotating node.
+    # Any other value falls back to "direct" (the safe default).
+    dns_route_via = settings_map.get("dns_route_via", "direct").strip() or "direct"
+    if dns_route_via not in ("direct", "proxy") and not dns_route_via.startswith("node:"):
+        # Unrecognised → safe default (don't ever emit a stray tag,
+        # xray would error out on reload and the box would go dark).
+        dns_route_via = "direct"
+    # `proxy` is xray's "follow routing rules" outbound name — but at
+    # the DNS-server-config level we want "match the active node",
+    # which xray represents as the literal tag `proxy` (see config_gen
+    # routing section). If the active_balancer is in play, xray would
+    # itself reroute; for DNS-specific use we accept simplicity.
+    if dns_route_via == "proxy":
+        dns_outbound_tag = "proxy"
+    elif dns_route_via.startswith("node:"):
+        try:
+            nid = int(dns_route_via.split(":", 1)[1])
+            dns_outbound_tag = f"node-{nid}"
+        except (ValueError, IndexError):
+            dns_outbound_tag = "direct"
+    else:
+        dns_outbound_tag = "direct"
+
     pinned_servers: List[Any] = []
     for srv in dns_servers:
         if srv == "fakedns":
             pinned_servers.append(srv)  # sentinel — no outbound
             continue
         if isinstance(srv, str):
-            pinned_servers.append({"address": srv, "outboundTag": "direct"})
+            pinned_servers.append({"address": srv, "outboundTag": dns_outbound_tag})
         elif isinstance(srv, dict):
             # Preserve any existing outboundTag (currently none, but
             # defensive against future per-server overrides).
             if "outboundTag" not in srv:
-                srv = {**srv, "outboundTag": "direct"}
+                srv = {**srv, "outboundTag": dns_outbound_tag}
             pinned_servers.append(srv)
         else:
             pinned_servers.append(srv)  # unknown shape — leave alone
@@ -1164,10 +1193,27 @@ def generate_config(
     # Why we don't strip dangerous user rules: surgical user-rule
     # rewriting is brittle and user-surprising. A system rule that
     # always wins is robust and stays explicit in the generated config.
+    # `dns_route_via` (v1.4.7 — finding 3.1): the `outboundTag` of
+    # this rule mirrors the same computation used in
+    # `_build_dns_section`. We recompute here (cheap string check)
+    # rather than carry a parameter through the helper signatures —
+    # otherwise _build_dns_section would have to thread the value
+    # through every caller. Drift risk: low, both compute the same
+    # way. Tests cover both paths.
+    _drv = settings_map.get("dns_route_via", "direct").strip() or "direct"
+    if _drv == "proxy":
+        _dns_sys_tag = "proxy"
+    elif _drv.startswith("node:"):
+        try:
+            _dns_sys_tag = f"node-{int(_drv.split(':', 1)[1])}"
+        except (ValueError, IndexError):
+            _dns_sys_tag = "direct"
+    else:
+        _dns_sys_tag = "direct"
     routing_rules.append({
         "type": "field",
         "port": "53",
-        "outboundTag": "direct",
+        "outboundTag": _dns_sys_tag,
     })
 
     if mode == "bypass":

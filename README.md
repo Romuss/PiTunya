@@ -320,6 +320,11 @@ Frontend is a single-page React app served by nginx.
   Clash YAML / xray JSON subscription URLs
 - Per-subscription User-Agent (v2ray, clash, sing-box, happ, …),
   optional regex filter, configurable interval
+- Automatic node-name enrichment — panels (Happ, xtool, marzban)
+  that ship every server with the generic name `proxy` / `proxy-N` /
+  blank are transformed into `<protocol>-<🇩🇪>-<addr>:<port>` on
+  import, using the bundled GeoLite2 mmdb for the country flag.
+  Names the operator already curated are kept verbatim.
 
 **Devices & DNS**
 - LAN discovery via `arp-scan`, OUI vendor lookup

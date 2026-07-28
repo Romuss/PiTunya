@@ -12,6 +12,91 @@ from app.schemas import NodeCircleCreate, NodeCircleRead, NodeCircleUpdate
 
 router = APIRouter(prefix="/nodecircle", tags=["nodecircle"])
 
+# Hard cap on per-node latency for circle membership (since v1.4.7).
+# A NodeCircle rotates between its members on a schedule — high-RTT
+# members make rotations visibly slow and produce perceivable stalls
+# when the active node fails over to a 200+ ms backup. Rejecting them
+# at the API boundary forces the operator to consciously populate the
+# circle with nearby servers, rather than quietly shipping a broken
+# rotation policy. The cap is hard-coded by operator choice: it
+# matches the upper bound of "feels-instant" RTT for home-LAN use.
+#
+# A node with no `latency_ms` (never health-checked yet, freshly
+# imported) is treated as 0 for this check — we don't want to block
+# fresh imports just because the health-checker hasn't run yet. The
+# first rotation tick will surface the real latency, and an offline
+# node is already filtered out by the circle scheduler when picking
+# the next candidate.
+MAX_LATENCY_MS = 80
+
+
+async def _validate_node_ids(
+    session: AsyncSession, node_ids: List[int]
+) -> None:
+    """Reject the request if any `node_ids` reference a missing Node
+    row OR a Node whose last measured latency exceeds `MAX_LATENCY_MS`.
+
+    Raises `HTTPException(400)` with a list of offenders split into
+    "missing" (id absent from DB) and "too_slow" (latency > cap) so
+    the UI can show the user exactly which rows to remove.
+
+    Idempotent — fetches all referenced Nodes in one SELECT (no N+1).
+    Skipped entirely when `node_ids` is empty (an empty circle is a
+    valid intermediate state — e.g. PATCH clearing all members while
+    the operator composes a new set; rejecting that would force them
+    to delete + recreate instead).
+    """
+    if not node_ids:
+        return
+    rows = (await session.exec(
+        select(Node.id, Node.name, Node.latency_ms).where(Node.id.in_(node_ids))
+    )).all()
+    by_id: dict[int, tuple[Optional[str], Optional[int]]] = {}
+    for row in rows:
+        nid, nm, lat = (row[0], row[1], row[2]) if not hasattr(row, "id") \
+            else (row.id, row.name, row.latency_ms)
+        by_id[nid] = (nm, lat)
+    missing: list[int] = []
+    too_slow: list[dict] = []
+    for nid in node_ids:
+        if nid not in by_id:
+            missing.append(nid)
+            continue
+        nm, lat = by_id[nid]
+        # `lat is None` (never measured) → allowed through. Lat 0 is
+        # also allowed (some probes report 0 for sub-ms RTT). Anything
+        # strictly above the cap → rejected.
+        if lat is not None and lat > MAX_LATENCY_MS:
+            too_slow.append({
+                "id": nid,
+                "name": nm or f"node-{nid}",
+                "latency_ms": lat,
+                "limit_ms": MAX_LATENCY_MS,
+            })
+    if missing or too_slow:
+        detail_parts: list[str] = []
+        if missing:
+            detail_parts.append(
+                f"missing node ids: {missing} (referenced but not in DB)"
+            )
+        if too_slow:
+            slow_str = ", ".join(
+                f"{s['name']} (id={s['id']}, {s['latency_ms']} ms)"
+                for s in too_slow
+            )
+            detail_parts.append(
+                f"latency exceeds {MAX_LATENCY_MS} ms cap: {slow_str}"
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": " | ".join(detail_parts),
+                "max_latency_ms": MAX_LATENCY_MS,
+                "missing": missing,
+                "too_slow": too_slow,
+            },
+        )
+
 
 @router.get("", response_model=List[NodeCircleRead])
 async def list_circles(session: AsyncSession = Depends(get_session)):
@@ -52,6 +137,8 @@ async def list_circles(session: AsyncSession = Depends(get_session)):
 
 @router.post("", response_model=NodeCircleRead, status_code=201)
 async def create_circle(data: NodeCircleCreate, session: AsyncSession = Depends(get_session)):
+    # Latency cap + existence check on members. See `_validate_node_ids`.
+    await _validate_node_ids(session, data.node_ids)
     circle = NodeCircle(**data.model_dump(exclude={"node_ids"}))
     circle.node_ids = json.dumps(data.node_ids)
     session.add(circle)
@@ -75,6 +162,10 @@ async def update_circle(circle_id: int, data: NodeCircleUpdate, session: AsyncSe
         raise HTTPException(404, "NodeCircle not found")
     patch = data.model_dump(exclude_unset=True)
     if "node_ids" in patch and patch["node_ids"] is not None:
+        # Same latency+existence check as on POST — ensures PATCH can't
+        # smuggle in a too-slow member the operator wouldn't be allowed
+        # to add via the create endpoint.
+        await _validate_node_ids(session, patch["node_ids"])
         patch["node_ids"] = json.dumps(patch["node_ids"])
     for k, v in patch.items():
         setattr(circle, k, v)

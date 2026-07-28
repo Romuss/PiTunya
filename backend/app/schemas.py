@@ -932,6 +932,9 @@ class SubscriptionBase(BaseModel):
     auto_update: bool = False
     update_interval: int = 86400
     rotate_hwid: bool = False
+    # Opt-in to skip TLS verification when fetching this subscription.
+    # Default False (secure) — see `models.Subscription.allow_insecure`.
+    allow_insecure: bool = False
 
     @field_validator("url")
     @classmethod
@@ -1105,6 +1108,13 @@ class SettingsRead(BaseModel):
     geoip_url: str
     geosite_url: str
     geoip_mmdb_url: Optional[str] = None
+    # v1.4.7 — "direct" (default) | "proxy" | "node:<id>". See core/config_gen.
+    dns_route_via: Optional[str] = "direct"
+    # v1.4.7 — finding 3.5. Default False: box-local outgoing traffic
+    # bypasses xray entirely (panel fetches don't leak to the VPN
+    # provider's logs). True re-enables the old "tunnel the box too"
+    # behaviour.
+    proxy_local_apps: Optional[bool] = False
     # TUN mode
     inbound_mode: str = "tproxy"
     tun_address: str = "10.0.0.1/30"
@@ -1121,8 +1131,12 @@ class SettingsRead(BaseModel):
     dns_query_log_enabled: bool = False
     # Device routing
     device_routing_mode: str = "all"  # "all" | "include_only" | "exclude_list"
-    # IPv6
-    disable_ipv6: bool = False
+    # IPv6 — default True since v1.4.7 (finding 3.2): PiTun's TPROXY
+    # pipeline is IPv4-only, and a sticky AAAA cache / RA default
+    # route from the home router lets v6 escape via the router. The
+    # `apply_system_toggles_on_boot` writes `net.ipv6.conf.all.disable
+    # _ipv6=1` from this flag.
+    disable_ipv6: bool = True
     # DNS over TCP
     dns_over_tcp: bool = False
     # Health check
@@ -1188,6 +1202,8 @@ class SettingsUpdate(BaseModel):
     block_quic: Optional[bool] = None
     # Kill switch
     kill_switch: Optional[bool] = None
+    # v1.4.7 — finding 3.5. None = leave unchanged.
+    proxy_local_apps: Optional[bool] = None
     auto_restart_xray: Optional[bool] = None
     # DNS query logging
     dns_query_log_enabled: Optional[bool] = None
@@ -1304,6 +1320,9 @@ class DNSSettingsRead(BaseModel):
     dns_disable_fallback: bool = True
     # UseIP | UseIPv4 | UseIPv6 — UseIPv4 default closes the IPv6 leak.
     dns_query_strategy: str = "UseIPv4"
+    # v1.4.7 — routing outbound for DNS upstream dials.
+    # "direct" (default, robust) | "proxy" (stealthy) | "node:<id>"
+    dns_route_via: str = "direct"
     # Comma-separated IPv4 fallback resolvers for the BOX's own DNS
     # (subscriptions/geo/panels/healthchecks). Empty = router-only.
     host_fallback_dns: str = ""
@@ -1323,6 +1342,7 @@ class DNSSettingsUpdate(BaseModel):
     bypass_ru_dns: Optional[bool] = None
     dns_disable_fallback: Optional[bool] = None
     dns_query_strategy: Optional[str] = None
+    dns_route_via: Optional[str] = None
     host_fallback_dns: Optional[str] = None
 
 

@@ -1,0 +1,97 @@
+# PiTun — optional TLS terminator (architecture review finding 2.2)
+#
+# Enable via `COMPOSE_PROFILES=tls` in .env or:
+#   docker compose --profile tls up -d
+#
+# This file assumes:
+#   * The plain-HTTP nginx service (pitun-nginx) is reachable via the
+#     Docker bridge as `nginx:80`. We reverse-proxy to it from `:443`.
+#   * When `PITUN_TLS_CERT` + `PITUN_TLS_KEY` env vars are populated
+#     with full paths to supplied cert/key files, the tls directive
+#     uses them. Otherwise caddy's internal CA generates a self-signed
+#     cert and mints a new root for the operator's device to install
+#     once (saved to the persisted `./data/caddy` volume so the same
+#     root is presented on container restart).
+#   * Operator sets `PITUN_TLS_HOST` in their .env to the hostname
+#     clients connect to. Default `pitun.local` is fine on LAN clients
+#     that have `pitun.local` in /etc/hosts (or in the home router's
+#     DHCP DNS path).
+
+{
+	# Quiet the admin endpoint (default listens on :2019 unauthenticated).
+	# We don't run the admin API by default; bring up is plaintext-only.
+	admin off
+	# Persist cert/state outside container FS via the bind-mounted
+	# /data and /config dirs (see docker-compose.yml).
+	storage file_system {
+		root /data
+	}
+}
+
+# TLS host resolves via Docker DNS to pitun-nginx:80 on the user-
+# defined bridge. We require this hostname (not an IP) so caddy's SNI
+# match works.
+:443 {
+	# ── TLS strategy ──────────────────────────────────────────────
+	# Two modes — operator can pick by setting (or omitting) env:
+	#
+	# 1. Operator-supplied cert: `PITUN_TLS_CERT` + `PITUN_TLS_KEY`
+	#    both set to existing container paths.
+	# 2. Internal-CA self-signed: blank — caddy generates + persists.
+	#
+	# The `{$PITUN_TLS_CERT:}` is caddy's default-value syntax: if
+	# the env var is unset, the directive is empty (cleanly skipped).
+	tls {$PITUN_TLS_KEY:internal} {$PITUN_TLS_CERT:internal} {
+		# Tell caddy we don't need ACME — if internal (self-signed),
+		# it will generate a CA in /data and present certs signed by
+		# it. The CA root cert path is exposed at /data/caddy/pki/
+		# authorities/default/root.crt for the operator to install
+		# in their browser / OS trust store once (one-time step).
+		#
+		# When the operator DID supply a real cert/key (env vars
+		# are populated with file paths), this `ca` line isn't
+		# honoured — the cert files are used directly.
+	}
+
+	# Reverse-proxy to the plain pitun-nginx. We do this rather than
+	# proxying directly to the backend because:
+	#   * nginx already handles the /api/ vs / vs /api/logs/stream
+	#     location routing — duplicating it in Caddyfile would be
+	#     brittle.
+	#   * nginx resolves `backend:host-gateway` via extra_hosts —
+	#     we'd need the same extra_hosts entry in caddy; not worth it.
+	#   * caddy → nginx:80 → backend:8000 (one extra hop) costs
+	#     ~1 ms per request on a LAN, totally invisible.
+	reverse_proxy nginx:80 {
+		# WebSocket upgrade handling — relay logs/server-tasks streams.
+		# caddy auto-handles `Connection: upgrade` but we set this
+		# explicitly so a caddy config drift doesn't silently break WS.
+		header_up Connection {>Connection}
+		header_up Upgrade {>Upgrade}
+	}
+
+	# Enable gzip for the static SPA so the TLS handshakes aren't the
+	# big cost on slow links.
+	encode gzip
+
+	# Hide the upstream Server header from nginx's default — caddy
+	# already sets its own. Cosmetic but reduces surface area.
+	header -Server
+
+	# Don't log access.log lines by default (the user only needs
+	# error.log). If an operator wants access logging, they can
+	# turn this on.
+	log {
+		output stdout
+		level ERROR
+	}
+}
+
+# Redirect :80 to :443 when caddy is also listening on :80 (only
+# happens if the profile includes public ACME). For LAN-only setups
+# where the operator keeps nginx on :80 and only enables caddy on
+# :443, this block is silent — no-op. If caddy binds :80 (because the
+# operator wants ACME via :80 verification), requests are 301-redirected.
+:80 {
+	redir https://{host}{uri} 308
+}

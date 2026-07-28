@@ -378,6 +378,14 @@ class Subscription(SQLModel, table=True):
     # placeholder entries instead of real nodes) rotating gets a clean
     # response.
     rotate_hwid: bool = False
+    # Per-subscription opt-in to skip TLS verification when fetching.
+    # Default False: previous behaviour was `verify=False` uncond-
+    # itionally, leaking panel credentials + node UUIDs to any MITM
+    # on the path between PiTun and the panel. Now it's opt-in: only
+    # subscriptions whose panel uses a self-signed cert that the
+    # operator can't avoid need this. See migration 018 + architecture
+    # review finding 1.3.
+    allow_insecure: bool = False
 
 
 class DNSRule(SQLModel, table=True):
@@ -458,6 +466,15 @@ class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     username: str = Field(unique=True, index=True)
     password_hash: str
+    # Brute-force defense (since v1.4.7 — architecture review finding
+    # 1.2). After `MAX_FAILED_ATTEMPTS` (defined in core/auth.py) proven
+    # wrong passwords, the account is locked until `locked_until` has
+    # elapsed. A successful login resets `failed_attempts` to 0 AND
+    # clears `locked_until`. Both columns are persisted: a backend
+    # restart mid-brute-force keeps the state so a restart can't be
+    # used to reset the counter.
+    failed_attempts: int = Field(default=0, nullable=False)
+    locked_until: Optional[datetime] = None
 
 
 class Event(SQLModel, table=True):

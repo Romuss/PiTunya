@@ -136,6 +136,166 @@ class TestNodeCircleDelete:
         assert resp.status_code == 404
 
 
+# ── Latency cap (80ms) on create + update ──────────────────────────────────────
+# NodeCircle membership is rejected when any member's measured latency
+# exceeds the hard-coded MAX_LATENCY_MS (=80). A node with no measured
+# latency (freshly imported, never healthchecked) is allowed through —
+# the cap is about measured RTT, not "we don't know yet".
+
+
+class TestNodeCircleLatencyCap:
+    """Latency ≥ 80 ms cap enforced on POST/PATCH /nodecircle."""
+
+    def _mk_node(self, session, *, name, latency_ms):
+        from app.models import Node
+        n = Node(
+            name=name, protocol="vless", address="10.0.0.9", port=443,
+            uuid=f"{name}-uuid", transport="ws", tls="none",
+            enabled=True, order=0, latency_ms=latency_ms,
+        )
+        session.add(n)
+        session.commit()
+        session.refresh(n)
+        return n
+
+    def test_create_allows_fast_node(
+        self, client, admin_user, auth_headers, session, sample_node,
+    ):
+        # sample_node has latency_ms = None (never checked) — allowed.
+        # A second node with measured 20ms must also pass.
+        fast = self._mk_node(session, name="fast-20", latency_ms=20)
+        resp = client.post(
+            "/api/nodecircle",
+            headers=auth_headers,
+            json={
+                "name": "Fast Circle",
+                "node_ids": [sample_node.id, fast.id],
+                "mode": "sequential",
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["node_ids"] == [sample_node.id, fast.id]
+
+    def test_create_allows_node_at_exact_cap(
+        self, client, admin_user, auth_headers, session,
+    ):
+        # Latency == 80 (cap) is allowed; >80 is rejected. Edge case.
+        at_cap = self._mk_node(session, name="at-cap-80", latency_ms=80)
+        resp = client.post(
+            "/api/nodecircle",
+            headers=auth_headers,
+            json={"name": "Cap", "node_ids": [at_cap.id], "mode": "sequential"},
+        )
+        assert resp.status_code == 201, resp.text
+
+    def test_create_rejects_slow_node(self, client, admin_user, auth_headers, session):
+        slow = self._mk_node(session, name="slow-200", latency_ms=200)
+        resp = client.post(
+            "/api/nodecircle",
+            headers=auth_headers,
+            json={"name": "Slow Circle", "node_ids": [slow.id], "mode": "sequential"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()["detail"]
+        assert body["max_latency_ms"] == 80
+        assert len(body["too_slow"]) == 1
+        assert body["too_slow"][0]["id"] == slow.id
+        assert body["too_slow"][0]["latency_ms"] == 200
+        assert body["missing"] == []
+
+    def test_create_rejects_missing_node_id(self, client, admin_user, auth_headers):
+        # 9999 doesn't exist in the DB; should also be a 400 with "missing"
+        # rather than crash with a FK violation on commit.
+        resp = client.post(
+            "/api/nodecircle",
+            headers=auth_headers,
+            json={"name": "Phantom", "node_ids": [9999], "mode": "sequential"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()["detail"]
+        assert 9999 in body["missing"]
+        assert body["too_slow"] == []
+
+    def test_create_rejects_mixed(
+        self, client, admin_user, auth_headers, session, sample_node,
+    ):
+        # Mix of: a fast one (OK), a slow one (too_slow), and a missing id.
+        slow = self._mk_node(session, name="slow-150", latency_ms=150)
+        resp = client.post(
+            "/api/nodecircle",
+            headers=auth_headers,
+            json={
+                "name": "Mixed",
+                "node_ids": [sample_node.id, slow.id, 8888],
+                "mode": "sequential",
+            },
+        )
+        assert resp.status_code == 400
+        body = resp.json()["detail"]
+        assert 8888 in body["missing"]
+        assert len(body["too_slow"]) == 1
+        assert body["too_slow"][0]["id"] == slow.id
+
+    def test_create_empty_node_ids_is_allowed(
+        self, client, admin_user, auth_headers,
+    ):
+        # An empty circle is a valid intermediate state — operator may
+        # create then PATCH members in. We do NOT reject an empty list,
+        # the validator short-circuits.
+        resp = client.post(
+            "/api/nodecircle",
+            headers=auth_headers,
+            json={"name": "Empty", "node_ids": [], "mode": "sequential"},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["node_ids"] == []
+
+    def test_patch_rejects_slow_member(
+        self, client, admin_user, auth_headers, session, sample_circle,
+    ):
+        # sample_circle was created with sample_node (latency_ms=None).
+        # PATCHing a slow one in must be rejected with the same shape.
+        slow = self._mk_node(session, name="slow-100", latency_ms=100)
+        resp = client.patch(
+            f"/api/nodecircle/{sample_circle.id}",
+            headers=auth_headers,
+            json={"node_ids": [slow.id]},
+        )
+        assert resp.status_code == 400
+        body = resp.json()["detail"]
+        assert len(body["too_slow"]) == 1
+        assert body["too_slow"][0]["id"] == slow.id
+
+    def test_patch_allows_swapping_in_fast_member(
+        self, client, admin_user, auth_headers, session, sample_circle, sample_node,
+    ):
+        # Sanity: the validator doesn't false-positive on legitimate
+        # swaps when all members are within the cap.
+        fast = self._mk_node(session, name="new-fast-15", latency_ms=15)
+        resp = client.patch(
+            f"/api/nodecircle/{sample_circle.id}",
+            headers=auth_headers,
+            json={"node_ids": [sample_node.id, fast.id]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["node_ids"] == [sample_node.id, fast.id]
+
+    def test_patch_other_fields_skip_latency_check(
+        self, client, admin_user, auth_headers, sample_circle,
+    ):
+        # PATCHing name/mode/interval without touching node_ids must
+        # NOT trigger the latency check (otherwise the operator couldn't
+        # rename a circle that happens to contain a now-slow node).
+        resp = client.patch(
+            f"/api/nodecircle/{sample_circle.id}",
+            headers=auth_headers,
+            json={"name": "Renamed", "mode": "random"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "Renamed"
+        assert resp.json()["mode"] == "random"
+
+
 # ── Rotation with pre-ping ──────────────────────────────────────────────────
 #
 # Each rotation now probes candidates before switching, taking the

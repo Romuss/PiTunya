@@ -72,6 +72,16 @@ async def _nft(script: str) -> bool:
     return True
 
 
+# v1.4.7 — finding 3.5. The two `meta mark set 1` rules that go in
+# the `output` chain when `proxy_local_apps=True` (LAN client traffic
+# is unaffected — `prerouting` handles that). Kept as a separate
+# string constant so the f-string in `apply()` stays a clean literal.
+_LOCAL_MARK_RULES = (
+    "        ip protocol tcp meta mark set 1\n"
+    "        ip protocol udp meta mark set 1"
+)
+
+
 class NftablesManager:
     """Manage the pitun nftables table for TPROXY."""
 
@@ -97,6 +107,15 @@ class NftablesManager:
         block_quic: bool = True,
         kill_switch: bool = False,
         routing_set_specs: Optional[Sequence[RoutingSetSpec]] = None,
+        # v1.4.7 — finding 3.5. Default False: LAN client traffic is
+        # still TPROXY'd per `prerouting` rules, but the box's own
+        # outgoing traffic (httpx for subscription/xui fetches, etc.)
+        # is NOT routed through TPROXY/xray → it goes direct, hiding
+        # panel ips from the upstream VPN provider's logs and
+        # avoiding TLS-MITM by the exit node (`verify=True` attacks
+        # become irrelevant). Operator who wants to proxy-outbound-
+        # from-the-box can opt-in via /settings.
+        proxy_local_apps: bool = False,
     ) -> bool:
         """
         Apply nftables rules based on inbound_mode.
@@ -122,6 +141,7 @@ class NftablesManager:
             dns_port=dns_port,
             block_quic=block_quic,
             routing_set_specs=routing_set_specs,
+            proxy_local_apps=proxy_local_apps,
         )
 
     async def apply(
@@ -136,6 +156,7 @@ class NftablesManager:
         dns_port: Optional[int] = None,
         block_quic: bool = True,
         routing_set_specs: Optional[Sequence[RoutingSetSpec]] = None,
+        proxy_local_apps: bool = False,
     ) -> bool:
         """
         Create or replace the pitun nftables table with TPROXY rules.
@@ -290,8 +311,15 @@ table inet {_TABLE} {{
         type route hook output priority mangle; policy accept;
         meta mark 255 return
         ip daddr @bypass_dst4 return
-        ip protocol tcp meta mark set 1
-        ip protocol udp meta mark set 1
+        # v1.4.7 — finding 3.5. `proxy_local_apps` gates whether the
+        # box's own outgoing traffic is mangled into mark=1 (which
+        # routes it through TPROXY → xray → active node). Default
+        # False: local apps go direct → panel subscription/xui fetches
+        # don't leak panel IPs to the upstream VPN provider's logs,
+        # and `verify=True` suffices to protect TLS connections.
+        # Operators who want the box itself tunneled can flip this in
+        # /settings (one inbound_mode-aware knob; same call site).
+        {_LOCAL_MARK_RULES if proxy_local_apps else "        # proxy_local_apps=false: box-local apps go direct"}
     }}
 }}
 """

@@ -119,7 +119,13 @@ class XuiClient:
     etc. would produce `//login` with a trailing slash on the base."""
 
     api_token: str
-    verify_tls: bool = False
+    # Default True (secure) since v1.4.7 — finding 1.3.
+    # Old default False let any MITM between PiTun and the x-ui panel
+    # capture the panel api_token / panel_user+pass, since the panel
+    # typically exposes itself over a self-signed cert. Now opt-in
+    # via the XuiServer row's verify_tls override, set True by default
+    # and flipped to False only when the operator explicitly chooses so.
+    verify_tls: bool = True
     timeout: float = _DEFAULT_TIMEOUT
     # Cookie+CSRF credentials. Optional because the vast majority of
     # call sites only need Bearer (inbounds/clients/server-utils). The

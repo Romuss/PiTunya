@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 # Bypass mark: the nft ruleset's `mark eq 0xFF return` lets these
 # packets skip TPROXY interception. Same value HealthChecker uses.
 _BYPASS_MARK = 0xFF
-
 _PROBE_CMD = "uname -a; echo ---; (cat /etc/os-release 2>/dev/null | head -3) || true"
 
 _CONNECT_TIMEOUT_S = 8.0
