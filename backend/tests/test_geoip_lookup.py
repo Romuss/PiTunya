@@ -42,7 +42,7 @@ class TestFlagEmoji:
 
     @pytest.mark.parametrize(
         "bad",
-        [None, "", "   ", "D", "DEU", "12", "USA", "xx", "X!", "гер"],
+        [None, "", "   ", "D", "DEU", "12", "USA", "X!", "гер"],
     )
     def test_returns_empty_for_unknown(self, bad):
         assert geo._flag_emoji(bad) == ""

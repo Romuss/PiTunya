@@ -51,7 +51,7 @@ async def _save_speed_result(node_id: int, speed: float) -> str:
 
 async def _get_active_node_id() -> Optional[int]:
     async with AsyncSession(get_async_engine()) as session:
-        row = (await session.exec(
+        row = (await session.execute(
             text("SELECT value FROM settings WHERE key = 'active_node_id'")
         )).first()
         if row and row[0]:
@@ -64,9 +64,9 @@ async def _get_active_node_id() -> Optional[int]:
 
 async def _set_active_node_id(node_id: int) -> None:
     async with AsyncSession(get_async_engine()) as session:
-        await session.exec(
+        await session.execute(
             text("UPDATE settings SET value = :val WHERE key = 'active_node_id'"),
-            params={"val": str(node_id)},
+            {"val": str(node_id)},
         )
         await session.commit()
 
@@ -172,7 +172,7 @@ async def speed_test_all():
     """
     from sqlalchemy import text as sql_text
     async with AsyncSession(get_async_engine()) as session:
-        rows = (await session.exec(
+        rows = (await session.execute(
             sql_text("SELECT id, name FROM node WHERE enabled = 1 ORDER BY latency_ms ASC NULLS LAST")
         )).all()
 
