@@ -97,7 +97,9 @@ class ServiceSupervisor:
         stop: Callable[[], None],
     ) -> None:
         if name in self._services:
-            raise ValueError(f"service {name!r} already registered")
+            return  # idempotent — tests create multiple TestClient instances
+                    # that each trigger lifespan; the singleton supervisor
+                    # would otherwise raise on the 2nd register.
         reg = _ServiceRegistration(name=name, start=start, stop=stop)
         reg.state.name = name
         self._services[name] = reg
