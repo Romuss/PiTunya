@@ -37,15 +37,15 @@ router = APIRouter()
 
 async def _save_speed_result(node_id: int, speed: float) -> str:
     async with AsyncSession(get_async_engine()) as session:
-        await session.exec(
+        await session.execute(
             text("UPDATE node SET speed_mbps = :speed, last_speed_test = :ts WHERE id = :id"),
-            params={"speed": speed, "ts": datetime.now(tz=timezone.utc), "id": node_id},
+            {"speed": speed, "ts": datetime.now(tz=timezone.utc), "id": node_id}
         )
         await session.commit()
-        row = (await session.exec(
+        row = (await session.execute(
             text("SELECT name FROM node WHERE id = :id"),
-            params={"id": node_id},
-        )).first()
+            {"id": node_id}
+        )).scalar()
         return row[0] if row else "?"
 
 

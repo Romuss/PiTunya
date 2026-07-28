@@ -188,14 +188,15 @@ class TestNodeCircleLatencyCap:
         )
         assert resp.status_code == 201, resp.text
 
-    def test_create_rejects_slow_node(self, client, admin_user, auth_headers, session):
+    def test_create_allows_slow_node(self, client, admin_user, auth_headers, session):
+        # v1.5.0 — latency cap is now a warning, not a hard reject
         slow = self._mk_node(session, name="slow-200", latency_ms=200)
         resp = client.post(
             "/api/nodecircle",
             headers=auth_headers,
             json={"name": "Slow Circle", "node_ids": [slow.id], "mode": "sequential"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 201
         body = resp.json()["detail"]
         assert body["max_latency_ms"] == 80
         assert len(body["too_slow"]) == 1
@@ -216,10 +217,10 @@ class TestNodeCircleLatencyCap:
         assert 9999 in body["missing"]
         assert body["too_slow"] == []
 
-    def test_create_rejects_mixed(
+    def test_create_rejects_missing_but_allows_slow(
         self, client, admin_user, auth_headers, session, sample_node,
     ):
-        # Mix of: a fast one (OK), a slow one (too_slow), and a missing id.
+        # v1.5.0 — slow nodes are allowed (warning), but missing nodes reject
         slow = self._mk_node(session, name="slow-150", latency_ms=150)
         resp = client.post(
             "/api/nodecircle",
@@ -233,8 +234,6 @@ class TestNodeCircleLatencyCap:
         assert resp.status_code == 400
         body = resp.json()["detail"]
         assert 8888 in body["missing"]
-        assert len(body["too_slow"]) == 1
-        assert body["too_slow"][0]["id"] == slow.id
 
     def test_create_empty_node_ids_is_allowed(
         self, client, admin_user, auth_headers,

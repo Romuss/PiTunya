@@ -53,7 +53,10 @@ def _flag_emoji(country_code: Optional[str]) -> str:
     if not country_code or not isinstance(country_code, str):
         return ""
     cc = country_code.strip().upper()
-    if len(cc) != 2 or not (cc.isalpha() and cc.isascii()):
+    if len(cc) != 2 or not cc.isalpha() or not cc.isascii():
+        return ""
+    # Only A-Z (uppercase) produce valid flag emoji via regional indicators
+    if not all('A' <= c <= 'Z' for c in cc):
         return ""
     try:
         return chr(_RIS_OFFSET + ord(cc[0])) + chr(_RIS_OFFSET + ord(cc[1]))
