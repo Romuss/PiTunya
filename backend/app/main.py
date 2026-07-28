@@ -181,8 +181,6 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("JobManager failed to start: %s", exc)
         await _record_boot_event_safe("JobManager", exc)
-</parameter>
-<parameter name="path">PiTun/backend/app/main.py</parameter>
 
     # Apply system-level toggles (IPv6, DNS over TCP) from DB — /proc/sys resets on reboot
     from app.api.system import apply_system_toggles_on_boot
