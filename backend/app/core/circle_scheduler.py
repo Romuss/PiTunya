@@ -105,39 +105,46 @@ class CircleScheduler:
                     self._next_rotate[cid] = now
 
             if now >= self._next_rotate[cid]:
-                # ── Smart rotation guard (v1.4.8) ──────────────────────
-                # If the circle has `min_speed_mbps > 0` and the current
-                # active node is still healthy (online + fast enough +
-                # low latency), skip the rotation entirely. Only rotate
-                # when the active node has degraded — fell offline,
-                # speed dropped below threshold, or latency climbed.
-                # This saves the operator from unnecessary hops on a
-                # perfectly good connection.
+                # ── Smart rotation guard (v1.5.0) ──────────────────────
+                # Skip rotation when the active node is healthy:
+                #   * is_online = True
+                #   * latency_ms <= 80 (or None = untested = rotate anyway)
+                #   * speed_mbps >= min_speed_mbps (if min_speed_mbps > 0)
+                #
+                # Default behavior (min_speed_mbps = 0): still skips if
+                # the node is online AND latency is good (<80ms). This
+                # prevents unnecessary jumps between equal-quality nodes
+                # while still rotating if the active node degrades.
+                #
+                # Set min_speed_mbps > 0 to additionally require the
+                # speed test to have measured a minimum throughput.
                 min_speed = cd.get("min_speed_mbps", 0) or 0
-                if min_speed > 0:
-                    current_idx = cd["current_index"]
-                    node_ids = cd["node_ids"]
-                    if 0 <= current_idx < len(node_ids):
-                        active_id = node_ids[current_idx]
-                        # Fetch the active node's health from DB
-                        active_node = await session.get(Node, active_id)
-                        if (
-                            active_node is not None
-                            and active_node.is_online
-                            and (active_node.speed_mbps or 0) >= min_speed
-                            and (active_node.latency_ms or 999) <= 80
-                        ):
-                            # Active node is good — skip rotation, reset timer
-                            interval = self._calc_interval(cd)
-                            self._next_rotate[cid] = now + timedelta(minutes=interval)
+                current_idx = cd["current_index"]
+                node_ids = cd["node_ids"]
+                should_skip = False
+                if 0 <= current_idx < len(node_ids):
+                    active_id = node_ids[current_idx]
+                    # Use select() not session.get() — avoids greenlet
+                    active_node = (await session.exec(
+                        select(Node).where(Node.id == active_id)
+                    )).first()
+                    if active_node is not None and active_node.is_online:
+                        latency_ok = (active_node.latency_ms or 999) <= 80
+                        speed_ok = (active_node.speed_mbps or 0) >= min_speed if min_speed > 0 else True
+                        if latency_ok and speed_ok:
+                            should_skip = True
                             logger.debug(
                                 "NodeCircle %d: skipping rotation — active node "
-                                "%d (%s) is healthy (%.1f MB/s, %dms, online)",
+                                "%d (%s) is healthy (%dms, online, %.1f MB/s)",
                                 cid, active_id, active_node.name,
-                                active_node.speed_mbps or 0,
                                 active_node.latency_ms or 0,
+                                active_node.speed_mbps or 0,
                             )
-                            continue
+
+                if should_skip:
+                    interval = self._calc_interval(cd)
+                    self._next_rotate[cid] = now + timedelta(minutes=interval)
+                    continue
 
                 await self.rotate_circle(cid)
                 interval = self._calc_interval(cd)
