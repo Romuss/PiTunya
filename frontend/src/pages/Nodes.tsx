@@ -383,6 +383,7 @@ export function Nodes() {
                   onSelect={() => setActive.mutate(activeNode.id)}
                   checkLoading={checkHealth.isPending && checkHealth.variables === activeNode.id}
                   speedLoading={speedtest.isPending && speedtest.variables === activeNode.id}
+                  speedResultText={speedResults[activeNode.id]}
                 />
               </div>
             </div>
@@ -456,12 +457,8 @@ export function Nodes() {
                   onSelect={() => setActive.mutate(node.id)}
                   checkLoading={checkHealth.isPending && checkHealth.variables === node.id}
                   speedLoading={speedtest.isPending && speedtest.variables === node.id}
+                  speedResultText={speedResults[node.id]}
                 />
-                {speedResults[node.id] && (
-                  <div className="text-xs text-gray-500 mt-1 pl-4 font-mono">
-                    Speed: {speedResults[node.id]}
-                  </div>
-                )}
                 {node.protocol === 'naive' && (
                   <NaiveSidecarPanel nodeId={node.id} nodeName={node.name} />
                 )}
