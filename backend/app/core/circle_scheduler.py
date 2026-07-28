@@ -342,9 +342,10 @@ class CircleScheduler:
                 -(c["speed_mbps"] or 0),     # higher speed = better (negate for asc sort)
             ))
 
-            # In random mode, shuffle within the top-3 best candidates
-            # so we don't always pick the same node every rotation tick.
-            # In sequential mode, just use the sorted order (best first).
+            # v1.5.0 — three modes:
+            #   best: strict best-first order (top candidate always probed first)
+            #   random: shuffle within top-3 best for anti-DPI variety
+            #   sequential: best-first order (same as best, but user chose it)
             if circle.mode == "random" and len(all_candidates) > 3:
                 top3 = all_candidates[:3]
                 random.shuffle(top3)

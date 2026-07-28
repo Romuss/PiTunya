@@ -15,6 +15,9 @@ import type { NodeCircle, NodeCircleCreate, Subscription } from '@/types'
 const MODE_LABELS: Record<string, string> = {
   sequential: 'Sequential',
   random: 'Random',
+  best: 'Best (auto)',
+}
+  random: 'Random',
 }
 
 const MODE_COLORS: Record<string, string> = {
@@ -52,7 +55,7 @@ interface ModalProps {
 function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalProps) {
   const t = useT()
   const [name, setName] = useState(initial?.name ?? '')
-  const [mode, setMode] = useState<'sequential' | 'random'>(initial?.mode ?? 'sequential')
+  const [mode, setMode] = useState<'sequential' | 'random' | 'best'>(initial?.mode ?? 'best')
   const [enabled, setEnabled] = useState(initial?.enabled ?? false)
   const [intervalMin, setIntervalMin] = useState(String(initial?.interval_min ?? 5))
   const [intervalMax, setIntervalMax] = useState(String(initial?.interval_max ?? 15))
@@ -132,9 +135,10 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
         </label>
         <select
           value={mode}
-          onChange={(e) => setMode(e.target.value as 'sequential' | 'random')}
+          onChange={(e) => setMode(e.target.value as 'sequential' | 'random' | 'best')}
           className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
         >
+          <option value="best">Best (auto-pick best available)</option>
           <option value="sequential">Sequential</option>
           <option value="random">Random</option>
         </select>

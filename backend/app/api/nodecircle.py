@@ -63,37 +63,25 @@ async def _validate_node_ids(
             missing.append(nid)
             continue
         nm, lat = by_id[nid]
-        # `lat is None` (never measured) → allowed through. Lat 0 is
-        # also allowed (some probes report 0 for sub-ms RTT). Anything
-        # strictly above the cap → rejected.
+        # v1.5.0 — latency cap is now a WARNING not a hard reject.
+        # The operator may want high-latency nodes in the circle (they
+        # can be useful as fallback). The smart rotation + best-candidate
+        # logic will naturally prefer lower-latency nodes, and skip
+        # high-latency ones during rotation.
         if lat is not None and lat > MAX_LATENCY_MS:
-            too_slow.append({
-                "id": nid,
-                "name": nm or f"node-{nid}",
-                "latency_ms": lat,
-                "limit_ms": MAX_LATENCY_MS,
-            })
-    if missing or too_slow:
-        detail_parts: list[str] = []
-        if missing:
-            detail_parts.append(
-                f"missing node ids: {missing} (referenced but not in DB)"
+            logger.warning(
+                "NodeCircle: node %d (%s) has latency %dms > %dms cap — "
+                "allowed but will be deprioritized by best-candidate rotation",
+                nid, nm, lat, MAX_LATENCY_MS,
             )
-        if too_slow:
-            slow_str = ", ".join(
-                f"{s['name']} (id={s['id']}, {s['latency_ms']} ms)"
-                for s in too_slow
-            )
-            detail_parts.append(
-                f"latency exceeds {MAX_LATENCY_MS} ms cap: {slow_str}"
-            )
+    # Only reject on MISSING nodes (not on slow ones)
+    if missing:
         raise HTTPException(
             status_code=400,
             detail={
-                "message": " | ".join(detail_parts),
-                "max_latency_ms": MAX_LATENCY_MS,
+                "message": f"missing node ids: {missing} (referenced but not in DB)",
                 "missing": missing,
-                "too_slow": too_slow,
+                "too_slow": [],
             },
         )
 

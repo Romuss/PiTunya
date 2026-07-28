@@ -875,8 +875,8 @@ class NodeCircleBase(BaseModel):
     @field_validator("mode")
     @classmethod
     def validate_mode(cls, v: str) -> str:
-        if v not in ("sequential", "random"):
-            raise ValueError("mode must be sequential|random")
+        if v not in ("sequential", "random", "best"):
+            raise ValueError("mode must be sequential|random|best")
         return v
 
     @field_validator("interval_min")
@@ -902,14 +902,16 @@ class NodeCircleUpdate(BaseModel):
     mode: Optional[str] = None
     interval_min: Optional[int] = None
     interval_max: Optional[int] = None
+    subscription_id: Optional[int] = None
+    min_speed_mbps: Optional[float] = None
 
     @field_validator("mode", mode="before")
     @classmethod
     def validate_mode(cls, v):
         if v is None:
             return v
-        if v not in ("sequential", "random"):
-            raise ValueError("mode must be sequential|random")
+        if v not in ("sequential", "random", "best"):
+            raise ValueError("mode must be sequential|random|best")
         return v
 
 class NodeCircleRead(NodeCircleBase):

@@ -686,7 +686,7 @@ export interface NodeCircle {
   name: string
   enabled: boolean
   node_ids: number[]
-  mode: 'sequential' | 'random'
+  mode: 'sequential' | 'random' | 'best'
   interval_min: number
   interval_max: number
   current_index: number
