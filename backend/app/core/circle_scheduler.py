@@ -119,12 +119,28 @@ class CircleScheduler:
                 # Set min_speed_mbps > 0 to additionally require the
                 # speed test to have measured a minimum throughput.
                 min_speed = cd.get("min_speed_mbps", 0) or 0
-                current_idx = cd["current_index"]
                 node_ids = cd["node_ids"]
                 should_skip = False
-                if 0 <= current_idx < len(node_ids):
-                    active_id = node_ids[current_idx]
-                    # Use select() not session.get() — avoids greenlet
+
+                # Bug fix (v1.5.0): check the ACTUAL active node (from
+                # Settings.active_node_id), NOT node_ids[current_index].
+                # The circle's current_index points to the last node the
+                # circle itself picked — but the operator may have
+                # manually switched the active node via Dashboard, or
+                # failover set a different one. The smart rotation must
+                # check whichever node traffic is ACTUALLY going through.
+                active_id_str = (await session.exec(
+                    select(DBSettings).where(DBSettings.key == "active_node_id")
+                )).first()
+                active_id = None
+                if active_id_str and active_id_str.value:
+                    try:
+                        active_id = int(active_id_str.value)
+                    except (ValueError, TypeError):
+                        pass
+
+                if active_id is not None and active_id in node_ids:
+                    # The actual active node is in this circle — check its health
                     active_node = (await session.exec(
                         select(Node).where(Node.id == active_id)
                     )).first()
@@ -140,6 +156,14 @@ class CircleScheduler:
                                 active_node.latency_ms or 0,
                                 active_node.speed_mbps or 0,
                             )
+                elif active_id is not None and active_id not in node_ids:
+                    # Active node is NOT in this circle — the operator
+                    # manually picked a different node. Don't interfere;
+                    # let the circle rotate on its own schedule.
+                    pass
+                else:
+                    # No active node set at all — let the circle rotate
+                    pass
 
                 if should_skip:
                     interval = self._calc_interval(cd)
