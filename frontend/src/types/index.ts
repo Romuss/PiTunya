@@ -695,6 +695,7 @@ export interface NodeCircle {
   // v1.5.0
   subscription_id?: number | null
   min_speed_mbps?: number
+  max_latency_ms?: number
 }
 export type NodeCircleCreate = Omit<NodeCircle, 'id' | 'current_index' | 'last_rotated' | 'current_node_name'>
 export type NodeCircleUpdate = Partial<NodeCircleCreate>

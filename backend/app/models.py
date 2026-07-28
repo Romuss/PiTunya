@@ -442,6 +442,10 @@ class NodeCircle(SQLModel, table=True):
     # Default 0 means "always rotate on schedule" (preserves prior behavior).
     # Set e.g. 5.0 to "skip rotation while active node gives ≥5 MB/s".
     min_speed_mbps: float = 0.0
+    # v1.5.1 — max latency for candidates. 0 = no limit (use any latency).
+    # When > 0, rotation filters out candidates with latency_ms > max_latency_ms.
+    # Also used by smart rotation: if active node latency > max_latency → rotate.
+    max_latency_ms: int = 0
 
 
 class Device(SQLModel, table=True):

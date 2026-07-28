@@ -871,6 +871,7 @@ class NodeCircleBase(BaseModel):
     # v1.4.8 — skip rotation while the active node's speed_mbps is
     # above this threshold. 0 = always rotate (prior behavior).
     min_speed_mbps: float = 0.0
+    max_latency_ms: int = 0
 
     @field_validator("mode")
     @classmethod
@@ -904,6 +905,7 @@ class NodeCircleUpdate(BaseModel):
     interval_max: Optional[int] = None
     subscription_id: Optional[int] = None
     min_speed_mbps: Optional[float] = None
+    max_latency_ms: Optional[int] = None
 
     @field_validator("mode", mode="before")
     @classmethod

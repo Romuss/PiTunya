@@ -61,6 +61,7 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
   // v1.5.0 — auto-sync from subscription + smart rotation
   const [subscriptionId, setSubscriptionId] = useState(String(initial?.subscription_id ?? ''))
   const [minSpeed, setMinSpeed] = useState(String(initial?.min_speed_mbps ?? '0'))
+  const [maxLatency, setMaxLatency] = useState(String(initial?.max_latency_ms ?? '0'))
   const { data: subscriptions = [] } = useQuery<Subscription[]>({
     queryKey: ['subscriptions'],
     queryFn: () => subsApi.list(),
@@ -107,6 +108,7 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
       node_ids: Array.from(selectedIds),
       subscription_id: subscriptionId ? Number(subscriptionId) : null,
       min_speed_mbps: parseFloat(minSpeed) || 0,
+      max_latency_ms: parseInt(maxLatency) || 0,
     })
   }
 
@@ -259,6 +261,22 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
           min="0"
           value={minSpeed}
           onChange={(e) => setMinSpeed(e.target.value)}
+          className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+          placeholder="0"
+        />
+      </div>
+
+      {/* v1.5.1 — Max latency filter for rotation candidates */}
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-1">
+          Max latency for candidates (ms)
+          <InfoTip position="bottom" className="ml-0.5" text="Reject rotation candidates with latency above this value. 0 = no limit. Smart rotation also forces rotation when active node latency exceeds this." />
+        </label>
+        <input
+          type="number"
+          min="0"
+          value={maxLatency}
+          onChange={(e) => setMaxLatency(e.target.value)}
           className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
           placeholder="0"
         />

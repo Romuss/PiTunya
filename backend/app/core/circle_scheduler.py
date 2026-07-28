@@ -75,6 +75,7 @@ class CircleScheduler:
                     "current_index": c.current_index,
                     "last_rotated": c.last_rotated,
                     "min_speed_mbps": getattr(c, "min_speed_mbps", 0) or 0,
+                    "max_latency_ms": getattr(c, "max_latency_ms", 0) or 0,
                 })
 
         live_ids = {cd["id"] for cd in circle_data}
@@ -145,7 +146,11 @@ class CircleScheduler:
                         select(Node).where(Node.id == active_id)
                     )).first()
                     if active_node is not None and active_node.is_online:
-                        latency_ok = (active_node.latency_ms or 999) <= 80
+                        latency_limit = cd.get("max_latency_ms", 0) or 0
+                        if latency_limit > 0:
+                            latency_ok = (active_node.latency_ms or 999) <= latency_limit
+                        else:
+                            latency_ok = (active_node.latency_ms or 999) <= 80
                         speed_ok = (active_node.speed_mbps or 0) >= min_speed if min_speed > 0 else True
                         if latency_ok and speed_ok:
                             should_skip = True
@@ -340,12 +345,17 @@ class CircleScheduler:
             # either haven't been speed-tested (None = unknown = allowed) or
             # have measured speed >= min_speed_mbps.
             min_speed_threshold = getattr(circle, 'min_speed_mbps', 0) or 0
+            max_latency_threshold = getattr(circle, 'max_latency_ms', 0) or 0
+
             if min_speed_threshold > 0:
                 filtered = [c for c in all_candidates if (c['speed_mbps'] is None or c['speed_mbps'] >= min_speed_threshold)]
                 if filtered:
-                    all_candidates = filtered  # only use qualifying candidates
-                # if ALL candidates are below threshold, keep them all
-                # (better to rotate to a slow node than keep a dead one)
+                    all_candidates = filtered
+
+            if max_latency_threshold > 0:
+                filtered = [c for c in all_candidates if (c['latency_ms'] is None or c['latency_ms'] <= max_latency_threshold)]
+                if filtered:
+                    all_candidates = filtered
 
             # Sort by quality: online first, then lowest latency, then highest speed
             all_candidates.sort(key=lambda c: (
