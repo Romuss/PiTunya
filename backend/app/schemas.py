@@ -153,6 +153,9 @@ class NodeRead(NodeBase):
     latency_ms: Optional[int] = None
     last_check: Optional[datetime] = None
     is_online: bool = True
+    # v1.4.8 — speed test results
+    speed_mbps: Optional[float] = None
+    last_speed_test: Optional[datetime] = None
     # Multi-client deployment provenance (since v1.3.0-beta.4). When this
     # Node was exported from a DeploymentClient (e.g. WireGuard peer),
     # keep the link so the UI can render "from <server name>" alongside
@@ -860,6 +863,14 @@ class NodeCircleBase(BaseModel):
     mode: str = "sequential"
     interval_min: int = 5
     interval_max: int = 15
+    # v1.4.8 — when set, circle auto-syncs its node_ids from this
+    # subscription on every refresh: new nodes appended, removed ones
+    # dropped. Operator "links" a circle to a sub and forgets about
+    # manual edits.
+    subscription_id: Optional[int] = None
+    # v1.4.8 — skip rotation while the active node's speed_mbps is
+    # above this threshold. 0 = always rotate (prior behavior).
+    min_speed_mbps: float = 0.0
 
     @field_validator("mode")
     @classmethod

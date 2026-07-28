@@ -765,6 +765,50 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         sub.node_count = imported
         sub.last_error = None  # clear error on success
         session.add(sub)
+
+        # ── Auto-sync NodeCircles linked to this subscription (v1.4.8) ──
+        # Any NodeCircle whose `subscription_id == sub_id` gets its
+        # node_ids automatically rebuilt from the fresh set of enabled
+        # nodes in this subscription. The operator "links" a circle to
+        # a sub once (POST/PATCH with subscription_id), and from then
+        # on every refresh keeps the circle in sync — new nodes appended
+        # (sorted by latency → fastest first), removed ones dropped —
+        # without any manual editing.
+        # The 80ms latency cap from the circle's own validation does NOT
+        # apply here (auto-sync bypasses the POST/PATCH validator); we
+        # include all nodes and let the circle_scheduler's smart
+        # rotation pick the best one at each tick.
+        try:
+            import json as _json
+            linked_circles = (await session.exec(
+                select(NodeCircle).where(NodeCircle.subscription_id == sub_id)
+            )).all()
+            if linked_circles:
+                # Build the fresh node-id list from the DB (post-upsert),
+                # sorted by latency ascending so the circle's rotation
+                # order naturally prefers faster nodes.
+                fresh_nodes = (await session.exec(
+                    select(Node.id).where(
+                        Node.subscription_id == sub_id,
+                        Node.enabled == True,  # noqa: E712
+                    ).order_by(Node.latency_ms.asc().nulls_last(), Node.id)
+                )).all()
+                fresh_ids = [n for n in fresh_nodes if n is not None]
+                for circle in linked_circles:
+                    old_ids = _json.loads(circle.node_ids) if isinstance(circle.node_ids, str) else (circle.node_ids or [])
+                    circle.node_ids = _json.dumps(fresh_ids)
+                    # Reset current_index if it points past the new list
+                    if circle.current_index >= len(fresh_ids):
+                        circle.current_index = 0
+                    session.add(circle)
+                logger.info(
+                    "Subscription %d: auto-synced %d NodeCircle(s) — "
+                    "node_ids updated (%d nodes, was %d)",
+                    sub_id, len(linked_circles), len(fresh_ids), len(old_ids) if old_ids else 0,
+                )
+        except Exception as exc:
+            logger.warning("Subscription %d: NodeCircle auto-sync failed: %s", sub_id, exc)
+
         await session.commit()
         logger.info(
             "Subscription %d: imported %d nodes (matched=%d new=%d removed=%d%s)",

@@ -101,6 +101,12 @@ class Node(SQLModel, table=True):
     latency_ms: Optional[int] = None
     last_check: Optional[datetime] = None
     is_online: bool = True
+    # Speed test (since v1.4.8) — throughput through the node's outbound,
+    # measured by downloading via the PIX socks-in. `speed_mbps` is megabytes
+    # per second of actual download bandwidth. `last_speed_test` is the UTC
+    # timestamp when the test was last run.
+    speed_mbps: Optional[float] = None
+    last_speed_test: Optional[datetime] = None
 
     # Order in list
     order: int = 0
@@ -424,6 +430,18 @@ class NodeCircle(SQLModel, table=True):
     interval_max: int = 15        # maximum minutes (for random interval)
     current_index: int = 0        # current position in the circle
     last_rotated: Optional[datetime] = None
+    # Auto-sync from subscription (since v1.4.8). When set, the circle's
+    # node_ids auto-update on every subscription refresh: new nodes from
+    # the sub are appended; nodes that vanished are removed. Lets the
+    # operator "link" a circle to a subscription and forget about manual
+    # edits.
+    subscription_id: Optional[int] = Field(default=None, foreign_key="subscription.id")
+    # Smart rotation guard. If the active node's `speed_mbps >= min_speed_mbps`
+    # AND `is_online == True` AND `latency_ms <= 80`, the scheduler skips the
+    # rotation tick entirely — why rotate away from a perfectly good node?
+    # Default 0 means "always rotate on schedule" (preserves prior behavior).
+    # Set e.g. 5.0 to "skip rotation while active node gives ≥5 MB/s".
+    min_speed_mbps: float = 0.0
 
 
 class Device(SQLModel, table=True):
