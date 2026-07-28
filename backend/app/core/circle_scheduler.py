@@ -307,20 +307,21 @@ class CircleScheduler:
             current_idx = circle.current_index if circle.current_index < len(node_ids) else 0
             prev_node_id = node_ids[current_idx]
 
-            # Build candidate order: random=shuffle, sequential=walk forward.
-            if circle.mode == "random":
-                order = [i for i in range(len(node_ids)) if i != current_idx]
-                random.shuffle(order)
-            else:  # sequential — walk forward from current+1, wrap, skip current
-                order = [(current_idx + i) % len(node_ids) for i in range(1, len(node_ids))]
-
-            candidates: list[dict] = []
-            for idx in order:
+            # v1.5.0 — pick the BEST candidate by quality score instead
+            # of random/sequential walk. Quality = online + latency + speed.
+            # Sort all candidates by: is_online DESC, latency ASC NULLS LAST,
+            # speed_mbps DESC NULLS LAST. Then probe the TOP candidate first.
+            # If it's alive → switch. If not → probe next. This way the
+            # circle always tries the best available node first.
+            all_candidates: list[dict] = []
+            for idx in range(len(node_ids)):
+                if idx == current_idx:
+                    continue  # skip current — we're rotating away from it
                 cand = await session.get(Node, node_ids[idx])
                 if not cand or not cand.enabled:
                     continue
                 addr, port, udp = await health_checker._resolve_probe_target(session, cand)
-                candidates.append({
+                all_candidates.append({
                     "idx": idx,
                     "id": cand.id,
                     "name": cand.name,
@@ -329,7 +330,29 @@ class CircleScheduler:
                     "udp": udp,
                     "protocol": cand.protocol,
                     "internal_port": cand.internal_port,
+                    "is_online": cand.is_online,
+                    "latency_ms": cand.latency_ms,
+                    "speed_mbps": cand.speed_mbps,
                 })
+
+            # Sort by quality: online first, then lowest latency, then highest speed
+            all_candidates.sort(key=lambda c: (
+                not c["is_online"],          # online = False sorts after online = True
+                c["latency_ms"] or 999999,   # None latency = worst
+                -(c["speed_mbps"] or 0),     # higher speed = better (negate for asc sort)
+            ))
+
+            # In random mode, shuffle within the top-3 best candidates
+            # so we don't always pick the same node every rotation tick.
+            # In sequential mode, just use the sorted order (best first).
+            if circle.mode == "random" and len(all_candidates) > 3:
+                top3 = all_candidates[:3]
+                random.shuffle(top3)
+                order_pool = top3 + all_candidates[3:]
+            else:
+                order_pool = all_candidates
+
+            candidates = order_pool
 
             circle_name = circle.name
             circle_mode = circle.mode
