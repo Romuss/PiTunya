@@ -17,12 +17,11 @@ const MODE_LABELS: Record<string, string> = {
   random: 'Random',
   best: 'Best (auto)',
 }
-  random: 'Random',
-}
 
 const MODE_COLORS: Record<string, string> = {
   sequential: 'bg-cyan-900/60 text-cyan-300',
   random: 'bg-purple-900/60 text-purple-300',
+  best: 'bg-green-900/60 text-green-300',
 }
 
 function formatInterval(min: number, max: number): string {
