@@ -126,6 +126,8 @@ export interface NodePageParams {
   /** Tiebreaker direction for the `id` column. Default `desc` shows
    *  newest-added Nodes first (natural for subscription imports). */
   direction?: 'asc' | 'desc'
+  /** v1.5.0 — 'quality' sorts by online + speed + latency. */
+  sort?: 'default' | 'quality'
 }
 
 export interface NodeImportResponse {
@@ -690,6 +692,9 @@ export interface NodeCircle {
   current_index: number
   last_rotated?: string
   current_node_name?: string
+  // v1.5.0
+  subscription_id?: number | null
+  min_speed_mbps?: number
 }
 export type NodeCircleCreate = Omit<NodeCircle, 'id' | 'current_index' | 'last_rotated' | 'current_node_name'>
 export type NodeCircleUpdate = Partial<NodeCircleCreate>

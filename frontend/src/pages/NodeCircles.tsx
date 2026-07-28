@@ -4,13 +4,13 @@ import { Plus, Pencil, Trash2, ToggleLeft, ToggleRight, RefreshCw, Circle } from
 import { InfoTip } from '@/components/InfoTip'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { circleApi } from '@/api/client'
+import { circleApi, subsApi } from '@/api/client'
 import { useNodes } from '@/hooks/useNodes'
 import { useSystemSettings, useUpdateSettings } from '@/hooks/useSystem'
 import { useT } from '@/hooks/useT'
 import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
-import type { NodeCircle, NodeCircleCreate } from '@/types'
+import type { NodeCircle, NodeCircleCreate, Subscription } from '@/types'
 
 const MODE_LABELS: Record<string, string> = {
   sequential: 'Sequential',
@@ -54,12 +54,15 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
   const [name, setName] = useState(initial?.name ?? '')
   const [mode, setMode] = useState<'sequential' | 'random'>(initial?.mode ?? 'sequential')
   const [enabled, setEnabled] = useState(initial?.enabled ?? false)
-  // Interval inputs are kept as strings so the user can transiently clear
-  // the field while typing (`Number('')` = 0, which would lock them into
-  // a leading-zero state like "035"). We parse on submit; empty/invalid
-  // \u2192 1 (the underlying minimum the rotation scheduler accepts).
   const [intervalMin, setIntervalMin] = useState(String(initial?.interval_min ?? 5))
   const [intervalMax, setIntervalMax] = useState(String(initial?.interval_max ?? 15))
+  // v1.5.0 — auto-sync from subscription + smart rotation
+  const [subscriptionId, setSubscriptionId] = useState(String(initial?.subscription_id ?? ''))
+  const [minSpeed, setMinSpeed] = useState(String(initial?.min_speed_mbps ?? '0'))
+  const { data: subscriptions = [] } = useQuery<Subscription[]>({
+    queryKey: ['subscriptions'],
+    queryFn: () => subsApi.list(),
+  })
   const [selectedIds, setSelectedIds] = useState<Set<number>>(
     new Set(initial?.node_ids ?? [])
   )
@@ -100,6 +103,8 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
       interval_min: minN,
       interval_max: maxN,
       node_ids: Array.from(selectedIds),
+      subscription_id: subscriptionId ? Number(subscriptionId) : null,
+      min_speed_mbps: parseFloat(minSpeed) || 0,
     })
   }
 
@@ -219,6 +224,41 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
             ))
           )}
         </div>
+      </div>
+
+      {/* v1.5.0 — Auto-sync from subscription */}
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-1">
+          Auto-sync from subscription
+          <InfoTip position="bottom" className="ml-0.5" text="Link this circle to a subscription. On every refresh, node_ids auto-update: new nodes added (sorted by latency), removed ones dropped." />
+        </label>
+        <select
+          value={subscriptionId}
+          onChange={(e) => setSubscriptionId(e.target.value)}
+          className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+        >
+          <option value="">None (manual)</option>
+          {subscriptions.map((s) => (
+            <option key={s.id} value={String(s.id)}>{s.name}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* v1.5.0 — Smart rotation: skip if active node is fast enough */}
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-1">
+          Min speed to skip rotation (MB/s)
+          <InfoTip position="bottom" className="ml-0.5" text="When active node is online AND speed >= this value AND latency <= 80ms, rotation is skipped. 0 = always rotate." />
+        </label>
+        <input
+          type="number"
+          step="0.1"
+          min="0"
+          value={minSpeed}
+          onChange={(e) => setMinSpeed(e.target.value)}
+          className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+          placeholder="0"
+        />
       </div>
 
       <div className="flex items-center gap-2">

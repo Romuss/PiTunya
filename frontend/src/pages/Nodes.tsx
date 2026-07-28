@@ -75,6 +75,7 @@ export function Nodes() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<number>(loadPageSize)
   const [direction, setDirection] = useState<SortDirection>(loadDirection)
+  const [qualitySort, setQualitySort] = useState(false)
 
   // Reset to first page whenever the result set changes shape — any
   // filter / search / page-size flip can invalidate the current
@@ -109,7 +110,8 @@ export function Nodes() {
     online: filters.online,
     group: filters.group,
     direction,
-  }), [page, pageSize, search, filters, direction])
+    sort: qualitySort ? 'quality' : undefined,
+  }), [page, pageSize, search, filters, direction, qualitySort])
 
   const { data: pageData, isLoading } = useNodesPage(pageParams)
   const nodes = pageData?.items ?? []
@@ -345,6 +347,25 @@ export function Nodes() {
             : <ArrowUpNarrowWide className="h-4 w-4" />}
           <span className="hidden sm:inline text-xs">
             {direction === 'desc' ? 'Newest' : 'Oldest'}
+          </span>
+        </button>
+        {/* v1.5.0 — Quality sort toggle. When active, sorts by online
+            + speed + latency instead of Node.order. Shows Gauge icon. */}
+        <button
+          type="button"
+          onClick={() => setQualitySort((v) => !v)}
+          className={clsx(
+            'flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors',
+            qualitySort
+              ? 'border-brand-600 bg-brand-900/30 text-brand-400'
+              : 'border-gray-800 bg-gray-900 text-gray-400 hover:text-gray-200 hover:border-gray-700',
+          )}
+          title="Sort by availability + speed + latency. Best nodes on top."
+          aria-label="Quality sort"
+        >
+          <Gauge className="h-4 w-4" />
+          <span className="hidden sm:inline text-xs">
+            {qualitySort ? 'Quality' : 'Sort'}
           </span>
         </button>
       </div>
