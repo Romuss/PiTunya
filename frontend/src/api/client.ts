@@ -107,10 +107,10 @@ export const nodesApi = {
     http.post<HealthResult[]>('/nodes/check-all').then(r => r.data),
 
   speedtest: (id: number) =>
-    http.post<SpeedTestResult>(`/nodes/${id}/speedtest`).then(r => r.data),
+    http.post<SpeedTestResult>(`/nodes/${id}/speed-test`).then(r => r.data),
 
   speedtestAll: () =>
-    http.post<SpeedTestResult[]>('/nodes/speedtest-all').then(r => r.data),
+    http.post<SpeedTestResult[]>('/nodes/speed-test-all').then(r => r.data),
 
   /** Plain-text URI export. Sister to the JSON bundle but emits a
    *  shareable `.txt` file with one `vless://` / `trojan://` / `ss://`
