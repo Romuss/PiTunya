@@ -8,7 +8,7 @@
 > маршрутизирует его через xray-core по вашим правилам — домен,
 > GeoIP, GeoSite, MAC, порт, протокол — через веб-интерфейс.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/DaveBugg/PiTun/ci.yml?branch=master&label=CI)](#)
+[![CI](https://img.shields.io/github/actions/workflow/status/Romuss/PiTunya/ci.yml?branch=master&label=CI)](#)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-lightgrey)](#)
 
@@ -400,7 +400,7 @@ docker build не происходит — на свежем RPi занимае�
 rename `.tmp → final`).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh | sudo bash
 ```
 
 > **Внимание — передача флагов через pipe.** Флаги вида `--flag` ниже
@@ -409,20 +409,20 @@ curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh | 
 >
 > **(A) Foolproof — скачать и запустить:**
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+> curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 >      -o /tmp/pitun-install.sh
 > sudo bash /tmp/pitun-install.sh --version v1.3.0-beta.8
 > ```
 >
 > **(B) Pipe с разделителем `bash -s --`** (`-s --` **обязателен**):
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+> curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 >      | sudo bash -s -- --version v1.3.0-beta.8
 > ```
 >
 > **(C) Через переменную окружения** (без `-s --` шаманства):
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+> curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 >      | sudo PITUN_VERSION=v1.3.0-beta.8 bash
 > ```
 >
@@ -477,7 +477,7 @@ curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh | 
 или patch'ей перед деплоем) — классический путь тоже работает:
 
 ```bash
-git clone https://github.com/DaveBugg/PiTun pitun
+git clone https://github.com/Romuss/PiTunya pitun
 cd pitun
 
 # Подготовка хоста: ставит Docker (если нет), xray-core, GeoIP/GeoSite,
@@ -565,8 +565,8 @@ CI release-workflow публикует загружаемые Docker-tarball'ы 
 
 ```bash
 # На машине с интернетом
-curl -LO https://github.com/DaveBugg/PiTun/releases/download/vX.Y.Z/pitun-backend-vX.Y.Z-arm64.tar.gz
-curl -LO https://github.com/DaveBugg/PiTun/releases/download/vX.Y.Z/pitun-frontend-vX.Y.Z.tar.gz
+curl -LO https://github.com/Romuss/PiTunya/releases/download/vX.Y.Z/pitun-backend-vX.Y.Z-arm64.tar.gz
+curl -LO https://github.com/Romuss/PiTunya/releases/download/vX.Y.Z/pitun-frontend-vX.Y.Z.tar.gz
 
 # Перенесите на хост и:
 docker load < pitun-backend-vX.Y.Z-arm64.tar.gz

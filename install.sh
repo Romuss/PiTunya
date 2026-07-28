@@ -10,7 +10,7 @@
 #
 # ─── Quick start (no flags — installs the latest release) ──────────────────
 #
-#   curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh | sudo bash
 #
 # ─── Install a specific version ────────────────────────────────────────────
 #
@@ -19,16 +19,16 @@
 #
 #   # 1. Download to a temp file, then run with the flag.
 #   #    Recommended — no shell-syntax pitfalls.
-#   curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 #        -o /tmp/pitun-install.sh
 #   sudo bash /tmp/pitun-install.sh --version v1.2.7
 #
 #   # 2. Pipe-form with `bash -s --` separator (REQUIRED to pass flags).
-#   curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 #        | sudo bash -s -- --version v1.2.7
 #
 #   # 3. Environment variable (works without `-s --`).
-#   curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 #        | sudo PITUN_VERSION=v1.2.7 bash
 #
 # ─── COMMON MISTAKE — DO NOT do this: ──────────────────────────────────────
@@ -111,7 +111,7 @@
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
-GITHUB_REPO="${PITUN_REPO:-DaveBugg/PiTun}"
+GITHUB_REPO="${PITUN_REPO:-Romuss/PiTunya}"
 INSTALL_DIR="${PITUN_DIR:-/opt/pitun}"
 VERSION="${PITUN_VERSION:-latest}"
 USE_BUILD="${PITUN_BUILD:-0}"

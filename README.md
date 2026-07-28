@@ -8,7 +8,7 @@
 > on your rules — domain, GeoIP, GeoSite, MAC, port, protocol — with a
 > web UI.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/DaveBugg/PiTun/ci.yml?branch=master&label=CI)](#)
+[![CI](https://img.shields.io/github/actions/workflow/status/Romuss/PiTunya/ci.yml?branch=master&label=CI)](#)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-lightgrey)](#)
 
@@ -405,7 +405,7 @@ cleanly if the connection drops mid-way (every download is retried
 and atomically renamed).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh | sudo bash
 ```
 
 > **Heads up — passing flags to a piped script.** The `--flag` arguments
@@ -414,20 +414,20 @@ curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh | 
 >
 > **(A) Foolproof — download then run:**
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+> curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 >      -o /tmp/pitun-install.sh
 > sudo bash /tmp/pitun-install.sh --version v1.3.0-beta.8
 > ```
 >
 > **(B) Pipe with `bash -s --` separator** (the `-s --` is **required**):
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+> curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 >      | sudo bash -s -- --version v1.3.0-beta.8
 > ```
 >
 > **(C) Environment variable** (no `-s --` voodoo needed):
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
+> curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
 >      | sudo PITUN_VERSION=v1.3.0-beta.8 bash
 > ```
 >
@@ -493,7 +493,7 @@ development, or to apply patches before deploy), the classic path
 still works:
 
 ```bash
-git clone https://github.com/DaveBugg/PiTun pitun
+git clone https://github.com/Romuss/PiTunya pitun
 cd pitun
 
 # Host bootstrap: installs Docker (if missing), xray-core, GeoIP/GeoSite,
@@ -582,8 +582,8 @@ factory-fresh RPi installs:
 
 ```bash
 # On a machine with internet
-curl -LO https://github.com/DaveBugg/PiTun/releases/download/vX.Y.Z/pitun-backend-vX.Y.Z-arm64.tar.gz
-curl -LO https://github.com/DaveBugg/PiTun/releases/download/vX.Y.Z/pitun-frontend-vX.Y.Z.tar.gz
+curl -LO https://github.com/Romuss/PiTunya/releases/download/vX.Y.Z/pitun-backend-vX.Y.Z-arm64.tar.gz
+curl -LO https://github.com/Romuss/PiTunya/releases/download/vX.Y.Z/pitun-frontend-vX.Y.Z.tar.gz
 
 # Transfer to the host, then:
 docker load < pitun-backend-vX.Y.Z-arm64.tar.gz
