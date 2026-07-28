@@ -163,7 +163,7 @@ export function Nodes() {
     onSuccess: (results) => {
       const map: Record<number, string> = {}
       for (const r of results) {
-        map[r.node_id] = r.download_mbps != null ? `${r.download_mbps} Mbps` : r.error ?? 'failed'
+        map[r.node_id] = r.speed_mbps != null && r.speed_mbps > 0 ? `${r.speed_mbps} MB/s` : r.error ?? 'failed'
       }
       setSpeedResults(map)
     },
