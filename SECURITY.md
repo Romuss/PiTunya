@@ -17,7 +17,7 @@ patch release; older minors aren't backported.
 
 Instead, use **GitHub's private vulnerability reporting**:
 
-> https://github.com/DaveBugg/PiTun/security/advisories/new
+> https://github.com/Romuss/PiTunya/security/advisories/new
 
 This sends the report to the maintainer privately, lets us coordinate
 a fix and CVE assignment if applicable, and avoids exposing users
@@ -91,5 +91,5 @@ We're a tiny team — please be patient and we'll do the same.
 - Set a strong `SECRET_KEY` in `.env` (the installer auto-generates
   one; if you ran without it, regenerate via `openssl rand -hex 32`).
 - Keep your host kernel + Docker patched.
-- Watch the [Releases page](https://github.com/DaveBugg/PiTun/releases)
+- Watch the [Releases page](https://github.com/Romuss/PiTunya/releases)
   for security-relevant updates and re-run `install.sh` to apply.

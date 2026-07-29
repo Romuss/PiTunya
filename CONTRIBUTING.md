@@ -1,6 +1,6 @@
 # Contributing to PiTun
 
-Thanks for considering a contribution. PiTun is a small project — most of
+Thanks for considering a contribution. PiTunya (fork of PiTun) is a small project — most of
 the value of the codebase is in being **legible to one person reading it
 cold**, so the bar for changes is "would I be able to debug this in two
 years from a 30-second skim?"
