@@ -2,14 +2,20 @@
 
 Runs as a background loop (started in main.py lifespan, same pattern
 as HealthChecker / SubscriptionScheduler). Every `speed_test_interval`
-seconds (default 3600 = 1 hour), iterates all enabled nodes and runs
-the per-node speed test (switches active → download → restore) for
-each one sequentially.
+seconds (default 3600 = 1 hour), runs the per-node speed test for
+each node sequentially. Results populate `Node.speed_mbps` used by
+NodeCircle "best" mode + min_speed_mbps filter.
 
-The results populate `Node.speed_mbps` + `Node.last_speed_test` which
-the NodeCircle "best" mode uses to rank candidates. Without this
-scheduler, speed_mbps stays NULL for nodes that were never manually
-speed-tested, and the min_speed_mbps filter excludes them.
+The speed test runs THROUGH the current active route (SOCKS5 → 
+xray → whatever node is active). It does NOT switch active node
+(no interruption to traffic). All nodes share the same active
+route's throughput — meaning the result is the speed of the ACTIVE
+node, not each individual node. However, this gives a baseline
+"throughput through the proxy" measurement every hour.
+
+For true per-node measurements (with active switching), the operator
+should use the manual "Speed All" button on the Nodes page, which
+switches active per node.
 """
 import asyncio
 import logging
@@ -79,48 +85,47 @@ class SpeedTestScheduler:
             if elapsed < interval:
                 return  # not time yet
 
-        logger.info("Speed test scheduler: starting round of all enabled nodes")
+        logger.info("Speed test scheduler: starting round (active route only, no switching)")
         self._last_run = now
 
-        # Import here to avoid circular deps with speedtest module
+        # Import here to avoid circular deps
         from app.api.speedtest import _speed_test_via_socks, _save_speed_result
 
-        # Get all enabled nodes sorted by latency (fastest first)
+        # Get current active node — speed test runs THROUGH this node
+        # Only test the active node (no switching!). The result is the
+        # throughput of the active proxy route, not per-node.
+        # For per-node testing, use the manual "Speed All" button.
         async with AsyncSession(get_async_engine()) as session:
-            rows = (await session.execute(
-                text("SELECT id, name FROM node WHERE enabled = 1 ORDER BY latency_ms ASC NULLS LAST")
-            )).all()
+            row = (await session.execute(
+                text("SELECT value FROM settings WHERE key = 'active_node_id'")
+            )).scalar()
 
-        if not rows:
-            logger.info("Speed test scheduler: no enabled nodes — skipping")
+        if not row or not str(row).strip():
+            logger.info("Speed test scheduler: no active node — skipping")
             return
 
+        try:
+            active_id = int(row)
+        except (ValueError, TypeError):
+            return
+
+        # Get active node name for logging
+        async with AsyncSession(get_async_engine()) as session:
+            name_row = (await session.execute(
+                text("SELECT name FROM node WHERE id = :id"),
+                {"id": active_id}
+            )).scalar()
+
+        node_name = name_row or f"node-{active_id}"
         socks_port = int(settings.socks_port)
-        tested = 0
-        failed = 0
 
-        for row in rows:
-            if not self._running:
-                return  # stopped mid-round
-            node_id = row[0]
-            node_name = row[1] if len(row) > 1 else f"node-{node_id}"
-            try:
-                speed = await _speed_test_via_socks(node_id, socks_port)
-                await _save_speed_result(node_id, speed)
-                tested += 1
-                if speed > 0:
-                    logger.info("Speed test scheduler: node %d (%s) = %.1f MB/s",
-                               node_id, node_name, speed)
-                else:
-                    failed += 1
-                    logger.debug("Speed test scheduler: node %d (%s) = 0 MB/s (failed)",
-                                node_id, node_name)
-            except Exception as exc:
-                failed += 1
-                logger.warning("Speed test scheduler: node %d failed: %s", node_id, exc)
-
-        logger.info("Speed test scheduler: round complete — %d tested, %d failed, %d total",
-                    tested - failed, failed, tested)
+        logger.info("Speed test scheduler: testing active node %d (%s)", active_id, node_name)
+        try:
+            speed = await _speed_test_via_socks(active_id, socks_port)
+            await _save_speed_result(active_id, speed)
+            logger.info("Speed test scheduler: node %d (%s) = %.1f MB/s", active_id, node_name, speed)
+        except Exception as exc:
+            logger.warning("Speed test scheduler: active node test failed: %s", exc)
 
 
 speed_test_scheduler = SpeedTestScheduler()
