@@ -340,15 +340,21 @@ class CircleScheduler:
                     "speed_mbps": cand.speed_mbps,
                 })
 
-            # v1.5.0 — if min_speed_mbps > 0, filter out candidates whose
-            # measured speed is below the threshold. Only consider nodes that
-            # either haven't been speed-tested (None = unknown = allowed) or
-            # have measured speed >= min_speed_mbps.
+            # v1.5.0 — apply quality filters to rotation candidates.
+            # When min_speed_mbps > 0: ONLY consider nodes with measured
+            # speed >= threshold. Nodes with speed_mbps = None (untested)
+            # are REJECTED — an untested node can't be "best" when the
+            # operator explicitly set a speed requirement.
+            # When max_latency_ms > 0: filter out nodes with latency >
+            # threshold. Nodes with latency_ms = None (untested) are
+            # allowed (latency check is less strict than speed check).
+            # If ALL candidates fail the filter → keep them all (better
+            # a slow/untested node than no proxy at all).
             min_speed_threshold = getattr(circle, 'min_speed_mbps', 0) or 0
             max_latency_threshold = getattr(circle, 'max_latency_ms', 0) or 0
 
             if min_speed_threshold > 0:
-                filtered = [c for c in all_candidates if (c['speed_mbps'] is None or c['speed_mbps'] >= min_speed_threshold)]
+                filtered = [c for c in all_candidates if c['speed_mbps'] is not None and c['speed_mbps'] >= min_speed_threshold]
                 if filtered:
                     all_candidates = filtered
 
