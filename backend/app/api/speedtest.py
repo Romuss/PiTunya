@@ -166,9 +166,10 @@ async def speed_test_node(node_id: int):
 async def speed_test_all():
     """Run speed tests on ALL enabled nodes sequentially.
 
-    For each node: temporarily switches active, tests, restores.
-    Returns results for every node. This is slow (N × ~5s each) but
-    gives real per-node measurements.
+    For each non-active node: switches active → reload xray → test →
+    restore original active. The active node is tested last (no switch
+    needed). This gives real per-node measurements but is slow
+    (N × ~5-10s each).
     """
     from sqlalchemy import text as sql_text
     async with AsyncSession(get_async_engine()) as session:
@@ -176,9 +177,28 @@ async def speed_test_all():
             sql_text("SELECT id, name FROM node WHERE enabled = 1 ORDER BY latency_ms ASC NULLS LAST")
         )).all()
 
+    # Get current active node to restore at the end
+    active_id = await _get_active_node_id()
+    needs_restore = False
+
     results = []
     for row in rows:
         nid, nm = row[0], row[1]
+        is_active = (active_id == nid)
+
+        if not is_active and not needs_restore:
+            # Switch to first non-active node for testing
+            logger.info("Speed test all: switching active from %s to %d", active_id, nid)
+            await _set_active_node_id(nid)
+            await _reload_xray()
+            await asyncio.sleep(_RESTORE_DELAY)
+            needs_restore = True
+        elif needs_restore:
+            # Switch to next node
+            await _set_active_node_id(nid)
+            await _reload_xray()
+            await asyncio.sleep(_RESTORE_DELAY)
+
         speed = await _speed_test_via_socks(nid, int(settings.socks_port))
         await _save_speed_result(nid, speed)
         results.append({
@@ -186,5 +206,11 @@ async def speed_test_all():
             "node_name": nm,
             "speed_mbps": speed,
         })
+
+    # Restore original active node
+    if needs_restore and active_id is not None:
+        logger.info("Speed test all: restoring active to %s", active_id)
+        await _set_active_node_id(active_id)
+        await _reload_xray()
 
     return {"results": results, "total": len(results)}
