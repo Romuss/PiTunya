@@ -437,7 +437,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, speedtest
+from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, speedtest, config_io
 from app.core.auth import get_current_user
 
 app.include_router(auth.router, prefix="/api")
@@ -473,6 +473,8 @@ app.include_router(xui.router, prefix="/api", dependencies=_auth)
 app.include_router(network.router, prefix="/api", dependencies=_auth)
 # Speed test (since v1.4.8) — auth-gated
 app.include_router(speedtest.router, prefix="/api", dependencies=_auth)
+# v1.5.2 — Config Export/Import (Settings page)
+app.include_router(config_io.router, prefix="/api", dependencies=_auth)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
