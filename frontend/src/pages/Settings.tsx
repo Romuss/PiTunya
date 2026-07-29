@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { systemApi } from '@/api/client'
 import HostNetworkSection from '@/components/HostNetworkSection'
@@ -18,6 +18,8 @@ import {
   Lock,
   Eye,
   EyeOff,
+  Download,
+  Upload,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useT } from '@/hooks/useT'
@@ -66,6 +68,9 @@ export function Settings() {
 
   const [draft, setDraft] = useState<PartialSettings>({})
   const [saved, setSaved] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const importRef = useRef<HTMLInputElement>(null)
   const [error, setError] = useState('')
 
   const mutation = useMutation({
@@ -224,6 +229,53 @@ export function Settings() {
     </div>
   )
 
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      const token = localStorage.getItem('pitun_token')
+      const resp = await fetch('/api/system/export', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      })
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `pitun-config-${new Date().toISOString().slice(0,10)}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert('Export failed: ' + e)
+    }
+    setExporting(false)
+  }
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setImporting(true)
+    try {
+      const token = localStorage.getItem('pitun_token')
+      const formData = new FormData()
+      formData.append('file', file)
+      const resp = await fetch('/api/system/import', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: formData,
+      })
+      const result = await resp.json()
+      if (resp.ok) {
+        alert(`Import complete: ${JSON.stringify(result.results)}`)
+        qc.invalidateQueries()
+      } else {
+        alert('Import failed: ' + (result.detail || 'Unknown error'))
+      }
+    } catch (err) {
+      alert('Import error: ' + err)
+    }
+    setImporting(false)
+    if (importRef.current) importRef.current.value = ''
+  }
+
   return (
     <div className="p-6 space-y-4 max-w-5xl">
       {/* Header */}
@@ -233,6 +285,26 @@ export function Settings() {
           <p className="text-sm text-gray-500 mt-0.5">Network, ports, safety and health check configuration</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* v1.5.2 — Config Export/Import */}
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:border-gray-600 hover:text-gray-100 transition-colors disabled:opacity-50"
+            title="Export all configuration as JSON"
+          >
+            <Download className="h-4 w-4" />
+            <span className="hidden sm:inline">Export Config</span>
+          </button>
+          <button
+            onClick={() => importRef.current?.click()}
+            disabled={importing}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:border-gray-600 hover:text-gray-100 transition-colors disabled:opacity-50"
+            title="Import configuration from JSON file"
+          >
+            <Upload className="h-4 w-4" />
+            <span className="hidden sm:inline">{importing ? 'Importing…' : 'Import Config'}</span>
+          </button>
+          <input ref={importRef} type="file" accept=".json" onChange={handleImport} className="hidden" />
           {saved && (
             <span className="flex items-center gap-1 text-xs text-green-400">
               <CheckCircle2 className="h-3.5 w-3.5" /> Saved
