@@ -124,12 +124,6 @@ async def lifespan(app: FastAPI):
     metrics_collector.start()
     geo_scheduler.start()
 
-    # v1.5.1 — background speed test scheduler: auto-tests all enabled
-    # nodes every speed_test_interval seconds (default 3600 = 1 hour).
-    from app.core.speed_scheduler import speed_test_scheduler
-    speed_test_scheduler.start()
-    _sup.register("speed_test", speed_test_scheduler.start, speed_test_scheduler.stop)
-
     # Service-supervisor bookkeeping (architecture review finding 4.1 +
     # 4.2): register the already-started services so the singleton's
     # snapshot() can report live state to a future /api/health/services
@@ -137,6 +131,12 @@ async def lifespan(app: FastAPI):
     # raised, that service is simply not registered (its absence in the
     # snapshot is itself the failure visibility the supervisor provides).
     from app.core.supervisor import supervisor as _sup
+
+    # v1.5.1 — background speed test scheduler: auto-tests all enabled
+    # nodes every speed_test_interval seconds (default 3600 = 1 hour).
+    from app.core.speed_scheduler import speed_test_scheduler
+    speed_test_scheduler.start()
+    _sup.register("speed_test", speed_test_scheduler.start, speed_test_scheduler.stop)
     _sup.register("health",       health_checker.start,        health_checker.stop)
     _sup.register("subs",         subscription_scheduler.start, subscription_scheduler.stop)
     _sup.register("circle",       circle_scheduler.start,       circle_scheduler.stop)
