@@ -53,7 +53,7 @@ This fork (PiTunya) includes the following enhancements over the upstream:
 
 ### Keywords
 
-`vpn` `proxy` `xray` `v2ray` `vless` `vmess` `trojan` `shadowsocks` `wireguard` `naiveproxy` `tproxy` `nftables` `raspberry-pi` `rpi` `bypass` `censorship` `anti-dpi` `mtproto` `telegram` `subscription` `node-circle` `rotation` `speed-test` `geoip` `transparent-proxy` `lan` `gateway` `self-hosted` `docker` `russia` `china` `iran` `blocking` `обход-блокировок`
+`vpn` `proxy` `xray` `v2ray` `vless` `vmess` `trojan` `shadowsocks` `wireguard` `naiveproxy` `tproxy` `nftables` `raspberry-pi` `rpi` `bypass` `censorship` `anti-dpi` `mtproto` `telegram` `subscription` `node-circle` `rotation` `speed-test` `geoip` `transparent-proxy` `lan` `gateway` `self-hosted` `docker`
 
 
 [![CI](https://img.shields.io/github/actions/workflow/status/Romuss/PiTunya/ci.yml?branch=master&label=CI)](#)
