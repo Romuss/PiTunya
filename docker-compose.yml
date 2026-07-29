@@ -136,7 +136,8 @@ services:
     ports:
       - "127.0.0.1:5300:53/udp"
       - "127.0.0.1:5300:53/tcp"
-      - "127.0.0.1:8081:80"
+      - "8081:3000"
+      - "8082:80"
     volumes:
       - ./data/adguard/conf:/opt/adguardhome/conf
       - ./data/adguard/work:/opt/adguardhome/work
