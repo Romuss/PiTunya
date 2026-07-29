@@ -121,31 +121,6 @@ services:
         max-size: "5m"
         max-file: "2"
 
-  # ── AdGuard Home sidecar (v1.5.2) ──────────────────────────────────────
-  # DNS-level ad/tracker blocking. xray's DNS engine sends queries
-  # to AdGuard Home (127.0.0.1:5300) which applies filter lists
-  # (AdGuard, EasyList, RU AdList) before forwarding to real upstream.
-  # Blocked domains get NXDOMAIN — no connection is ever made.
-  # Web UI on :8080 for managing filter lists.
-  # Enable via COMPOSE_PROFILES=adguard or run standalone.
-  adguard:
-    profiles: ["adguard"]
-    image: adguard/adguardhome:latest
-    container_name: pitun-adguard
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:5300:53/udp"
-      - "127.0.0.1:5300:53/tcp"
-      - "8081:3000"
-      - "8082:80"
-    volumes:
-      - ./data/adguard/conf:/opt/adguardhome/conf
-      - ./data/adguard/work:/opt/adguardhome/work
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "2"
 
   nginx:
     image: nginx:1.25-alpine@sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00
