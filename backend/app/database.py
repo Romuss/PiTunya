@@ -213,6 +213,10 @@ async def init_default_settings():
         # Comma-separated IPv4. Applied after the DHCP/router DNS so a
         # router DNS outage doesn't blind the box. Managed from DNS page.
         "host_fallback_dns": "1.1.1.1,8.8.8.8",
+        # v1.5.1 — background speed test interval (seconds). 0 = disabled.
+        # Default 3600 = 1 hour. Populates Node.speed_mbps for NodeCircle
+        # "best" mode + min_speed_mbps filtering.
+        "speed_test_interval": "3600",
         # Health check
         "health_interval": str(settings.health_interval),
         "health_timeout": str(settings.health_timeout),

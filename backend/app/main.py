@@ -124,6 +124,12 @@ async def lifespan(app: FastAPI):
     metrics_collector.start()
     geo_scheduler.start()
 
+    # v1.5.1 — background speed test scheduler: auto-tests all enabled
+    # nodes every speed_test_interval seconds (default 3600 = 1 hour).
+    from app.core.speed_scheduler import speed_test_scheduler
+    speed_test_scheduler.start()
+    _sup.register("speed_test", speed_test_scheduler.start, speed_test_scheduler.stop)
+
     # Service-supervisor bookkeeping (architecture review finding 4.1 +
     # 4.2): register the already-started services so the singleton's
     # snapshot() can report live state to a future /api/health/services
@@ -328,6 +334,11 @@ async def lifespan(app: FastAPI):
     device_scanner.stop()
     metrics_collector.stop()
     geo_scheduler.stop()
+    try:
+        from app.core.speed_scheduler import speed_test_scheduler
+        speed_test_scheduler.stop()
+    except Exception:
+        pass
     try:
         from app.core.naive_supervisor import naive_supervisor
         naive_supervisor.stop()
