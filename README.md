@@ -1,12 +1,60 @@
-# PiTun
+# PiTunya — Enhanced PiTun Fork
 
 **🌐 Languages:** **English** · [Русский](README.ru.md)
+
+> **This is a fork of [PiTun](https://github.com/DaveBugg/PiTun) by Romuss.**
+> All credit for the original project goes to [DaveBugg](https://github.com/DaveBugg).
+> This fork adds security hardening, smart rotation, speed testing, and
+> quality-based node selection on top of the original PiTun.
+
+---
 
 > Self-hosted transparent proxy manager for Raspberry Pi 4/5 (and any
 > other Linux box). Drops in next to your router, intercepts LAN
 > traffic via nftables TPROXY, and routes it through xray-core based
 > on your rules — domain, GeoIP, GeoSite, MAC, port, protocol — with a
 > web UI.
+
+## What's different from the original PiTun?
+
+This fork (PiTunya) includes the following enhancements over the upstream:
+
+### Security
+- **SECRET_KEY boot guard** — refuses to start with the default `changeme` key
+- **Per-subscription `allow_insecure`** — TLS verification per subscription (was blanket `verify=False`)
+- **Login rate-limiting + DB lockout** — 5 wrong attempts → 1h lockout, per-IP `slowapi` throttling
+- **Optional TLS-on-LAN** — Caddy reverse proxy via `COMPOSE_PROFILES=tls`
+- **Service supervisor + boot event logging** — startup failures visible in Recent Events
+
+### Anti-censorship
+- **`dns_route_via`** setting — route DNS through proxy to hide from ISP DPI
+- **`disable_ipv6`** default true — closes IPv6 bypass leak on new installs
+- **`proxy_local_apps`** — box's own traffic (subscription/x-ui fetches) bypasses VPN by default
+
+### NodeCircle enhancements
+- **"Best" mode** — auto-pick the best available node by quality score (online + latency + speed)
+- **Smart rotation** — skip rotation when active node is healthy (online + latency ≤ threshold)
+- **`min_speed_mbps`** — reject candidates with speed below threshold
+- **`max_latency_ms`** — reject candidates with latency above threshold
+- **Auto-sync from subscription** — circle node_ids automatically update on subscription refresh
+- **`subscription_id`** — link a circle to a subscription, never manually edit again
+
+### Nodes page
+- **Speed test** — per-node throughput measurement (10MB download via SOCKS5)
+- **Quality sort** — sort nodes by availability + speed + latency
+- **Speed badge** — `⚡ XX MB/s` indicator on each node card (green ≥5, yellow ≥1, red <1)
+- **Progress indicator** — animated dots while testing
+- **Name enrichment** — generic names like `proxy` → `vless-🇬🇧-185.12.45.1:443` using GeoLite2
+
+### Operational
+- **`scripts/backup.sh`** — online SQLite backup via VACUUM INTO + rotation + age/gpg encryption
+- **`scripts/update.sh`** — one-command update from fork with auto-rollback
+- **`--repo` / `--branch` flags** in install.sh for fork installs
+
+### Keywords
+
+`vpn` `proxy` `xray` `v2ray` `vless` `vmess` `trojan` `shadowsocks` `wireguard` `naiveproxy` `tproxy` `nftables` `raspberry-pi` `rpi` `bypass` `censorship` `anti-dpi` `mtproto` `telegram` `subscription` `node-circle` `rotation` `speed-test` `geoip` `transparent-proxy` `lan` `gateway` `self-hosted` `docker` `russia` `china` `iran` `blocking` `обход-блокировок`
+
 
 [![CI](https://img.shields.io/github/actions/workflow/status/Romuss/PiTunya/ci.yml?branch=master&label=CI)](#)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
