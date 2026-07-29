@@ -764,6 +764,44 @@ must be set before first start, via `.env`:
 
 Full annotated example: [`.env.example`](.env.example).
 
+> **⚠️ Important — Second IP / Routing-loop prevention.**
+>
+> When devices on your LAN set the PiTun host as their default gateway,
+> the PiTun host itself still needs a route to the internet (to reach
+> your VPN nodes, subscription URLs, geo-data servers, etc.). If the
+> host uses its primary IP as both the LAN gateway IP and its own
+> default route — **a routing loop occurs**: outbound packets from
+> the box get TPROXY'd back into xray, which tries to send them through
+> a VPN node that itself needs to be reached, creating an infinite
+> recursion that silently kills all connectivity.
+>
+> **Solution:** assign **two IPs** to the host's LAN interface:
+>
+> ```bash
+> # Primary IP — devices set this as their default gateway (GATEWAY_IP)
+> ip addr add 192.168.1.100/24 dev eth0
+>
+> # Secondary IP — the host uses this for its own outbound traffic
+> # (subscription fetches, geo-data downloads, health checks, SSH to VPS)
+> # The nftables `output` chain bypasses this address.
+> ip addr add 192.168.1.101/24 dev eth0
+> ```
+>
+> Set `GATEWAY_IP=192.168.1.100` in `.env`. The host's default route
+> should use the secondary IP (or the router's IP) as source:
+> ```bash
+> ip route replace default via 192.168.1.1 src 192.168.1.101
+> ```
+>
+> This way:
+> - Devices → `192.168.1.100` (GATEWAY_IP) → TPROXY → xray → VPN → internet
+> - Host's own traffic → `192.168.1.101` → router → internet (bypasses TPROXY)
+>
+> Without the second IP, the `proxy_local_apps` setting (v1.4.7+) is
+> the fallback — it prevents the `output` chain from marking the box's
+> own traffic, letting it go direct. But the second-IP approach is more
+> reliable because it works even when nftables rules are in a stale state.
+
 > **About `GATEWAY_IP`:** the variable name predates the LAN-gateway
 > feature and refers to the PiTun host itself, not your home router.
 > If the .env value disagrees with the actual interface IP, the backend
