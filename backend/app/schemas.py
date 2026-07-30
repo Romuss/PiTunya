@@ -942,6 +942,9 @@ class SubscriptionBase(BaseModel):
     url: str
     enabled: bool = True
     ua: str = "clash"
+    # CRLF injection guard (CWE-93, upstream v1.4.7): httpx forwards CR/LF
+    # inside header values unchanged, which smuggles extra headers. Reject
+    # any control characters that could break out of the User-Agent value.
     custom_ua: Optional[str] = None
     filter_regex: Optional[str] = None
     auto_update: bool = False
@@ -984,6 +987,28 @@ class SubscriptionBase(BaseModel):
                         raise ValueError(f"URL hostname resolves to private address ({addr[0]})")
             except socket.gaierror:
                 pass  # DNS resolution failed — let httpx handle it later
+        return v
+
+    @field_validator("custom_ua")
+    @classmethod
+    def validate_custom_ua(cls, v: Optional[str]) -> Optional[str]:
+        """Reject CR/LF (and other control chars) in custom_ua to prevent
+        HTTP header smuggling (CWE-93, upstream v1.4.7 fix). httpx forwards
+        raw CR/LF in header values without stripping, so a value containing
+        ``\\r\\nX-Injected: evil`` would inject an extra header on the
+        subscription fetch request."""
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        # Reject any C0 control chars (0x00-0x1F) and DEL (0x7F) — RFC 7230
+        # field-content already bans these, but httpx doesn't enforce it.
+        for ch in v:
+            if ord(ch) < 0x20 or ord(ch) == 0x7F:
+                raise ValueError(
+                    "custom_ua must not contain control characters (CR/LF/etc.)"
+                )
         return v
 
 

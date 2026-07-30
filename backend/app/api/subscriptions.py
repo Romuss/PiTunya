@@ -289,6 +289,16 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         # Override is for panels that gate on a fingerprint we don't ship
         # a preset for — paste the UA the panel docs specify.
         custom = (sub.custom_ua or "").strip()
+        # Defense-in-depth CRLF guard (CWE-93, upstream v1.4.7): even though
+        # the schema validator rejects control characters, a row that was
+        # written by an older code version (pre-fix) could still contain
+        # CR/LF. Strip them here so the httpx request never smuggles a header.
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in custom):
+            logger.warning(
+                "Subscription %d custom_ua contains control chars — stripping",
+                sub_id,
+            )
+            custom = "".join(c for c in custom if ord(c) >= 0x20 and ord(c) != 0x7F)
         ua = custom or _UA_MAP.get(sub.ua, _UA_MAP["v2ray"])
         headers = {
             "User-Agent": ua,

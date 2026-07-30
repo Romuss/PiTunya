@@ -683,6 +683,11 @@ export const serversApi = {
       `/servers/${serverId}/deployments/wireguard/clients/${encodeURIComponent(name)}/conf`,
     ).then(r => r.data),
 
+  getClientStats: (serverId: number, name: string) =>
+    http.get<{ name: string; rx_bytes: number; tx_bytes: number; rx_mb: number; tx_mb: number; online: boolean; error?: string }>(
+      `/servers/${serverId}/deployments/wireguard/clients/${encodeURIComponent(name)}/stats`,
+    ).then(r => r.data),
+
   exportClientToNode: (
     serverId: number, name: string, body: ExportClientToNodeRequest = {},
   ) =>

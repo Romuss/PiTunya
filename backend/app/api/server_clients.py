@@ -507,6 +507,112 @@ async def get_client_conf(
 # ── POST /{name}/export-node — create Node from this client ──────────────────
 
 
+
+@router.get("/{name}/stats")
+async def get_client_stats(
+    server_id: int,
+    name: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Get WireGuard traffic statistics for a specific client peer.
+
+    Runs `wg show wg0 transfer` on the VPS via SSH, parses the
+    rx/tx bytes for the peer matching this client's public key.
+    """
+    server = (await session.exec(
+        select(Server).where(Server.id == server_id)
+    )).first()
+    if not server:
+        raise HTTPException(404, "Server not found")
+
+    # Find the deployment + client
+    dep = (await session.exec(
+        select(ServerDeployment).where(
+            ServerDeployment.server_id == server_id,
+            ServerDeployment.protocol == "wireguard",
+        )
+    )).first()
+    if not dep:
+        raise HTTPException(404, "No WireGuard deployment on this server")
+
+    dc = (await session.exec(
+        select(DeploymentClient).where(
+            DeploymentClient.deployment_id == dep.id,
+            DeploymentClient.name == name,
+        )
+    )).first()
+    if not dc:
+        raise HTTPException(404, f"Client {name!r} not found")
+
+    pub_key = dc.wg_public_key
+    if not pub_key:
+        raise HTTPException(400, f"Client {name!r} has no public key on record")
+
+    # SSH: run `wg show wg0 transfer` on the VPS
+    from app.core.ssh import exec_remote_script, DeployResult
+    from app.core.deploy import build_plan
+    import json as _json
+
+    # Build a minimal SSH command to get wg transfer stats
+    try:
+        from app.core.ssh import _resolve_direct, _connect_marked, _BYPASS_MARK
+        import os, struct
+
+        # Get server auth
+        auth_type = server.auth_type
+        password = server.password
+        private_key = server.private_key
+        passphrase = server.passphrase
+
+        # Connect and run wg show
+        cmd = f"wg show wg0 transfer 2>/dev/null || echo 'WG_NOT_RUNNING'"
+        result = await exec_remote_script(server, cmd, env={}, protocol="wireguard")
+
+        if not result.ok:
+            return {
+                "name": name,
+                "rx_bytes": 0,
+                "tx_bytes": 0,
+                "rx_mb": 0.0,
+                "tx_mb": 0.0,
+                "online": False,
+                "error": "SSH command failed",
+            }
+
+        # Parse wg show output: each line is "pubkey\trx_bytes\ttx_bytes"
+        rx_bytes = 0
+        tx_bytes = 0
+        online = False
+        for line in result.stdout.strip().split("\n"):
+            if line == "WG_NOT_RUNNING" or not line.strip():
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) >= 3 and parts[0].strip() == pub_key:
+                rx_bytes = int(parts[1]) if parts[1].isdigit() else 0
+                tx_bytes = int(parts[2]) if parts[2].isdigit() else 0
+                online = True
+                break
+
+        return {
+            "name": name,
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes,
+            "rx_mb": round(rx_bytes / 1_000_000, 2) if rx_bytes else 0.0,
+            "tx_mb": round(tx_bytes / 1_000_000, 2) if tx_bytes else 0.0,
+            "online": online,
+        }
+    except Exception as exc:
+        logger.warning("WG stats failed for %s: %s", name, exc)
+        return {
+            "name": name,
+            "rx_bytes": 0,
+            "tx_bytes": 0,
+            "rx_mb": 0.0,
+            "tx_mb": 0.0,
+            "online": False,
+            "error": str(exc)[:200],
+        }
+
 @router.post("/{name}/export-node", response_model=NodeRead)
 async def export_to_node(
     server_id: int, name: str,

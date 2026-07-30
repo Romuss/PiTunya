@@ -2,13 +2,16 @@ import { useState } from 'react'
 import * as React from 'react'
 import {
   Users, Plus, RefreshCw, Trash2, Download, Network, Loader2,
-  AlertTriangle, AlertCircle, CheckCircle2, ExternalLink,
+  AlertTriangle, AlertCircle, CheckCircle2, ExternalLink, QrCode,
+  ArrowDown,
 } from 'lucide-react'
+import { QRCodeSVG } from 'qrcode.react'
 
 import { serversApi } from '@/api/client'
 import { ModalShell } from '@/components/ModalShell'
 import { useT } from '@/hooks/useT'
 import { useConfirm } from '@/components/ConfirmModal'
+import { apiError } from '@/lib/apiError'
 import {
   useDeploymentClients,
   useAddClient,
@@ -65,6 +68,10 @@ export function ManageClientsModal({
 
   const [newName, setNewName] = useState('')
   const [actionError, setActionError] = useState<string>('')
+  const [qrConf, setQrConf] = useState<string | null>(null)
+  const [qrName, setQrName] = useState('')
+  const [stats, setStats] = useState<Record<string, { rx_mb: number; tx_mb: number; online: boolean }>>({})
+  const [statsLoading, setStatsLoading] = useState(false)
   const [lastSync, setLastSync] = useState<{
     added: string[]; unchanged: string[]; orphaned: string[]
   } | null>(null)
@@ -138,8 +145,6 @@ export function ManageClientsModal({
     setActionError('')
     try {
       const conf = await serversApi.getClientConf(server.id, c.name)
-      // Trigger a browser download — `<server>-<client>.conf` is the
-      // typical naming used by wg-quick / mobile apps.
       const blob = new Blob([conf.wg_conf], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -150,6 +155,35 @@ export function ManageClientsModal({
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
     }
+  }
+
+  const onShowQR = async (c: DeploymentClient) => {
+    setActionError('')
+    try {
+      const conf = await serversApi.getClientConf(server.id, c.name)
+      setQrConf(conf.wg_conf)
+      setQrName(c.name)
+    } catch (err: unknown) {
+      setActionError(extractAxiosError(err))
+    }
+  }
+
+  const onFetchStats = async () => {
+    setStatsLoading(true)
+    setActionError('')
+    try {
+      const results: Record<string, { rx_mb: number; tx_mb: number; online: boolean }> = {}
+      for (const c of clients) {
+        try {
+          const s = await serversApi.getClientStats(server.id, c.name)
+          results[c.name] = { rx_mb: s.rx_mb, tx_mb: s.tx_mb, online: s.online }
+        } catch { results[c.name] = { rx_mb: 0, tx_mb: 0, online: false } }
+      }
+      setStats(results)
+    } catch (err: unknown) {
+      setActionError(extractAxiosError(err))
+    }
+    setStatsLoading(false)
   }
 
   return (
@@ -292,6 +326,8 @@ export function ManageClientsModal({
                   <th className="px-3 py-2 text-left">{t('Name', 'Имя')}</th>
                   <th className="px-3 py-2 text-left">{t('Status', 'Статус')}</th>
                   <th className="px-3 py-2 text-left">{t('Address', 'Адрес')}</th>
+                  <th className="px-3 py-2 text-right">RX</th>
+                  <th className="px-3 py-2 text-right">TX</th>
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
@@ -309,12 +345,27 @@ export function ManageClientsModal({
                     onRemove={() => onRemove(c)}
                     onExport={() => onExport(c)}
                     onDownload={() => onDownloadConf(c)}
+                    onShowQR={() => onShowQR(c)}
+                    clientStats={stats}
                   />
                 ))}
               </tbody>
             </table>
           </div>
         )}
+
+        {/* Stats button */}
+        <div className="flex items-center gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onFetchStats}
+            disabled={statsLoading || clients.length === 0}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:border-gray-600 hover:text-gray-100 transition-colors disabled:opacity-50"
+          >
+            {statsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowDown className="h-3.5 w-3.5" />}
+            {statsLoading ? t('Loading...', 'Загрузка...') : t('Fetch Stats', 'Статистика')}
+          </button>
+        </div>
 
         {/* Footer */}
         <div className="flex justify-end pt-4">
@@ -327,6 +378,26 @@ export function ManageClientsModal({
           </button>
         </div>
       </div>
+      {/* QR Code Modal for WG client */}
+      {qrConf && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={() => setQrConf(null)}>
+          <div className="rounded-2xl bg-gray-950 border border-gray-800 p-6 max-w-sm" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-semibold text-gray-200">{qrName} — QR</h3>
+              <button onClick={() => setQrConf(null)} className="text-gray-500 hover:text-gray-300">
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="flex justify-center rounded-xl bg-white p-4">
+              <QRCodeSVG value={qrConf} size={240} />
+            </div>
+            <p className="text-xs text-gray-500 mt-3 text-center">
+              Scan with WireGuard app (iOS/Android)
+            </p>
+          </div>
+        </div>
+      )}
+
     </ModalShell>
   )
 }
@@ -341,6 +412,8 @@ function ClientRow({
   onRemove,
   onExport,
   onDownload,
+  onShowQR,
+  clientStats,
 }: {
   client: DeploymentClient
   busy: boolean
@@ -348,6 +421,8 @@ function ClientRow({
   onRemove: () => void
   onExport: () => void
   onDownload: () => void
+  onShowQR?: () => void
+  clientStats?: Record<string, { rx_mb: number; tx_mb: number; online: boolean }>
 }) {
   const t = useT()
   const exportedCount = client.exported_node_ids.length
@@ -369,8 +444,20 @@ function ClientRow({
       <td className="px-3 py-2 text-xs text-gray-400 font-mono">
         {client.wg_local_address || <span className="text-gray-600">—</span>}
       </td>
+      <td className="px-3 py-2 text-xs text-gray-400 font-mono text-right">
+        {clientStats && clientStats[client.name] ? `${clientStats[client.name].rx_mb} MB` : '—'}
+      </td>
+      <td className="px-3 py-2 text-xs text-gray-400 font-mono text-right">
+        {clientStats && clientStats[client.name] ? `${clientStats[client.name].tx_mb} MB` : '—'}
+      </td>
       <td className="px-3 py-2">
         <div className="flex justify-end gap-1">
+          <IconBtn
+            onClick={() => onShowQR?.()}
+            title={t('Show QR code', 'Показать QR-код')}
+            icon={QrCode}
+            disabled={isOrphan}
+          />
           <IconBtn
             onClick={onDownload}
             title={t('Download .conf', 'Скачать .conf')}
@@ -454,18 +541,5 @@ function IconBtn({
 }
 
 
-function extractAxiosError(err: unknown): string {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as { response?: { data?: { detail?: unknown } }, message?: string }
-    const detail = e.response?.data?.detail
-    if (typeof detail === 'string') return detail
-    if (Array.isArray(detail)) {
-      return detail
-        .map((d: { msg?: string; loc?: unknown }) => (d?.msg ?? '') + (d?.loc ? ' (' + JSON.stringify(d.loc) + ')' : ''))
-        .filter(Boolean)
-        .join('; ')
-    }
-    if (e.message) return e.message
-  }
-  return 'Request failed'
-}
+// Replaced by shared apiError() from @/lib/apiError (upstream v1.4.7).
+const extractAxiosError = apiError

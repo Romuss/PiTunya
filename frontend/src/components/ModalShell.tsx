@@ -33,10 +33,14 @@ interface ModalShellProps {
   labelledBy?: string
   /** Override z-index (default 50). Bump if you nest dialogs. */
   z?: number
+  /** Whether to close on Escape (default true). Set to false for nested
+   * dialogs where the parent should trap Esc instead — prevents one
+   * keypress from collapsing the entire modal stack (upstream v1.4.7). */
+  closeOnEscape?: boolean
 }
 
-export function ModalShell({ onClose, children, labelledBy, z = 50 }: ModalShellProps) {
-  useEscapeKey(onClose)
+export function ModalShell({ onClose, children, labelledBy, z = 50, closeOnEscape = true }: ModalShellProps) {
+  useEscapeKey(onClose, closeOnEscape)
 
   // Portal to document.body so the modal isn't a child of any
   // page-level wrapper. Without this, callers that render the modal
