@@ -405,11 +405,17 @@ async def sync_clients(
         if not nm:
             continue
         if nm in local:
-            # Refresh sync timestamp + un-orphan if it had been flagged
+            # Refresh sync timestamp + un-orphan + update public key
             row = local[nm]
             row.last_synced_at = now
             if row.status == "orphan":
                 row.status = "available"
+            # Always update wg_public_key from the server's canonical
+            # source (wg0.conf parse) so stats matching works even if
+            # the original URI-parsed key was wrong/stale.
+            srv_pub = c.get("public_key")
+            if srv_pub and srv_pub != row.wg_public_key:
+                row.wg_public_key = srv_pub
             session.add(row)
             unchanged.append(nm)
         else:
@@ -635,6 +641,30 @@ async def get_client_stats(
                     tx_bytes = int(parts[2]) if parts[2].isdigit() else 0
                     online = True
                     break
+
+        if not online:
+            # Diagnostic: include what wg show returned vs what we have stored
+            # so the operator can see exactly why the match failed.
+            wg_keys = []
+            for line in stdout.split("\n"):
+                if line.startswith("WG_NOT_RUNNING:") or not line.strip():
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) >= 3:
+                    wg_keys.append(parts[0].strip()[:16] + "…")
+            return {
+                "name": name,
+                "rx_bytes": 0,
+                "tx_bytes": 0,
+                "rx_mb": 0.0,
+                "tx_mb": 0.0,
+                "online": False,
+                "error": (
+                    f"No peer matched stored key "
+                    f"(stored={pub_key[:16]}…, norm={norm_stored[:16]}…, "
+                    f"wg_peers={wg_keys})"
+                ),
+            }
 
         return {
             "name": name,
