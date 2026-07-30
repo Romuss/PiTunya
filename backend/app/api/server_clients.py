@@ -548,25 +548,23 @@ async def get_client_stats(
     if not pub_key:
         raise HTTPException(400, f"Client {name!r} has no public key on record")
 
-    # SSH: run `wg show wg0 transfer` on the VPS
-    from app.core.ssh import exec_remote_script, DeployResult
-    from app.core.deploy import build_plan
-    import json as _json
+    # SSH: run `wg show wg0 transfer` on the VPS. exec_remote_script
+    # uploads a script via SFTP then executes it — we pass a tiny
+    # one-liner that outputs the peer transfer counters.
+    from app.core.ssh import exec_remote_script
 
-    # Build a minimal SSH command to get wg transfer stats
     try:
-        from app.core.ssh import _resolve_direct, _connect_marked, _BYPASS_MARK
-        import os, struct
-
-        # Get server auth
-        auth_type = server.auth_type
-        password = server.password
-        private_key = server.private_key
-        passphrase = server.passphrase
-
-        # Connect and run wg show
-        cmd = f"wg show wg0 transfer 2>/dev/null || echo 'WG_NOT_RUNNING'"
-        result = await exec_remote_script(server, cmd, env={}, protocol="wireguard")
+        result = await exec_remote_script(
+            host=server.host,
+            port=server.port or 22,
+            username=server.user,
+            password=server.password if server.auth_type == "password" else None,
+            private_key=server.private_key if server.auth_type == "key" else None,
+            passphrase=server.passphrase if server.auth_type == "key" else None,
+            script_content="wg show wg0 transfer 2>/dev/null || echo WG_NOT_RUNNING\n",
+            env={},
+            timeout=15,
+        )
 
         if not result.ok:
             return {
@@ -576,14 +574,14 @@ async def get_client_stats(
                 "rx_mb": 0.0,
                 "tx_mb": 0.0,
                 "online": False,
-                "error": "SSH command failed",
+                "error": result.error or "SSH command failed",
             }
 
         # Parse wg show output: each line is "pubkey\trx_bytes\ttx_bytes"
         rx_bytes = 0
         tx_bytes = 0
         online = False
-        for line in result.stdout.strip().split("\n"):
+        for line in (result.stdout or "").strip().split("\n"):
             if line == "WG_NOT_RUNNING" or not line.strip():
                 continue
             parts = line.strip().split("\t")
