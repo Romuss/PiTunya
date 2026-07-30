@@ -548,6 +548,22 @@ async def get_client_stats(
     if not pub_key:
         raise HTTPException(400, f"Client {name!r} has no public key on record")
 
+    # Normalise the stored public key to standard base64 (with + and /).
+    # URI parsers (WireGuard URI format) use base64url (- and _) while
+    # `wg show <iface> transfer` outputs standard base64. Without this
+    # conversion the key comparison always fails and stats show 0.
+    import base64
+    def _norm_b64(key: str) -> str:
+        """Convert base64url to standard base64 (for comparison only)."""
+        t = key.replace("-", "+").replace("_", "/")
+        # Add padding if needed
+        pad = len(t) % 4
+        if pad:
+            t += "=" * (4 - pad)
+        return t
+
+    norm_stored = _norm_b64(pub_key)
+
     # SSH: run `wg show wg0 transfer` on the VPS. exec_remote_script
     # uploads a script via SFTP then executes it — we pass a tiny
     # one-liner that outputs the peer transfer counters.
@@ -555,8 +571,6 @@ async def get_client_stats(
 
     try:
         # Use absolute paths: non-interactive bash may not have wg in PATH.
-        # Also be robust to the interface being named something other than
-        # wg0 by listing all interfaces if wg0 fails.
         script = (
             "#!/bin/bash\n"
             "WG=$(command -v wg || echo /usr/bin/wg)\n"
@@ -611,11 +625,16 @@ async def get_client_stats(
             if not line.strip():
                 continue
             parts = line.strip().split("\t")
-            if len(parts) >= 3 and parts[0].strip() == pub_key:
-                rx_bytes = int(parts[1]) if parts[1].isdigit() else 0
-                tx_bytes = int(parts[2]) if parts[2].isdigit() else 0
-                online = True
-                break
+            if len(parts) >= 3:
+                wg_key = parts[0].strip()
+                # Compare both raw and normalised forms — the stored key
+                # may be base64url while wg show is standard base64.
+                norm_wg = _norm_b64(wg_key)
+                if wg_key == pub_key or norm_wg == norm_stored:
+                    rx_bytes = int(parts[1]) if parts[1].isdigit() else 0
+                    tx_bytes = int(parts[2]) if parts[2].isdigit() else 0
+                    online = True
+                    break
 
         return {
             "name": name,
