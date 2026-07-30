@@ -554,14 +554,28 @@ async def get_client_stats(
     from app.core.ssh import exec_remote_script
 
     try:
+        # Use absolute paths: non-interactive bash may not have wg in PATH.
+        # Also be robust to the interface being named something other than
+        # wg0 by listing all interfaces if wg0 fails.
+        script = (
+            "#!/bin/bash\n"
+            "WG=$(command -v wg || echo /usr/bin/wg)\n"
+            "out=$($WG show wg0 transfer 2>&1)\n"
+            "rc=$?\n"
+            "if [ $rc -ne 0 ]; then\n"
+            "  echo \"WG_NOT_RUNNING:$out\"\n"
+            "else\n"
+            "  echo \"$out\"\n"
+            "fi\n"
+        )
         result = await exec_remote_script(
             host=server.host,
             port=server.port or 22,
-            username=server.user,
+            username=server.user or "root",
             password=server.password if server.auth_type == "password" else None,
             private_key=server.private_key if server.auth_type == "key" else None,
             passphrase=server.passphrase if server.auth_type == "key" else None,
-            script_content="wg show wg0 transfer 2>/dev/null || echo WG_NOT_RUNNING\n",
+            script_content=script,
             env={},
             timeout=15,
         )
@@ -578,11 +592,23 @@ async def get_client_stats(
             }
 
         # Parse wg show output: each line is "pubkey\trx_bytes\ttx_bytes"
+        stdout = (result.stdout or "").strip()
         rx_bytes = 0
         tx_bytes = 0
         online = False
-        for line in (result.stdout or "").strip().split("\n"):
-            if line == "WG_NOT_RUNNING" or not line.strip():
+        for line in stdout.split("\n"):
+            if line.startswith("WG_NOT_RUNNING:"):
+                # wg show failed — include the reason in the response
+                return {
+                    "name": name,
+                    "rx_bytes": 0,
+                    "tx_bytes": 0,
+                    "rx_mb": 0.0,
+                    "tx_mb": 0.0,
+                    "online": False,
+                    "error": line.split(":", 1)[1][:200],
+                }
+            if not line.strip():
                 continue
             parts = line.strip().split("\t")
             if len(parts) >= 3 and parts[0].strip() == pub_key:

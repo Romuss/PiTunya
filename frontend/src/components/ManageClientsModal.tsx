@@ -173,13 +173,18 @@ export function ManageClientsModal({
     setActionError('')
     try {
       const results: Record<string, { rx_mb: number; tx_mb: number; online: boolean }> = {}
+      let firstError = ''
       for (const c of clients) {
         try {
           const s = await serversApi.getClientStats(server.id, c.name)
           results[c.name] = { rx_mb: s.rx_mb, tx_mb: s.tx_mb, online: s.online }
-        } catch { results[c.name] = { rx_mb: 0, tx_mb: 0, online: false } }
+          if (s.error && !firstError) firstError = `${c.name}: ${s.error}`
+        } catch {
+          results[c.name] = { rx_mb: 0, tx_mb: 0, online: false }
+        }
       }
       setStats(results)
+      if (firstError) setActionError(firstError)
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
     }
