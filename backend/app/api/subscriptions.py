@@ -804,11 +804,19 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
                     ).order_by(Node.latency_ms.asc().nulls_last(), Node.id)
                 )).all()
                 fresh_ids = [n for n in fresh_nodes if n is not None]
+                fresh_id_set = set(fresh_ids)
                 for circle in linked_circles:
                     old_ids = _json.loads(circle.node_ids) if isinstance(circle.node_ids, str) else (circle.node_ids or [])
-                    circle.node_ids = _json.dumps(fresh_ids)
+                    # MERGE semantics (v1.5.2 fix): keep manually-added nodes
+                    # (from other subscriptions or standalone) that are NOT
+                    # part of the linked subscription. Only the subscription's
+                    # own nodes are synced (new ones added, removed ones dropped);
+                    # manually-added nodes are preserved.
+                    manual_ids = [i for i in old_ids if i not in fresh_id_set and i not in removed_ids]
+                    merged_ids = manual_ids + fresh_ids
+                    circle.node_ids = _json.dumps(merged_ids)
                     # Reset current_index if it points past the new list
-                    if circle.current_index >= len(fresh_ids):
+                    if circle.current_index >= len(merged_ids):
                         circle.current_index = 0
                     session.add(circle)
                 logger.info(

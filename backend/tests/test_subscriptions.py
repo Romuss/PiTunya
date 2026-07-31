@@ -421,6 +421,79 @@ class TestSubscriptionRefreshPreservesCircles:
         assert json.loads(circle_after.node_ids) == [a.id, b.id]
         assert circle_after.enabled is True
 
+    def test_auto_sync_preserves_manually_added_nodes(
+        self, client, admin_user, auth_headers, session,
+    ):
+        """When a NodeCircle is linked to a subscription (has subscription_id),
+        the auto-sync merge must preserve any manually-added nodes that are
+        NOT part of that subscription.
+
+        Scenario: circle has subscription_id=sub1, contains:
+          - node A (from sub1)
+          - node B (from sub1)
+          - node M (manual, no subscription_id / standalone)
+
+        After refresh with only A surviving (B vanished), M must still be in
+        node_ids."""
+        import asyncio, json
+        from app.api.subscriptions import _fetch_subscription_unlocked
+        from app.models import Subscription, Node, NodeCircle
+
+        sub = Subscription(name="Test", url="http://example/sub", enabled=True)
+        session.add(sub)
+        session.commit()
+        session.refresh(sub)
+
+        # Nodes belonging to the subscription
+        a = Node(name="a", protocol="vless", address="1.1.1.1", port=443,
+                 uuid="a", transport="tcp", subscription_id=sub.id, enabled=True)
+        b = Node(name="b", protocol="vless", address="2.2.2.2", port=443,
+                 uuid="b", transport="tcp", subscription_id=sub.id, enabled=True)
+        # Manual node — NO subscription_id (standalone / imported via URI)
+        m = Node(name="manual", protocol="vless", address="9.9.9.9", port=443,
+                 uuid="m", transport="tcp", subscription_id=None, enabled=True)
+        for n in (a, b, m):
+            session.add(n)
+        session.commit()
+        for n in (a, b, m):
+            session.refresh(n)
+
+        # Circle linked to sub, with both sub nodes + manual node
+        circle = NodeCircle(
+            name="linked", node_ids=json.dumps([a.id, b.id, m.id]),
+            mode="sequential", interval_min=5, interval_max=10,
+            current_index=0, enabled=True,
+            subscription_id=sub.id,  # ← linked circle!
+        )
+        session.add(circle)
+        session.commit()
+        session.refresh(circle)
+        circle_id = circle.id
+
+        # Refresh returns ONLY `a` — `b` vanished from panel
+        with mock.patch(
+            "app.api.subscriptions.httpx.AsyncClient"
+        ) as mock_client:
+            instance = mock_client.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=mock.Mock(
+                status_code=200,
+                text="vless://a@1.1.1.1:443?type=tcp#a\n",
+                raise_for_status=lambda: None,
+            ))
+            asyncio.run(_fetch_subscription_unlocked(sub.id))
+
+        session.expire_all()
+        circle_after = session.get(NodeCircle, circle_id)
+        ids_after = json.loads(circle_after.node_ids)
+        # B is gone (vanished), A is kept, manual M is preserved
+        assert a.id in ids_after, f"surviving subscription node {a.id} should be present: {ids_after}"
+        assert m.id in ids_after, (
+            f"manually-added node {m.id} was dropped by auto-sync merge: {ids_after}"
+        )
+        assert b.id not in ids_after, (
+            f"vanished subscription node {b.id} should have been pruned: {ids_after}"
+        )
+
 
 class TestSubscriptionRefreshDedupsParsed:
     """Panels (especially Happ JSON bundles) often return the SAME
