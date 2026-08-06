@@ -943,6 +943,174 @@ class NodeCircleRead(NodeCircleBase):
         from_attributes = True
 
 
+_AUTOCHECK_SCOPES = ("all", "subscription", "group", "nodes")
+
+
+class AutoCheckRead(BaseModel):
+    enabled: bool
+    interval_minutes: int
+    scope_kind: str
+    scope_value: str
+    last_sweep: Optional[datetime] = None
+    is_sweeping: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class AutoCheckUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    interval_minutes: Optional[int] = None
+    scope_kind: Optional[str] = None
+    scope_value: Optional[str] = None
+
+    @field_validator("interval_minutes")
+    @classmethod
+    def validate_interval(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("interval_minutes must be at least 1")
+        return v
+
+    @field_validator("scope_kind")
+    @classmethod
+    def validate_scope_kind(cls, v):
+        if v is not None and v not in _AUTOCHECK_SCOPES:
+            raise ValueError(f"scope_kind must be one of {_AUTOCHECK_SCOPES}")
+        return v
+
+
+# ─── User-Agent templates ─────────────────────────────────────────────────────
+
+class UserAgentTemplateBase(BaseModel):
+    """Editable fields of a UA template.
+
+    Ported from upstream DaveBugg/PiTun v1.4.7.
+
+    Validation is delegated to `app.core.ua_templates` so the API, the
+    import endpoint and the seeding path all enforce one ruleset. The
+    header checks are not cosmetic: httpx 0.28 happily forwards a CR/LF
+    inside a header value (request splitting) and raises on non-ASCII,
+    so both have to be rejected before the value reaches the DB.
+    """
+    key: str
+    name: str
+    user_agent: str
+    headers: Dict[str, str] = {}
+    description: Optional[str] = None
+    order: int = 100
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, v: str) -> str:
+        from app.core.ua_templates import validate_key
+        return validate_key(v)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        from app.core.ua_templates import validate_name
+        return validate_name(v)
+
+    @field_validator("user_agent")
+    @classmethod
+    def validate_user_agent(cls, v: str) -> str:
+        from app.core.ua_templates import validate_user_agent
+        return validate_user_agent(v)
+
+    @field_validator("headers", mode="before")
+    @classmethod
+    def validate_headers_field(cls, v):
+        from app.core.ua_templates import parse_headers, validate_headers
+        if isinstance(v, str):
+            v = parse_headers(v)
+        return validate_headers(v)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v: Optional[str]) -> Optional[str]:
+        from app.core.ua_templates import validate_description
+        return validate_description(v)
+
+
+class UserAgentTemplateCreate(UserAgentTemplateBase):
+    pass
+
+
+class UserAgentTemplateUpdate(BaseModel):
+    """PATCH body — every field optional, same validators as create."""
+    key: Optional[str] = None
+    name: Optional[str] = None
+    user_agent: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    description: Optional[str] = None
+    order: Optional[int] = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, v):
+        if v is None:
+            return None
+        from app.core.ua_templates import validate_key
+        return validate_key(v)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v):
+        if v is None:
+            return None
+        from app.core.ua_templates import validate_name
+        return validate_name(v)
+
+    @field_validator("user_agent")
+    @classmethod
+    def validate_user_agent(cls, v):
+        if v is None:
+            return None
+        from app.core.ua_templates import validate_user_agent
+        return validate_user_agent(v)
+
+    @field_validator("headers", mode="before")
+    @classmethod
+    def validate_headers_field(cls, v):
+        if v is None:
+            return None
+        from app.core.ua_templates import parse_headers, validate_headers
+        if isinstance(v, str):
+            v = parse_headers(v)
+        return validate_headers(v)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v):
+        if v is None:
+            return None
+        from app.core.ua_templates import validate_description
+        return validate_description(v)
+
+
+class UserAgentTemplateRead(BaseModel):
+    """Output model — intentionally NOT a subclass of the validating base."""
+    id: int
+    key: str
+    name: str
+    user_agent: str
+    headers: Dict[str, str] = {}
+    description: Optional[str] = None
+    builtin: bool = False
+    order: int = 100
+    usage_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class UserAgentTemplateImportResponse(BaseModel):
+    imported: int = 0
+    updated: int = 0
+    skipped: int = 0
+    errors: List[str] = []
+
+
 # ─── Subscription ─────────────────────────────────────────────────────────────
 
 class SubscriptionBase(BaseModel):
