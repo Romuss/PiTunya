@@ -137,6 +137,14 @@ async def lifespan(app: FastAPI):
     from app.core.speed_scheduler import speed_test_scheduler
     speed_test_scheduler.start()
     _sup.register("speed_test", speed_test_scheduler.start, speed_test_scheduler.stop)
+    # v1.6.0 — background autocheck scheduler (upstream merge): periodic
+    # speed-test sweep scoped to all / subscription / group / specific nodes.
+    try:
+        from app.core.autocheck_scheduler import autocheck_scheduler
+        autocheck_scheduler.start()
+        _sup.register("autocheck", autocheck_scheduler.start, autocheck_scheduler.stop)
+    except Exception as exc:
+        logger.warning("AutoCheck scheduler failed to start: %s", exc)
     _sup.register("health",       health_checker.start,        health_checker.stop)
     _sup.register("subs",         subscription_scheduler.start, subscription_scheduler.stop)
     _sup.register("circle",       circle_scheduler.start,       circle_scheduler.stop)
@@ -340,6 +348,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
+        from app.core.autocheck_scheduler import autocheck_scheduler
+        autocheck_scheduler.stop()
+    except Exception:
+        pass
+    try:
         from app.core.naive_supervisor import naive_supervisor
         naive_supervisor.stop()
     except Exception:
@@ -437,7 +450,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io
+from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck
 from app.core.auth import get_current_user
 
 app.include_router(auth.router, prefix="/api")
@@ -474,6 +487,9 @@ app.include_router(network.router, prefix="/api", dependencies=_auth)
 # Speed test endpoints moved to nodes.py router (v1.6.0 upstream merge)
 # v1.5.2 — Config Export/Import (Settings page)
 app.include_router(config_io.router, prefix="/api", dependencies=_auth)
+# v1.6.0 — UA Templates + Autocheck (upstream merge)
+app.include_router(user_agents.router, prefix="/api", dependencies=_auth)
+app.include_router(autocheck.router, prefix="/api", dependencies=_auth)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
