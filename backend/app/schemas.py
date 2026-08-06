@@ -1483,6 +1483,8 @@ class SpeedTestResult(BaseModel):
     node_id: int
     node_name: str
     download_mbps: Optional[float]
+    max_mbps: Optional[float] = None
+    duration_s: Optional[float] = None
     error: Optional[str] = None
 
 

@@ -829,6 +829,14 @@ def resolve_active_circle(circles, active_node_id):
     return None, None
 
 
+# Live-tunnel speed-probe inbound (loopback). Only useful when a node is
+# active; the top routing rule below pins it to the active outbound, so a
+# live-tunnel measurement reuses the session that's already up. Ported from
+# upstream DaveBugg/PiTun v1.5.1.
+SPEED_PROBE_PORT = 10809
+SPEED_PROBE_TAG = "speed-probe"
+
+
 def generate_config(
     active_node: Optional[Node],
     all_nodes: List[Node],
@@ -964,6 +972,18 @@ def generate_config(
             "sniffing": {"enabled": dns_sniffing, "destOverride": sniff_dest, "routeOnly": True},
         },
     ]
+
+    # Live-tunnel speed-probe inbound (loopback). Only useful when a node is
+    # active; the top routing rule below pins it to the active outbound.
+    # Ported from upstream DaveBugg/PiTun v1.5.1.
+    if active_node is not None:
+        inbounds.append({
+            "tag": SPEED_PROBE_TAG,
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": SPEED_PROBE_PORT,
+            "settings": {"auth": "noauth", "udp": False},
+        })
 
     # TPROXY inbounds
     if inbound_mode in ("tproxy", "both"):
@@ -1290,6 +1310,18 @@ def generate_config(
 
         # Default: direct
         routing_rules.append({"type": "field", "ip": ["0.0.0.0/0", "::/0"], "outboundTag": "direct"})
+
+    # Force the speed-probe inbound straight to the active outbound, ahead of
+    # every other rule, so a live-tunnel measurement always egresses via the
+    # active node (never diverted by a geoip/domain/set rule).
+    # Ported from upstream DaveBugg/PiTun v1.5.1.
+    if active_node is not None:
+        routing_rules.insert(0, {
+            "type": "field",
+            "inboundTag": [SPEED_PROBE_TAG],
+            **({"balancerTag": active_balancer_tag} if active_balancer_tag
+               else {"outboundTag": f"node-{active_node.id}"}),
+        })
 
     config: Dict[str, Any] = {
         "log": {

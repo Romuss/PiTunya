@@ -88,8 +88,10 @@ class SpeedTestScheduler:
         logger.info("Speed test scheduler: starting round (active route only, no switching)")
         self._last_run = now
 
-        # Import here to avoid circular deps
-        from app.api.speedtest import _speed_test_via_socks, _save_speed_result
+        # Import here to avoid circular deps. Uses the new core/speedtest.py
+        # which measures the active node through the live tunnel (v1.6.0).
+        from app.core.speedtest import speedtest_node
+        from app.api.nodes import _persist_node_speed
 
         # Get current active node — speed test runs THROUGH this node
         # Only test the active node (no switching!). The result is the
@@ -109,21 +111,26 @@ class SpeedTestScheduler:
         except (ValueError, TypeError):
             return
 
-        # Get active node name for logging
+        # Get the active Node row to feed speedtest_node
         async with AsyncSession(get_async_engine()) as session:
-            name_row = (await session.execute(
-                text("SELECT name FROM node WHERE id = :id"),
-                {"id": active_id}
-            )).scalar()
+            from app.models import Node
+            node = await session.get(Node, active_id)
+        if not node:
+            logger.info("Speed test scheduler: active node %d not found — skipping", active_id)
+            return
 
-        node_name = name_row or f"node-{active_id}"
-        socks_port = int(settings.socks_port)
+        node_name = node.name or f"node-{active_id}"
 
         logger.info("Speed test scheduler: testing active node %d (%s)", active_id, node_name)
         try:
-            speed = await _speed_test_via_socks(active_id, socks_port)
-            await _save_speed_result(active_id, speed)
-            logger.info("Speed test scheduler: node %d (%s) = %.1f MB/s", active_id, node_name, speed)
+            result = await speedtest_node(node)
+            mbps = result.get("download_mbps")
+            max_mbps = result.get("max_mbps")
+            await _persist_node_speed(active_id, mbps, max_mbps)
+            if mbps is not None:
+                logger.info("Speed test scheduler: node %d (%s) = %.1f MB/s", active_id, node_name, mbps)
+            else:
+                logger.warning("Speed test scheduler: node %d (%s) failed: %s", active_id, node_name, result.get("error"))
         except Exception as exc:
             logger.warning("Speed test scheduler: active node test failed: %s", exc)
 

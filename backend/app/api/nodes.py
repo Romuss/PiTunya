@@ -9,7 +9,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import APP_VERSION
-from app.database import get_session
+from app.database import get_session, get_async_engine
 from app.models import BalancerGroup, Node, RoutingRule
 from app.schemas import (
     HealthResult,
@@ -846,6 +846,29 @@ async def check_all_nodes():
 
 # ── Speed test ────────────────────────────────────────────────────────────────
 
+async def _persist_node_speed(
+    node_id: int, mbps: Optional[float], max_mbps: Optional[float] = None
+) -> None:
+    """Cache a speed reading (avg + peak) on the Node row so it survives a
+    restart and feeds NodeCircle best/min_speed + the UI's staleness colour.
+    Best-effort: a write failure must never break the speed test itself.
+
+    Ported from upstream DaveBugg/PiTun v1.5.1.
+    """
+    if mbps is None:
+        return
+    try:
+        async with AsyncSession(get_async_engine()) as session:
+            node = await session.get(Node, node_id)
+            if node:
+                node.speed_mbps = float(mbps)
+                node.speed_max_mbps = float(max_mbps) if max_mbps is not None else None
+                node.speed_tested_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception:  # noqa: BLE001 — advisory cache, never fatal
+        pass
+
+
 @router.post("/{node_id:int}/speedtest", response_model=SpeedTestResult)
 async def speedtest_node(node_id: int, session: AsyncSession = Depends(get_session)):
     from app.core.speedtest import speedtest_node as _speedtest
@@ -855,7 +878,87 @@ async def speedtest_node(node_id: int, session: AsyncSession = Depends(get_sessi
         raise HTTPException(404, "Node not found")
 
     result = await _speedtest(node)
+    mbps = result.get("download_mbps")
+    if mbps is not None:
+        node.speed_mbps = float(mbps)
+        mx = result.get("max_mbps")
+        node.speed_max_mbps = float(mx) if mx is not None else None
+        node.speed_tested_at = datetime.now(timezone.utc)
+        await session.commit()
     return SpeedTestResult(**result)
+
+
+@router.post("/{node_id:int}/speedtest/stream")
+async def speedtest_node_stream(node_id: int, session: AsyncSession = Depends(get_session)):
+    """Live speed test — streams NDJSON progress (host + current Mbps).
+
+    Consumed by the frontend with `fetch` + a stream reader (so the normal
+    Bearer header carries auth — no token in the query string). Each line is
+    one JSON event; see `speedtest.speedtest_stream` for the shapes.
+
+    Ported from upstream DaveBugg/PiTun v1.5.1.
+    """
+    from fastapi.responses import StreamingResponse
+
+    from app.core.speedtest import speedtest_stream
+
+    node = await session.get(Node, node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+
+    async def _gen():
+        import json
+        final_mbps = None
+        final_max = None
+        async for event in speedtest_stream(node):
+            if event.get("phase") == "done":
+                final_mbps = event.get("mbps")
+                final_max = event.get("mbps_max")
+            yield json.dumps(event) + "\n"
+        # Persist the post-warmup average + peak after the stream closes. A
+        # fresh session — the request-scoped one is gone once streaming starts.
+        await _persist_node_speed(node_id, final_mbps, final_max)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="application/x-ndjson",
+        # Defeat any proxy buffering so the ticks arrive live, not in one dump.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/{node_id:int}/reachability")
+async def node_reachability(node_id: int, session: AsyncSession = Depends(get_session)):
+    """Does the internet actually work through this node? Fetches Google's
+    generate_204 over the tunnel — a real proxied round trip, distinct from
+    the TCP-only health check. Returns {ok, latency_ms, detail}.
+
+    Ported from upstream DaveBugg/PiTun v1.5.1.
+    """
+    from app.core.speedtest import reachability_check
+
+    node = await session.get(Node, node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    return await reachability_check(node)
+
+
+@router.get("/{node_id:int}/uri")
+async def node_uri(node_id: int, session: AsyncSession = Depends(get_session)):
+    """Share URL for a single node (vless:// etc.) — the per-node echo of
+    the bulk `/export-uris`, for a quick copy from the node's row.
+
+    Ported from upstream DaveBugg/PiTun v1.5.1.
+    """
+    from app.core.uri_formatter import node_to_uri
+
+    node = await session.get(Node, node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    uri = node_to_uri(node)
+    if not uri:
+        raise HTTPException(422, f"Cannot build a share URL for protocol {node.protocol!r}")
+    return {"uri": uri}
 
 
 @router.post("/speedtest-all", response_model=List[SpeedTestResult])
@@ -865,7 +968,15 @@ async def speedtest_all_nodes(session: AsyncSession = Depends(get_session)):
 
     nodes = list((await session.exec(select(Node).where(Node.enabled == True))).all())
     results = []
+    now = datetime.now(timezone.utc)
     for node in nodes:
         result = await _speedtest(node)
+        mbps = result.get("download_mbps")
+        if mbps is not None:
+            node.speed_mbps = float(mbps)
+            mx = result.get("max_mbps")
+            node.speed_max_mbps = float(mx) if mx is not None else None
+            node.speed_tested_at = now
         results.append(SpeedTestResult(**result))
+    await session.commit()
     return results
