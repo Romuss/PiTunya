@@ -101,12 +101,15 @@ class Node(SQLModel, table=True):
     latency_ms: Optional[int] = None
     last_check: Optional[datetime] = None
     is_online: bool = True
-    # Speed test (since v1.4.8) — throughput through the node's outbound,
-    # measured by downloading via the PIX socks-in. `speed_mbps` is megabytes
-    # per second of actual download bandwidth. `last_speed_test` is the UTC
-    # timestamp when the test was last run.
+    # Speed test — throughput through the node's outbound, measured by
+    # downloading via the PIX socks-in. `speed_mbps` is the average after
+    # warm-up; `speed_max_mbps` is the peak steady window (since v1.6.0,
+    # ported from upstream). `speed_tested_at` is the UTC timestamp when
+    # the test was last run (renamed from `last_speed_test` in v1.6.0 to
+    # match upstream field naming).
     speed_mbps: Optional[float] = None
-    last_speed_test: Optional[datetime] = None
+    speed_max_mbps: Optional[float] = None
+    speed_tested_at: Optional[datetime] = None
 
     # Order in list
     order: int = 0
@@ -359,6 +362,31 @@ class RoutingRule(SQLModel, table=True):
     )
 
 
+class UserAgentTemplate(SQLModel, table=True):
+    """A reusable client fingerprint for subscription fetches.
+
+    Ported from upstream DaveBugg/PiTun v1.4.7. Replaces the hardcoded
+    UA dicts that used to live in `app/api/subscriptions.py`.
+
+    Header-merge order and validation: `app/core/ua_templates.py`.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    # Stable slug referenced by `Subscription.ua`; renaming it re-points
+    # every subscription using it (handled in api/user_agents.py).
+    key: str = Field(unique=True, index=True)
+    name: str
+    user_agent: str = ""
+    # JSON object of extra request headers merged over the base set at
+    # fetch time. An empty value drops that header from the request.
+    headers: str = "{}"
+    description: Optional[str] = None
+    # Set on the seeded rows. Informational only — built-ins are editable
+    # and deletable; drives a UI badge and a louder delete confirmation.
+    builtin: bool = False
+    # Lower number = earlier in the dropdown.
+    order: int = 100
+
+
 class Subscription(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
@@ -446,6 +474,26 @@ class NodeCircle(SQLModel, table=True):
     # When > 0, rotation filters out candidates with latency_ms > max_latency_ms.
     # Also used by smart rotation: if active node latency > max_latency → rotate.
     max_latency_ms: int = 0
+
+
+class AutoCheckConfig(SQLModel, table=True):
+    """Singleton config (row id=1) for the background auto-speedtest sweep.
+
+    Ported from upstream DaveBugg/PiTun v1.5.0-beta.1.
+
+    A scheduler periodically speed-tests the scoped nodes so `speed_mbps` /
+    `speed_tested_at` stay fresh (feeds NodeCircle best/min_speed + the UI
+    staleness colour) without the operator clicking each node.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    enabled: bool = False
+    interval_minutes: int = 360            # sweep cadence; also the per-node
+                                           # staleness guard (skip if fresher)
+    # scope_kind: "all" | "subscription" | "group" | "nodes".
+    # scope_value: subscription id / group name / JSON "[1,2,3]"; ignored for "all".
+    scope_kind: str = "all"
+    scope_value: str = ""
+    last_sweep: Optional[datetime] = None  # start of the most recent sweep
 
 
 class Device(SQLModel, table=True):

@@ -151,8 +151,8 @@ export function NodeCard({
                     : node.speed_mbps >= 1 ? 'text-yellow-400'
                     : 'text-red-400',
                   )}
-                  title={node.last_speed_test
-                    ? `Last tested: ${new Date(node.last_speed_test).toLocaleString()}`
+                  title={node.speed_tested_at
+                    ? `Last tested: ${new Date(node.speed_tested_at).toLocaleString()}`
                     : 'Speed test result'}
                 >
                   <Zap className="h-3 w-3" />

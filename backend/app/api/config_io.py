@@ -96,9 +96,9 @@ async def export_config(
                             d[secret_field] = "***REDACTED***"
                 # Remove auto-managed fields
                 for auto_field in ["id", "latency_ms", "last_check", "is_online",
-                                   "speed_mbps", "last_speed_test", "last_updated",
-                                   "last_error", "node_count", "last_rotated",
-                                   "current_index", "client_orphan",
+                                   "speed_mbps", "speed_max_mbps", "speed_tested_at",
+                                   "last_updated", "last_error", "node_count",
+                                   "last_rotated", "current_index", "client_orphan",
                                    "from_deployment_client_id"]:
                     d.pop(auto_field, None)
                 items.append(d)

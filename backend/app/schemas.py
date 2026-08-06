@@ -155,7 +155,8 @@ class NodeRead(NodeBase):
     is_online: bool = True
     # v1.4.8 — speed test results
     speed_mbps: Optional[float] = None
-    last_speed_test: Optional[datetime] = None
+    speed_max_mbps: Optional[float] = None
+    speed_tested_at: Optional[datetime] = None
     # Multi-client deployment provenance (since v1.3.0-beta.4). When this
     # Node was exported from a DeploymentClient (e.g. WireGuard peer),
     # keep the link so the UI can render "from <server name>" alongside

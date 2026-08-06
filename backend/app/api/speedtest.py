@@ -38,7 +38,7 @@ router = APIRouter()
 async def _save_speed_result(node_id: int, speed: float) -> str:
     async with AsyncSession(get_async_engine()) as session:
         await session.execute(
-            text("UPDATE node SET speed_mbps = :speed, last_speed_test = :ts WHERE id = :id"),
+            text("UPDATE node SET speed_mbps = :speed, speed_tested_at = :ts WHERE id = :id"),
             {"speed": speed, "ts": datetime.now(tz=timezone.utc), "id": node_id}
         )
         await session.commit()
