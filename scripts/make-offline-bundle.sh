@@ -39,7 +39,7 @@
 set -euo pipefail
 
 # ── Config ─────────────────────────────────────────────────────────────────
-GITHUB_REPO="DaveBugg/PiTun"
+GITHUB_REPO="Romuss/PiTunya"
 GEO_REPO_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 
 VERSION=""

@@ -33,7 +33,7 @@
 #   sudo WG_IF=wg1 bash uninstall-wireguard-server.sh      # alt interface
 #
 # Or one-liner over SSH:
-#   curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/scripts/uninstall-wireguard-server.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/scripts/uninstall-wireguard-server.sh \
 #     | sudo bash
 #
 # Re-run safe: every step checks state first.

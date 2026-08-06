@@ -41,7 +41,7 @@
 #   sudo YES=1 FAIL2BAN=remove bash uninstall-naive-server.sh
 #
 # Or one-liner over SSH:
-#   curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/scripts/uninstall-naive-server.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/scripts/uninstall-naive-server.sh \
 #     | sudo bash
 # (interactive — drop the `| sudo bash` and `| sudo YES=1 bash` for
 #  non-interactive flag.)
