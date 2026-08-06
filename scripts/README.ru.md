@@ -14,7 +14,7 @@
 Стандартный путь на свежем Raspberry Pi 4/5:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/install.sh \
      | sudo bash -s -- --version v1.3.3
 ```
 
