@@ -41,7 +41,7 @@
 #
 set -uo pipefail
 
-REPO="${PITUN_REPO:-DaveBugg/PiTun}"
+REPO="${PITUN_REPO:-Romuss/PiTunya}"
 INSTALL_DIR="${PITUN_DIR:-/opt/pitun}"
 API_URL="${PITUN_API_URL:-http://127.0.0.1:8000}"
 LOG_FILE="${PITUN_UPDATE_LOG:-/var/log/pitun-update.log}"
