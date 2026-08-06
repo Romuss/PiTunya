@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 
 import { useT } from '@/hooks/useT'
+import { effectiveJobStatus } from '@/lib/jobStatus'
 import { useServers } from '@/hooks/useServers'
 import {
   useCancelServerTask,
@@ -14,37 +15,8 @@ import {
   useServerTaskStream,
   useServerTasks,
 } from '@/hooks/useServerTasks'
-import type { JobRead, JobStatus, JobSummary, DeployJobResult } from '@/types'
+import type { JobStatus, JobSummary, DeployJobResult } from '@/types'
 
-
-/**
- * `Job.status` is the *runner wrapper* status — `succeeded` when our
- * runner closure returned without an exception, `failed` only on
- * runner crash / SSH-level error / cancel. For deploy jobs, the
- * actual install outcome lives in `result.status` ("deployed",
- * "deployed_no_uri", or "failed"). When the script exits non-zero the
- * runner returns a result dict with `status:"failed"` rather than
- * raising — so the wrapper is `succeeded` but the deploy is not.
- *
- * Without this projection the master list / detail header would paint
- * those rows green ✓ and call them "SUCCEEDED" even though no Node
- * was created and the script visibly errored — observed in the v1.3.0-
- * beta.1 smoke test where two timeout/exit=-1 deploys looked successful.
- *
- * For UI status purposes, treat anything where `result.status` is
- * `failed` or `deployed_no_uri` as visually `failed`. The detail banner
- * still shows the original `result.status` text, so admins can tell
- * "script exited 0 with no URI" apart from "script exited non-zero".
- */
-function effectiveStatus(job: JobSummary | JobRead): JobStatus {
-  if (job.status === 'succeeded' && job.result && typeof job.result === 'object') {
-    const r = job.result as { status?: string }
-    if (r.status === 'failed' || r.status === 'deployed_no_uri') {
-      return 'failed'
-    }
-  }
-  return job.status
-}
 
 /**
  * `/server-tasks` page — recent install / deploy jobs (since v1.3.0-beta.1).
@@ -198,7 +170,7 @@ function FilterPill({
       className={
         'rounded-full px-2.5 py-1 transition-colors ' +
         (active
-          ? 'bg-brand-600/30 text-brand-200 border border-brand-500/50'
+          ? 'bg-brand-50 dark:bg-brand-600/30 text-brand-700 dark:text-brand-200 border border-brand-500/50'
           : 'border border-gray-800 text-gray-400 hover:bg-gray-800/60')
       }
     >
@@ -294,7 +266,7 @@ function JobListItem({
           (selected ? 'bg-brand-900/15' : 'hover:bg-gray-900/50')
         }
       >
-        <StatusIcon status={effectiveStatus(job)} />
+        <StatusIcon status={effectiveJobStatus(job)} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-gray-100 truncate">
@@ -315,7 +287,7 @@ function JobListItem({
             )}
           </div>
         </div>
-        <ChevronRight className="h-4 w-4 text-gray-600 flex-shrink-0" />
+        <ChevronRight className="h-4 w-4 text-gray-600 shrink-0" />
       </button>
     </li>
   )
@@ -356,14 +328,14 @@ function JobDetailPanel({ jobId }: { jobId: string | null }) {
     <div className="rounded-2xl border border-gray-800 bg-gray-900/30 overflow-hidden">
       {/* Header */}
       <div className="px-4 py-3 border-b border-gray-800/60 flex items-start gap-3">
-        <StatusIcon status={effectiveStatus(job)} large />
+        <StatusIcon status={effectiveJobStatus(job)} large />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-base font-semibold text-gray-100 truncate">
               {job.kind} · {job.target_name || `#${job.target_id ?? '?'}`}
             </h2>
             <span className="text-xs text-gray-500 font-mono">{job.protocol}</span>
-            <StatusPill status={effectiveStatus(job)} />
+            <StatusPill status={effectiveJobStatus(job)} />
           </div>
           <div className="mt-1 text-[11px] text-gray-500 font-mono break-all">
             id {job.id}
@@ -373,7 +345,7 @@ function JobDetailPanel({ jobId }: { jobId: string | null }) {
           <button
             onClick={() => cancel.mutate(job.id)}
             disabled={cancel.isPending}
-            className="rounded-lg border border-red-800/60 bg-red-900/20 hover:bg-red-900/30 text-red-300 px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 transition-colors flex-shrink-0"
+            className="rounded-lg border border-red-200 dark:border-red-800/60 bg-red-50 dark:bg-red-900/20 hover:bg-red-50 dark:hover:bg-red-900/30 text-red-700 dark:text-red-300 px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 transition-colors shrink-0"
           >
             <Ban className="h-3.5 w-3.5" />
             {cancel.isPending ? t('Cancelling…', 'Отмена…') : t('Cancel', 'Отменить')}
@@ -391,7 +363,7 @@ function JobDetailPanel({ jobId }: { jobId: string | null }) {
             value={
               <Link
                 to="/servers"
-                className="text-brand-400 hover:text-brand-300 inline-flex items-center gap-1"
+                className="text-brand-400 hover:text-brand-700 dark:hover:text-brand-300 inline-flex items-center gap-1"
               >
                 <ServerIcon className="h-3 w-3" />
                 #{job.target_id}
@@ -405,7 +377,7 @@ function JobDetailPanel({ jobId }: { jobId: string | null }) {
             value={
               <Link
                 to="/nodes"
-                className="text-brand-400 hover:text-brand-300 inline-flex items-center gap-1 font-mono"
+                className="text-brand-400 hover:text-brand-700 dark:hover:text-brand-300 inline-flex items-center gap-1 font-mono"
               >
                 #{result.node_id}
               </Link>
@@ -413,12 +385,12 @@ function JobDetailPanel({ jobId }: { jobId: string | null }) {
           />
         )}
         {job.error && (
-          <div className="sm:col-span-2 rounded-lg bg-red-900/15 border border-red-700/40 px-2 py-1.5 text-red-300 text-[11px] font-mono break-words">
+          <div className="sm:col-span-2 rounded-lg bg-red-50 dark:bg-red-900/15 border border-red-200 dark:border-red-700/40 px-2 py-1.5 text-red-700 dark:text-red-300 text-[11px] font-mono wrap-break-word">
             {job.error}
           </div>
         )}
         {result?.status === 'deployed_no_uri' && (
-          <div className="sm:col-span-2 rounded-lg bg-yellow-900/15 border border-yellow-700/40 px-2 py-1.5 text-yellow-200 text-[11px]">
+          <div className="sm:col-span-2 rounded-lg bg-yellow-50 dark:bg-yellow-900/15 border border-yellow-200 dark:border-yellow-700/40 px-2 py-1.5 text-yellow-800 dark:text-yellow-200 text-[11px]">
             {t(
               'Script ran but no URI was emitted — add the Node manually.',
               'Скрипт отработал, но URI не выдан — добавьте Node вручную.',
@@ -480,12 +452,14 @@ function DetailLog({
       style={{ scrollbarWidth: 'thin' }}
     >
       {lines.length === 0 ? (
-        <div className="text-gray-600">…</div>
+        <div className="text-slate-500">…</div>
       ) : (
         lines.map((l) => (
           <div
             key={l.idx}
-            className={l.kind === 'stderr' ? 'text-red-400' : 'text-gray-300'}
+            // Fixed-dark terminal (bg-black/60) → light text in BOTH themes
+            // (slate/red don't invert like our gray tokens).
+            className={l.kind === 'stderr' ? 'text-red-400' : 'text-slate-300'}
           >
             {l.line || ' '}
           </div>
@@ -500,19 +474,19 @@ function DetailLog({
 
 function StatusIcon({ status, large }: { status: JobStatus; large?: boolean }) {
   const cls = large ? 'h-5 w-5' : 'h-4 w-4'
-  if (status === 'running') return <Loader2 className={cls + ' animate-spin text-brand-400 flex-shrink-0'} />
-  if (status === 'succeeded') return <CheckCircle2 className={cls + ' text-emerald-400 flex-shrink-0'} />
-  if (status === 'failed') return <XCircle className={cls + ' text-red-400 flex-shrink-0'} />
-  if (status === 'cancelled') return <Ban className={cls + ' text-yellow-400 flex-shrink-0'} />
-  return <ListChecks className={cls + ' text-gray-500 flex-shrink-0'} />
+  if (status === 'running') return <Loader2 className={cls + ' animate-spin text-brand-400 shrink-0'} />
+  if (status === 'succeeded') return <CheckCircle2 className={cls + ' text-emerald-600 dark:text-emerald-400 shrink-0'} />
+  if (status === 'failed') return <XCircle className={cls + ' text-red-600 dark:text-red-400 shrink-0'} />
+  if (status === 'cancelled') return <Ban className={cls + ' text-yellow-600 dark:text-yellow-400 shrink-0'} />
+  return <ListChecks className={cls + ' text-gray-500 shrink-0'} />
 }
 
 function StatusPill({ status }: { status: JobStatus }) {
   const styles: Record<JobStatus, string> = {
-    running: 'bg-brand-900/30 text-brand-300 border-brand-700/50',
-    succeeded: 'bg-emerald-900/30 text-emerald-300 border-emerald-700/50',
-    failed: 'bg-red-900/30 text-red-300 border-red-700/50',
-    cancelled: 'bg-yellow-900/30 text-yellow-300 border-yellow-700/50',
+    running: 'bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-200 border-brand-700/50',
+    succeeded: 'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-700/50',
+    failed: 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-red-200 dark:border-red-700/50',
+    cancelled: 'bg-yellow-50 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 border-yellow-200 dark:border-yellow-700/50',
   }
   return (
     <span className={

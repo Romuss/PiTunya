@@ -11,7 +11,9 @@ import { serversApi } from '@/api/client'
 import { ModalShell } from '@/components/ModalShell'
 import { TemplatePicker } from '@/components/TemplatePicker'
 import { SshPortField } from '@/components/SshPortField'
+import { DirectToggle } from '@/components/DirectToggle'
 import { useT } from '@/hooks/useT'
+import { effectiveJobStatus } from '@/lib/jobStatus'
 import { useDeployments } from '@/hooks/useServers'
 import {
   useCancelServerTask,
@@ -51,9 +53,11 @@ import type {
  */
 export function DeployModal({
   server,
+  initialDirect = false,
   onClose,
 }: {
   server: Server
+  initialDirect?: boolean
   onClose: () => void
 }) {
   const t = useT()
@@ -148,6 +152,10 @@ export function DeployModal({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [jobId, setJobId] = useState<string | null>(null)
+  // Off = install runs THROUGH the active node (default); on = dial the
+  // server directly (SO_MARK bypass) — reach it even over a dead tunnel.
+  // Seeded from the Servers page toggle so the choice carries into deploy.
+  const [direct, setDirect] = useState(initialDirect)
   const [submittedProtocol, setSubmittedProtocol] = useState<
     ServerDeploymentProtocol
   >('naive')
@@ -205,7 +213,7 @@ export function DeployModal({
       const accepted = await serversApi.deploy(server.id, {
         protocol,
         config: params,
-      })
+      }, direct)
       setSubmittedProtocol(protocol)
       setJobId(accepted.job_id)
     } catch (err: unknown) {
@@ -221,7 +229,7 @@ export function DeployModal({
     <ModalShell onClose={onClose} labelledBy="deploy-modal-title">
       <div className="w-full max-w-3xl rounded-2xl bg-gray-950/95 border border-gray-800 p-6 m-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-start gap-3 mb-4">
-          <div className="rounded-lg bg-brand-600/15 p-2 text-brand-400">
+          <div className="rounded-lg bg-brand-50 dark:bg-brand-600/15 p-2 text-brand-400">
             <Rocket className="h-5 w-5" />
           </div>
           <div className="flex-1 min-w-0">
@@ -262,6 +270,8 @@ export function DeployModal({
             wgAllowedIps={wgAllowedIps}
             error={error}
             submitting={submitting}
+            direct={direct}
+            setDirect={setDirect}
             setDomain={setDomain}
             setEmail={setEmail}
             setNaiveUser={setNaiveUser}
@@ -313,6 +323,7 @@ function DeployForm(props: {
   wgClientName: string; wgServerPort: string; wgDns1: string
   wgDns2: string; wgAllowedIps: string
   error: string; submitting: boolean
+  direct: boolean; setDirect: (v: boolean) => void
   setDomain: (v: string) => void
   setEmail: (v: string) => void
   setNaiveUser: (v: string) => void
@@ -341,8 +352,8 @@ function DeployForm(props: {
   return (
     <form onSubmit={props.onSubmit}>
       {props.error && (
-        <div className="mb-3 rounded-lg bg-red-900/30 border border-red-700/50 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
-          <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+        <div className="mb-3 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700/50 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
           <span>{props.error}</span>
         </div>
       )}
@@ -444,8 +455,8 @@ function DeployForm(props: {
         </FieldL>
       </div>
 
-      <div className="rounded-lg border border-yellow-700/40 bg-yellow-900/10 px-3 py-2 mt-4 text-xs text-yellow-200 flex items-start gap-2">
-        <Sparkles className="h-3.5 w-3.5 mt-0.5 flex-shrink-0 text-yellow-400" />
+      <div className="rounded-lg border border-yellow-200 dark:border-yellow-700/40 bg-yellow-50 dark:bg-yellow-900/10 px-3 py-2 mt-4 text-xs text-yellow-800 dark:text-yellow-200 flex items-start gap-2">
+        <Sparkles className="h-3.5 w-3.5 mt-0.5 shrink-0 text-yellow-600 dark:text-yellow-400" />
         <span>
           {isNaive
             ? t(
@@ -467,6 +478,7 @@ function DeployForm(props: {
         >
           {t('Cancel', 'Отмена')}
         </button>
+        <DirectToggle checked={props.direct} onChange={props.setDirect} className="px-1" />
         <button
           type="submit"
           disabled={props.submitting || xuiProConflict}
@@ -510,11 +522,20 @@ function DeployRunning({
   const t = useT()
   const qc = useQueryClient()
   const { frames, done, error: wsError } = useServerTaskStream(jobId)
-  // Poll the detail row while the WS is still open — once `done` is set
-  // we stop polling and use the final detail snapshot for the result
-  // banner (node_id, parsed_uri, error).
-  const isRunning = done === null
-  const { data: jobRow } = useServerTask(jobId, { polling: isRunning })
+  // Keep polling until the DETAIL ROW itself reports a terminal status.
+  //
+  // Two failure modes this closes. (1) `done === 'unknown'` means the
+  // socket dropped without a done frame — treating that as finished
+  // switched off the only remaining channel, so a deploy that kept
+  // running server-side left the modal spinning forever. (2) the backend
+  // commits the terminal row microseconds before it emits `done`, so
+  // stopping at the frame left `jobRow` on a `running` snapshot with
+  // result=null — no node link on success, no reason on failure, and a
+  // script that exited non-zero rendered as a green "Install succeeded".
+  const { data: jobRow } = useServerTask(jobId, { polling: true })
+  const rowTerminal =
+    jobRow != null && jobRow.status !== 'running'
+  const isRunning = !rowTerminal && (done === null || done === 'unknown')
 
   const cancel = useCancelServerTask()
   const onCancel = () => cancel.mutate(jobId)
@@ -523,14 +544,16 @@ function DeployRunning({
   // + servers (new ServerDeployment) + WG clients (new peer added on
   // first WG install — Clients modal cache should pick it up
   // immediately on next open).
+  // Keyed off the persisted row, not the WS frame: a dropped socket
+  // (`done === 'unknown'`) used to skip these entirely, so a deploy that
+  // actually succeeded left the Nodes/Servers lists stale.
   useEffect(() => {
-    if (done && done !== 'unknown') {
-      qc.invalidateQueries({ queryKey: ['nodes'] })
-      qc.invalidateQueries({ queryKey: ['servers'] })
-      qc.invalidateQueries({ queryKey: ['servers', server.id, 'deployments'] })
-      qc.invalidateQueries({ queryKey: ['servers', server.id, 'wg-clients'] })
-    }
-  }, [done, qc, server.id])
+    if (!rowTerminal) return
+    qc.invalidateQueries({ queryKey: ['nodes'] })
+    qc.invalidateQueries({ queryKey: ['servers'] })
+    qc.invalidateQueries({ queryKey: ['servers', server.id, 'deployments'] })
+    qc.invalidateQueries({ queryKey: ['servers', server.id, 'wg-clients'] })
+  }, [rowTerminal, qc, server.id])
 
   const result = useMemo<DeployJobResult | null>(() => {
     const r = jobRow?.result
@@ -538,16 +561,15 @@ function DeployRunning({
     return r as DeployJobResult
   }, [jobRow])
 
-  // The WS `done` frame is authoritative — polling stops the moment
-  // it arrives, so the last `jobRow.status` we polled is often still
-  // `running` even though the job already finalized. Prefer the WS
-  // signal when it's a real terminal state, fall back to jobRow only
-  // when WS hasn't reported yet (or reported `unknown` due to a
-  // dropped connection).
-  const finalStatus =
-    done && done !== 'unknown'
-      ? done
-      : (jobRow?.status ?? (done === null ? 'running' : done))
+  // The persisted row wins once it reaches a terminal state, and it is
+  // read through the same projection the tasks page uses: a script that
+  // exited non-zero finalizes the JOB as `succeeded` while its RESULT
+  // says failed. Without the projection this modal painted a green
+  // "Install succeeded" over a broken install. The WS frame is only a
+  // fallback for the window before the row lands.
+  const finalStatus = rowTerminal && jobRow
+    ? effectiveJobStatus(jobRow)
+    : (done && done !== 'unknown' ? done : 'running')
 
   return (
     <div>
@@ -586,7 +608,7 @@ function DeployRunning({
             type="button"
             onClick={onCancel}
             disabled={cancel.isPending}
-            className="rounded-lg border border-red-800/60 bg-red-900/20 hover:bg-red-900/30 text-red-300 px-3 py-1.5 text-sm flex items-center gap-1.5 disabled:opacity-50 transition-colors"
+            className="rounded-lg border border-red-200 dark:border-red-800/60 bg-red-50 dark:bg-red-900/20 hover:bg-red-50 dark:hover:bg-red-900/30 text-red-700 dark:text-red-300 px-3 py-1.5 text-sm flex items-center gap-1.5 disabled:opacity-50 transition-colors"
             title={t(
               'Cancel local stream — remote script keeps running on the VPS',
               'Отменить локальный поток — скрипт продолжит работу на VPS',
@@ -718,7 +740,7 @@ function NaiveFields(props: {
           type="checkbox"
           checked={props.installPhp}
           onChange={(e) => props.setInstallPhp(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 rounded border-gray-600 bg-gray-800 text-brand-500 focus:ring-brand-500"
+          className="mt-0.5 h-3.5 w-3.5 rounded-sm border-gray-600 bg-gray-800 text-brand-500 focus:ring-brand-500"
         />
         <div className="min-w-0 flex-1">
           <div className="text-xs font-medium text-gray-200">
@@ -832,7 +854,7 @@ function ProtocolPick(props: {
   const cls = props.disabled
     ? 'border-gray-800 bg-gray-900/20 text-gray-600 cursor-not-allowed opacity-50'
     : (props.active
-      ? 'border-brand-500/60 bg-brand-600/10 text-brand-200'
+      ? 'border-brand-500/60 bg-brand-50 dark:bg-brand-600/10 text-brand-700 dark:text-brand-200'
       : 'border-gray-800 bg-gray-900/40 text-gray-400 hover:border-gray-700 hover:text-gray-200')
   return (
     <button
@@ -891,8 +913,8 @@ function XuiFields(props: {
   return (
     <div className="space-y-3">
       {proConflict && (
-        <div className="rounded-lg border border-red-700/50 bg-red-900/20 px-3 py-2 text-xs text-red-200 flex items-start gap-2">
-          <Sparkles className="h-3.5 w-3.5 mt-0.5 flex-shrink-0 text-red-400" />
+        <div className="rounded-lg border border-red-200 dark:border-red-700/50 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-xs text-red-800 dark:text-red-200 flex items-start gap-2">
+          <Sparkles className="h-3.5 w-3.5 mt-0.5 shrink-0 text-red-600 dark:text-red-400" />
           <span>
             {t(
               'NaiveProxy already binds :443 on this VPS. Domain mode (x-ui-pro) needs :443 for nginx + Let\'s Encrypt — clear the domain to install in bare mode, or uninstall NaiveProxy first.',
@@ -901,8 +923,8 @@ function XuiFields(props: {
           </span>
         </div>
       )}
-      <div className="rounded-lg border border-blue-700/40 bg-blue-900/10 px-3 py-2 text-xs text-blue-200 flex items-start gap-2">
-        <Sparkles className="h-3.5 w-3.5 mt-0.5 flex-shrink-0 text-blue-400" />
+      <div className="rounded-lg border border-blue-200 dark:border-blue-700/40 bg-blue-50 dark:bg-blue-900/10 px-3 py-2 text-xs text-blue-800 dark:text-blue-200 flex items-start gap-2">
+        <Sparkles className="h-3.5 w-3.5 mt-0.5 shrink-0 text-blue-600 dark:text-blue-400" />
         <span>
           {hasDomain
             ? t(
@@ -970,7 +992,7 @@ function StatusBanner({
   const t = useT()
   if (status === 'running') {
     return (
-      <div className="rounded-lg border border-brand-700/40 bg-brand-900/10 px-3 py-2 text-sm text-brand-300 flex items-center gap-2">
+      <div className="rounded-lg border border-brand-700/40 bg-brand-50 dark:bg-brand-900/10 px-3 py-2 text-sm text-brand-300 flex items-center gap-2">
         <Loader2 className="h-4 w-4 animate-spin" />
         <span>{t('Running install…', 'Идёт установка…')}</span>
       </div>
@@ -978,11 +1000,11 @@ function StatusBanner({
   }
   if (status === 'cancelled') {
     return (
-      <div className="rounded-lg border border-yellow-700/40 bg-yellow-900/10 px-3 py-2 text-sm text-yellow-300 flex items-start gap-2">
+      <div className="rounded-lg border border-yellow-200 dark:border-yellow-700/40 bg-yellow-50 dark:bg-yellow-900/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300 flex items-start gap-2">
         <Ban className="h-4 w-4 mt-0.5" />
         <div>
           <div className="font-medium">{t('Cancelled', 'Отменено')}</div>
-          <div className="text-xs text-yellow-300/80 mt-0.5">
+          <div className="text-xs text-yellow-700 dark:text-yellow-300/80 mt-0.5">
             {t(
               'The remote script may still be running on the VPS. Re-run when ready, or check the server manually.',
               'Скрипт может всё ещё выполняться на VPS. Повторите запуск или проверьте сервер вручную.',
@@ -994,12 +1016,12 @@ function StatusBanner({
   }
   if (status === 'failed') {
     return (
-      <div className="rounded-lg border border-red-700/40 bg-red-900/10 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
+      <div className="rounded-lg border border-red-200 dark:border-red-700/40 bg-red-50 dark:bg-red-900/10 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 mt-0.5" />
         <div className="min-w-0">
           <div className="font-medium">{t('Install failed', 'Установка не удалась')}</div>
           {error && (
-            <div className="text-xs text-red-300/80 mt-0.5 break-words font-mono">{error}</div>
+            <div className="text-xs text-red-700 dark:text-red-300/80 mt-0.5 wrap-break-word font-mono">{error}</div>
           )}
         </div>
       </div>
@@ -1008,11 +1030,11 @@ function StatusBanner({
   // succeeded
   if (result?.status === 'deployed_no_uri') {
     return (
-      <div className="rounded-lg border border-yellow-700/40 bg-yellow-900/10 px-3 py-2 text-sm text-yellow-300 flex items-start gap-2">
+      <div className="rounded-lg border border-yellow-200 dark:border-yellow-700/40 bg-yellow-50 dark:bg-yellow-900/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300 flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 mt-0.5" />
         <div>
           <div className="font-medium">{t('Script ran but no URI was emitted', 'Скрипт отработал, но URI не выдан')}</div>
-          <div className="text-xs text-yellow-300/80 mt-0.5">
+          <div className="text-xs text-yellow-700 dark:text-yellow-300/80 mt-0.5">
             {t(
               'Check the log below — you may need to add the Node manually.',
               'Проверьте лог ниже — возможно, придётся добавить Node вручную.',
@@ -1024,39 +1046,39 @@ function StatusBanner({
   }
   if (result?.status === 'failed') {
     return (
-      <div className="rounded-lg border border-red-700/40 bg-red-900/10 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
+      <div className="rounded-lg border border-red-200 dark:border-red-700/40 bg-red-50 dark:bg-red-900/10 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 mt-0.5" />
         <div>
           <div className="font-medium">{t('Install failed', 'Установка не удалась')}</div>
           {result?.error && (
-            <div className="text-xs text-red-300/80 mt-0.5 break-words font-mono">{result.error}</div>
+            <div className="text-xs text-red-700 dark:text-red-300/80 mt-0.5 wrap-break-word font-mono">{result.error}</div>
           )}
         </div>
       </div>
     )
   }
   return (
-    <div className="rounded-lg border border-emerald-700/40 bg-emerald-900/10 px-3 py-2 text-sm text-emerald-300 flex items-start gap-2">
+    <div className="rounded-lg border border-emerald-200 dark:border-emerald-700/40 bg-emerald-50 dark:bg-emerald-900/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300 flex items-start gap-2">
       <CheckCircle2 className="h-4 w-4 mt-0.5" />
       <div className="min-w-0">
         <div className="font-medium">{t('Install succeeded', 'Установка прошла успешно')}</div>
         {protocol === 'naive' && result?.node_id != null && (
-          <div className="text-xs text-emerald-300/80 mt-0.5">
+          <div className="text-xs text-emerald-700 dark:text-emerald-300/80 mt-0.5">
             {t('Node created: ', 'Создана нода: ')}
             <span className="font-mono">#{result.node_id}</span>
             {result.duration_sec ? (
-              <span className="text-emerald-300/60"> · {Math.round(result.duration_sec)}s</span>
+              <span className="text-emerald-700 dark:text-emerald-300/60"> · {Math.round(result.duration_sec)}s</span>
             ) : null}
           </div>
         )}
         {protocol === 'wireguard' && result?.client_id != null && (
-          <div className="text-xs text-emerald-300/80 mt-0.5">
+          <div className="text-xs text-emerald-700 dark:text-emerald-300/80 mt-0.5">
             {t('First client added: ', 'Создан первый клиент: ')}
             <span className="font-mono">#{result.client_id}</span>
             {result.duration_sec ? (
-              <span className="text-emerald-300/60"> · {Math.round(result.duration_sec)}s</span>
+              <span className="text-emerald-700 dark:text-emerald-300/60"> · {Math.round(result.duration_sec)}s</span>
             ) : null}
-            <div className="text-[11px] text-emerald-300/60 mt-1">
+            <div className="text-[11px] text-emerald-700 dark:text-emerald-300/60 mt-1">
               {t(
                 'Open the server in Servers → Clients to download conf or export it as a Node.',
                 'Откройте сервер в разделе Серверы → Клиенты, чтобы скачать конфиг или экспортировать как Ноду.',
@@ -1115,7 +1137,7 @@ function LogPanel({
         lines.map((l) => (
           <div
             key={l.idx}
-            className={l.kind === 'stderr' ? 'text-red-400' : 'text-gray-300'}
+            className={l.kind === 'stderr' ? 'text-red-600 dark:text-red-400' : 'text-gray-300'}
           >
             {l.line || ' '}
           </div>
@@ -1129,7 +1151,7 @@ function LogPanel({
 // ── Misc ────────────────────────────────────────────────────────────────────
 
 const inputCls =
-  'w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-none'
+  'w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden'
 
 function FieldL({
   label, hint, children,

@@ -1,39 +1,41 @@
+import { isAxiosError } from 'axios'
+
 /**
- * Shared error-message extractor for axios/FastAPI errors.
+ * Pull a human-readable message out of an API failure.
  *
- * Normalises both FastAPI detail shapes:
- *  - Our own string messages: `{ detail: "..." }`
- *  - Pydantic 422 arrays:     `{ detail: [{ msg, loc, type }, ...] }`
- *
- * Also falls back to `error.message` for generic JS errors, and a
- * final `"Request failed"` if nothing parses.
- *
- * Ported from upstream PiTun v1.4.7 — eliminates every ad-hoc
- * `extractAxiosError` copy scattered across components.
+ * FastAPI uses two `detail` shapes and both reach the UI: a plain string
+ * from a hand-raised `HTTPException`, and an array of per-field objects
+ * from a pydantic 422. Without the array branch a validation error
+ * renders as the generic fallback, naming no field.
  */
-export function apiError(err: unknown): string {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as {
-      response?: { data?: { detail?: unknown } }
-      message?: string
-    }
-    const detail = e.response?.data?.detail
-
+export function apiErrorText(err: unknown, fallback: string): string {
+  if (isAxiosError(err)) {
+    const detail = err.response?.data?.detail
     if (typeof detail === 'string') return detail
-
-    if (Array.isArray(detail)) {
-      return detail
-        .map((d: { msg?: string; loc?: unknown; type?: string }) => {
-          const msg = d?.msg ?? ''
-          const loc = d?.loc ? ' (' + JSON.stringify(d.loc) + ')' : ''
-          return msg + loc
-        })
-        .filter(Boolean)
-        .join('; ')
+    // Structured detail: several endpoints raise
+    // `HTTPException(detail={"error": ..., "hint": ...})` — the 409 from
+    // the subscription-refresh mutex and the 503 from a busy xray lock
+    // both do. Rendered as the generic fallback, the hint (the only part
+    // that tells the operator what to do) was thrown away.
+    if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+      const d = detail as { error?: unknown; message?: unknown; hint?: unknown }
+      const head =
+        typeof d.error === 'string' ? d.error
+          : typeof d.message === 'string' ? d.message : ''
+      const hint = typeof d.hint === 'string' ? d.hint : ''
+      if (head && hint) return `${head} — ${hint}`
+      if (head) return head
+      if (hint) return hint
     }
-
-    if (e.message) return e.message
+    if (Array.isArray(detail) && detail.length > 0) {
+      const first = detail[0] as { loc?: unknown[]; msg?: unknown }
+      const loc = Array.isArray(first?.loc)
+        ? first.loc.filter((p) => p !== 'body' && typeof p !== 'number')
+        : []
+      const msg = typeof first?.msg === 'string' ? first.msg : ''
+      if (msg) return loc.length > 0 ? `${loc.join('.')}: ${msg}` : msg
+    }
   }
-  if (err instanceof Error) return err.message
-  return 'Request failed'
+  if (err instanceof Error && err.message) return err.message
+  return fallback
 }

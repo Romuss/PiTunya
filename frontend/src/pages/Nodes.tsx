@@ -1,6 +1,7 @@
+import { useT } from '@/hooks/useT'
 import * as React from 'react'
 import { useEffect, useMemo, useState } from 'react'
-import { Plus, Activity, Search, GripVertical, Gauge, FileDown, FileUp, Pin, ArrowDownNarrowWide, ArrowUpNarrowWide } from 'lucide-react'
+import { Plus, Activity, Search, GripVertical, Gauge, FileDown, FileUp, Pin, ArrowDownNarrowWide, ArrowUpNarrowWide, Timer } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQueryClient, useMutation } from '@tanstack/react-query'
 import {
@@ -12,7 +13,12 @@ import {
   useDeleteNode,
   useCheckNodeHealth,
   useCheckAllNodes,
-  useSpeedtest,
+  useSpeedtestStream,
+  useReachability,
+  useSpeedtestAll,
+  useAutocheckSweep,
+  useSpeedResults,
+  useSpeedPending,
 } from '@/hooks/useNodes'
 import { nodesApi } from '@/api/client'
 import { useSystemStatus, useSetActiveNode } from '@/hooks/useSystem'
@@ -23,7 +29,10 @@ import { NaiveSidecarPanel } from '@/components/NaiveSidecarPanel'
 import { NodeFilterPopup, type NodeFilterState } from '@/components/NodeFilterPopup'
 import { Pagination } from '@/components/Pagination'
 import { useConfirm } from '@/components/ConfirmModal'
+import { copyToClipboard } from '@/lib/clipboard'
 import { ModalShell } from '@/components/ModalShell'
+import { AutoCheckModal } from '@/components/AutoCheckModal'
+import { apiErrorText } from '@/lib/apiError'
 import type { Node, NodeCreate, NodePageParams } from '@/types'
 
 type Modal = 'none' | 'add' | 'edit' | 'import'
@@ -67,15 +76,16 @@ function loadDirection(): SortDirection {
 }
 
 export function Nodes() {
+  const t = useT()
   const confirm = useConfirm()
   const [modal, setModal] = useState<Modal>('none')
+  const [showAutocheck, setShowAutocheck] = useState(false)
   const [editNode, setEditNode] = useState<Node | null>(null)
   const [search, setSearch] = useState('')
   const [filters, setFilters] = useState<NodeFilterState>({})
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<number>(loadPageSize)
   const [direction, setDirection] = useState<SortDirection>(loadDirection)
-  const [qualitySort, setQualitySort] = useState(false)
 
   // Reset to first page whenever the result set changes shape — any
   // filter / search / page-size flip can invalidate the current
@@ -110,8 +120,7 @@ export function Nodes() {
     online: filters.online,
     group: filters.group,
     direction,
-    sort: qualitySort ? 'quality' : undefined,
-  }), [page, pageSize, search, filters, direction, qualitySort])
+  }), [page, pageSize, search, filters, direction])
 
   const { data: pageData, isLoading } = useNodesPage(pageParams)
   const nodes = pageData?.items ?? []
@@ -153,23 +162,21 @@ export function Nodes() {
   const deleteNode = useDeleteNode()
   const checkHealth = useCheckNodeHealth()
   const checkAll = useCheckAllNodes()
-  const speedtest = useSpeedtest()
+  const speedStream = useSpeedtestStream()
+  const reachability = useReachability()
   const setActive = useSetActiveNode()
 
-  const [speedResults, setSpeedResults] = useState<Record<number, string>>({})
+  // Results and in-flight ids come from the query cache so they survive
+  // pagination, filtering and leaving the page mid-test.
+  const { data: speedResults } = useSpeedResults()
+  const { data: speedPending } = useSpeedPending()
   const [dragId, setDragId] = useState<number | null>(null)
   const qc = useQueryClient()
 
-  const speedAll = useMutation({
-    mutationFn: () => nodesApi.speedtestAll(),
-    onSuccess: (results) => {
-      const map: Record<number, string> = {}
-      for (const r of results) {
-        map[r.node_id] = r.speed_mbps != null && r.speed_mbps > 0 ? `${r.speed_mbps} MB/s` : r.error ?? 'failed'
-      }
-      setSpeedResults(map)
-    },
-  })
+  const speedAll = useSpeedtestAll()
+  // True while a background sweep (auto-check or "Speed All") runs — drives
+  // the button spinner + refreshes node rows live.
+  const sweeping = useAutocheckSweep()
 
   // Reorder via useMutation so it follows the same pattern as other CRUD
   // operations (toast hooks, optimistic update later, error surface via
@@ -188,25 +195,25 @@ export function Nodes() {
     }
   }
 
-  const handleSpeedtest = async (node: Node) => {
-    setSpeedResults((r) => ({ ...r, [node.id]: 'testing…' }))
-    speedtest.mutate(node.id, {
-      onSuccess: (r) => {
-        setSpeedResults((prev) => ({
-          ...prev,
-          [node.id]: r.speed_mbps != null && r.speed_mbps > 0
-            ? `${r.speed_mbps} MB/s`
-            : 'failed',
-        }))
-        // Invalidate nodes query so the speed_mbps field refreshes
-        // and the badge in NodeCard picks up the new value.
-        qc.invalidateQueries({ queryKey: ['nodes'] })
-        qc.invalidateQueries({ queryKey: ['nodesPage'] })
-      },
-      onError: () => {
-        setSpeedResults((prev) => ({ ...prev, [node.id]: 'error' }))
-      },
-    })
+  // Streaming test: writes live progress into the query cache itself, so it
+  // ticks in place and survives leaving the page.
+  const handleSpeedtest = (node: Node) => {
+    if (speedPending.includes(node.id)) return
+    speedStream.run(node.id)
+  }
+
+  const handleReachability = (node: Node) => {
+    if (speedPending.includes(node.id)) return
+    reachability.run(node.id)
+  }
+
+  const handleExportUri = async (node: Node) => {
+    try {
+      const uri = await nodesApi.uri(node.id)
+      await copyToClipboard(uri)
+    } catch {
+      /* protocol without a URL form (e.g. wireguard) — nothing to copy */
+    }
   }
 
   const handleDrop = (targetId: number) => {
@@ -239,9 +246,12 @@ export function Nodes() {
   const runTestAll = async () => {
     if (total > BULK_CONFIRM_THRESHOLD) {
       const ok = await confirm({
-        title: `Test all ${total} nodes?`,
-        body: `Health-check fires sequentially through every enabled node. With ${total} nodes this can take ${Math.ceil(total * 2 / 60)}+ minutes. Active traffic isn't affected.`,
-        confirmLabel: 'Run health check',
+        title: t(`Test all ${total} nodes?`, `Проверить все ${total} нод?`),
+        body: t(
+          `Health-check fires sequentially through every enabled node. With ${total} nodes this can take ${Math.ceil(total * 2 / 60)}+ minutes. Active traffic isn't affected.`,
+          `Проверка идёт последовательно по всем включённым нодам. Для ${total} нод это займёт ${Math.ceil(total * 2 / 60)}+ минут. Активный трафик не затрагивается.`,
+        ),
+        confirmLabel: t('Run health check', 'Запустить проверку'),
       })
       if (!ok) return
     }
@@ -251,9 +261,12 @@ export function Nodes() {
   const runSpeedAll = async () => {
     if (total > BULK_CONFIRM_THRESHOLD) {
       const ok = await confirm({
-        title: `Speed-test all ${total} nodes?`,
-        body: `Each speed test spawns its own xray and runs ~10–30s. With ${total} nodes the whole sweep can take several hours and saturate uplink. There's no abort button — once started the only way to stop is restarting the backend container.`,
-        confirmLabel: 'Run speed test',
+        title: t(`Speed-test all ${total} nodes?`, `Замерить скорость всех ${total} нод?`),
+        body: t(
+          `Runs the same background sweep as Auto-checks — one node at a time (~10–30s each); results appear live on the cards. With ${total} nodes the full sweep can take a while and saturate the uplink, but it keeps running in the background even if you leave the page.`,
+          `Запускает тот же фоновый проход, что и Автопроверки — по одной ноде (~10–30с каждая); результаты появляются на карточках вживую. Для ${total} нод полный проход может занять время и загрузить канал, но он продолжится в фоне, даже если уйти со страницы.`,
+        ),
+        confirmLabel: t('Run speed test', 'Запустить тест'),
         danger: true,
       })
       if (!ok) return
@@ -270,7 +283,7 @@ export function Nodes() {
           wider screens everything collapses back to one row via
           flex-wrap's natural single-line behaviour. */}
       <div className="flex items-start justify-between flex-wrap gap-3">
-        <h1 className="text-xl font-bold text-gray-100">Nodes</h1>
+        <h1 className="text-xl font-bold text-gray-100">{t('Nodes', 'Ноды')}</h1>
         <div className="flex items-center gap-2 flex-wrap">
           <button
             onClick={runTestAll}
@@ -278,25 +291,33 @@ export function Nodes() {
             className="flex items-center gap-1.5 rounded-lg bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 transition-colors disabled:opacity-50"
           >
             <Activity className={clsx('h-4 w-4', checkAll.isPending && 'animate-pulse')} />
-            Test All
+            {t('Test All', 'Проверить все')}
           </button>
           <button
             onClick={runSpeedAll}
-            disabled={speedAll.isPending}
+            disabled={speedAll.isPending || sweeping}
             className="flex items-center gap-1.5 rounded-lg bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 transition-colors disabled:opacity-50"
           >
-            <Gauge className={clsx('h-4 w-4', speedAll.isPending && 'animate-spin')} />
-            {speedAll.isPending ? 'Testing…' : 'Speed All'}
+            <Gauge className={clsx('h-4 w-4', (speedAll.isPending || sweeping) && 'animate-spin')} />
+            {(speedAll.isPending || sweeping) ? t('Testing…', 'Проверка…') : t('Speed All', 'Скорость всех')}
+          </button>
+          <button
+            onClick={() => setShowAutocheck(true)}
+            className="flex items-center gap-1.5 rounded-lg bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 transition-colors"
+            title={t('Auto speed-checks — schedule background speed tests', 'Автопроверки скорости — фоновые тесты по расписанию')}
+          >
+            <Timer className="h-4 w-4" />
+            {t('Auto-checks', 'Автопроверки')}
           </button>
           {/* Unified Import — paste URIs OR drop a PiTun JSON bundle;
               the modal auto-detects which path to take. */}
           <button
             onClick={() => setModal('import')}
             className="flex items-center gap-1.5 rounded-lg bg-gray-700 px-3 py-2 text-sm text-gray-200 hover:bg-gray-600 transition-colors"
-            title="Import nodes — paste URIs or upload a PiTun JSON bundle; format is auto-detected"
+            title={t('Import nodes — paste URIs or upload a PiTun JSON bundle; format is auto-detected', 'Импорт нод — вставьте URI или загрузите PiTun JSON; формат определяется автоматически')}
           >
             <FileUp className="h-4 w-4" />
-            Import
+            {t('Import', 'Импорт')}
           </button>
           {/* Export dropdown — pick between URI-list (.txt) and
               full-fidelity JSON bundle (.json). */}
@@ -306,7 +327,7 @@ export function Nodes() {
             className="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-2 text-sm font-medium text-white hover:bg-brand-500 transition-colors"
           >
             <Plus className="h-4 w-4" />
-            Add Node
+            {t('Add Node', 'Добавить ноду')}
           </button>
         </div>
       </div>
@@ -320,8 +341,8 @@ export function Nodes() {
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search nodes…"
-            className="w-full rounded-lg bg-gray-900 border border-gray-800 pl-9 pr-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+            placeholder={t('Search nodes…', 'Поиск нод…')}
+            className="w-full rounded-lg bg-gray-900 border border-gray-800 pl-9 pr-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
           />
         </div>
         <NodeFilterPopup
@@ -339,36 +360,29 @@ export function Nodes() {
           type="button"
           onClick={() => setDirection((d) => (d === 'desc' ? 'asc' : 'desc'))}
           className="flex items-center gap-1.5 rounded-lg border border-gray-800 bg-gray-900 px-2.5 py-2 text-sm text-gray-400 hover:text-gray-200 hover:border-gray-700 transition-colors"
-          title={direction === 'desc' ? 'Newest IDs first — click to reverse' : 'Oldest IDs first — click to reverse'}
-          aria-label={direction === 'desc' ? 'Sort newest first' : 'Sort oldest first'}
+          title={direction === 'desc' ? t('Newest IDs first — click to reverse', 'Сначала новые ID — клик, чтобы развернуть') : t('Oldest IDs first — click to reverse', 'Сначала старые ID — клик, чтобы развернуть')}
+          aria-label={direction === 'desc' ? t('Sort newest first', 'Сначала новые') : t('Sort oldest first', 'Сначала старые')}
         >
           {direction === 'desc'
             ? <ArrowDownNarrowWide className="h-4 w-4" />
             : <ArrowUpNarrowWide className="h-4 w-4" />}
           <span className="hidden sm:inline text-xs">
-            {direction === 'desc' ? 'Newest' : 'Oldest'}
-          </span>
-        </button>
-        {/* v1.5.0 — Quality sort toggle. When active, sorts by online
-            + speed + latency instead of Node.order. Shows Gauge icon. */}
-        <button
-          type="button"
-          onClick={() => setQualitySort((v) => !v)}
-          className={clsx(
-            'flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors',
-            qualitySort
-              ? 'border-brand-600 bg-brand-900/30 text-brand-400'
-              : 'border-gray-800 bg-gray-900 text-gray-400 hover:text-gray-200 hover:border-gray-700',
-          )}
-          title="Sort by availability + speed + latency. Best nodes on top."
-          aria-label="Quality sort"
-        >
-          <Gauge className="h-4 w-4" />
-          <span className="hidden sm:inline text-xs">
-            {qualitySort ? 'Quality' : 'Sort'}
+            {direction === 'desc' ? t('Newest', 'Новые') : t('Oldest', 'Старые')}
           </span>
         </button>
       </div>
+
+      {/* Speed All runs synchronously and the reverse proxy cuts the
+          request at 120s, so on a large node set it WILL fail. Without
+          this banner the spinner just stopped and the operator was left
+          wondering whether anything happened. */}
+      {speedAll.isError && (
+        <div className="rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+          Speed All failed: {apiErrorText(speedAll.error, 'request timed out')}.
+          Results for individual nodes are still available via the per-node
+          speed test.
+        </div>
+      )}
 
       {/* Pinned active node — shown only when the active node is NOT
           already in the current page (filters/pagination would hide
@@ -378,13 +392,13 @@ export function Nodes() {
         <div className="space-y-1.5">
           <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-brand-400">
             <Pin className="h-3 w-3" />
-            <span>Active node (pinned)</span>
+            <span>{t('Active node (pinned)', 'Активная нода (закреплена)')}</span>
           </div>
-          <div className="rounded-lg ring-1 ring-brand-700/40 bg-brand-900/10 p-0.5">
-            <div className="flex items-start gap-2">
-              {/* No drag handle — pinned card sits outside the
-                  reorderable list semantically. */}
-              <div className="mt-3 shrink-0 hidden sm:block w-4" />
+          <div>
+            <div className="flex items-start">
+              {/* No drag handle / grip column — the pinned card sits
+                  outside the reorderable list, and the card's own active
+                  border is the single highlight (no outer ring). */}
               <div className="flex-1 min-w-0">
                 <NodeCard
                   node={activeNode}
@@ -393,19 +407,29 @@ export function Nodes() {
                   onDelete={async () => {
                     const ok = await confirm({
                       title: `Delete "${activeNode.name}"?`,
-                      body: 'This node is currently active. Routing rules pointing at it will be left dangling.',
-                      confirmLabel: 'Delete',
+                      body: t('This node is currently active. Routing rules pointing at it will be left dangling.', 'Эта нода сейчас активна. Правила маршрутизации на неё останутся «висячими».'),
+                      confirmLabel: t('Delete', 'Удалить'),
                       danger: true,
                     })
                     if (ok) deleteNode.mutate(activeNode.id)
                   }}
                   onCheck={() => checkHealth.mutate(activeNode.id)}
                   onSpeedtest={() => handleSpeedtest(activeNode)}
+                  onReachability={() => handleReachability(activeNode)}
+                  onExportUri={() => handleExportUri(activeNode)}
                   onSelect={() => setActive.mutate(activeNode.id)}
                   checkLoading={checkHealth.isPending && checkHealth.variables === activeNode.id}
-                  speedLoading={speedtest.isPending && speedtest.variables === activeNode.id}
-                  speedResultText={speedResults[activeNode.id]}
+                  speedLoading={speedPending.includes(activeNode.id)}
+                  reachLoading={speedPending.includes(activeNode.id)}
                 />
+                {/* The pinned card is only rendered when the active node
+                    is NOT in the list, so without this row its speed-test
+                    result had nowhere to appear at all. */}
+                {speedResults[activeNode.id] && (
+                  <div className="text-xs text-gray-500 mt-1 pl-4 font-mono">
+                    Speed: {speedResults[activeNode.id]}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -467,19 +491,26 @@ export function Nodes() {
                   onDelete={async () => {
                     const ok = await confirm({
                       title: `Delete "${node.name}"?`,
-                      body: 'Routing rules pointing at this node will be left dangling — fix them after deletion.',
-                      confirmLabel: 'Delete',
+                      body: t('Routing rules pointing at this node will be left dangling — fix them after deletion.', 'Правила маршрутизации на эту ноду останутся «висячими» — поправьте их после удаления.'),
+                      confirmLabel: t('Delete', 'Удалить'),
                       danger: true,
                     })
                     if (ok) deleteNode.mutate(node.id)
                   }}
                   onCheck={() => checkHealth.mutate(node.id)}
                   onSpeedtest={() => handleSpeedtest(node)}
+                  onReachability={() => handleReachability(node)}
+                  onExportUri={() => handleExportUri(node)}
                   onSelect={() => setActive.mutate(node.id)}
                   checkLoading={checkHealth.isPending && checkHealth.variables === node.id}
-                  speedLoading={speedtest.isPending && speedtest.variables === node.id}
-                  speedResultText={speedResults[node.id]}
+                  speedLoading={speedPending.includes(node.id)}
+                  reachLoading={speedPending.includes(node.id)}
                 />
+                {speedResults[node.id] && (
+                  <div className="text-xs text-gray-500 mt-1 pl-4 font-mono">
+                    Speed: {speedResults[node.id]}
+                  </div>
+                )}
                 {node.protocol === 'naive' && (
                   <NaiveSidecarPanel nodeId={node.id} nodeName={node.name} />
                 )}
@@ -530,6 +561,11 @@ export function Nodes() {
             onCancel={() => setModal('none')}
           />
         </Modal>
+      )}
+
+      {/* Auto-checks config */}
+      {showAutocheck && (
+        <AutoCheckModal nodes={allNodesForReorder} onClose={() => setShowAutocheck(false)} />
       )}
     </div>
   )

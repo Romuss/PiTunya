@@ -3,14 +3,15 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Layers, Loader2, AlertTriangle, ExternalLink, Trash2, Plus, RefreshCw,
   ShieldCheck, ShieldAlert, Server as ServerIcon, KeyRound, Copy, Check,
-  ChevronRight, ChevronDown, Upload, Shuffle, UploadCloud, QrCode,
+  ChevronRight, ChevronDown, Upload, Shuffle, UploadCloud, QrCode, Radar,
 } from 'lucide-react'
 
-import { xuiApi } from '@/api/client'
+import { xuiApi, diagnosticsApi, type SniScanResult } from '@/api/client'
 import { useT } from '@/hooks/useT'
 import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
 import { ClientQrModal } from '@/components/ClientQrModal'
+import { DirectToggle } from '@/components/DirectToggle'
 import { copyToClipboard } from '@/lib/clipboard'
 import type { InboundPreset, XuiClient, XuiInbound, XuiServer } from '@/types'
 
@@ -74,7 +75,7 @@ export default function XuiPage() {
       )}
 
       {srvError && (
-        <div className="rounded-lg border border-red-700/40 bg-red-900/20 px-3 py-3 text-sm text-red-300 flex items-start gap-2">
+        <div className="rounded-lg border border-red-200 dark:border-red-700/40 bg-red-50 dark:bg-red-900/20 px-3 py-3 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
           <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
           <span>{t('Failed to load panels', 'Не удалось загрузить панели')}</span>
         </div>
@@ -146,7 +147,7 @@ function ServerList({
               className={
                 'w-full text-left px-3 py-2.5 flex items-start gap-2 transition-colors border-b border-gray-900 ' +
                 (s.id === selectedId
-                  ? 'bg-brand-600/10 text-brand-200'
+                  ? 'bg-brand-50 dark:bg-brand-600/10 text-brand-700 dark:text-brand-200'
                   : 'text-gray-300 hover:bg-gray-900/40')
               }
             >
@@ -161,14 +162,14 @@ function ServerList({
                 </div>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <span className={
-                    'text-[10px] px-1.5 py-0.5 rounded font-mono ' +
+                    'text-[10px] px-1.5 py-0.5 rounded-sm font-mono ' +
                     (s.mode === 'xui-pro'
-                      ? 'bg-purple-900/30 text-purple-300 border border-purple-700/40'
+                      ? 'bg-purple-100 text-purple-700 border border-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:border-purple-700/40'
                       : 'bg-gray-900 text-gray-400 border border-gray-700')
                   }>{s.mode}</span>
                   {s.last_check_error
-                    ? <ShieldAlert className="h-3 w-3 text-red-400" />
-                    : <ShieldCheck className="h-3 w-3 text-emerald-400" />}
+                    ? <ShieldAlert className="h-3 w-3 text-red-600 dark:text-red-400" />
+                    : <ShieldCheck className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />}
                 </div>
               </div>
             </button>
@@ -197,6 +198,12 @@ function ServerDetail({ server }: { server: XuiServer }) {
   const qc = useQueryClient()
   const confirm = useConfirm()
 
+  // "Direct connection" — when on, panel operations dial the panel OFF the
+  // active node's tunnel (SO_MARK bypass). Default off = through the active
+  // node, like all other backend egress. Handy to reach a panel while the
+  // active node is down. Off by default so we never silently leave the VPN.
+  const [direct, setDirect] = useState(false)
+
   const { data: inbounds = [], isLoading, error, refetch } = useQuery<XuiInbound[]>({
     queryKey: ['xui', 'inbounds', server.id],
     queryFn: () => xuiApi.listInbounds(server.id),
@@ -211,7 +218,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
   // just want a token re-test (sidebar list-refresh, etc.).
   const [showHealth, setShowHealth] = useState(false)
   const healthMut = useMutation({
-    mutationFn: () => xuiApi.healthcheckServer(server.id),
+    mutationFn: () => xuiApi.healthcheckServer(server.id, direct),
   })
 
   // Reconcile the panel ↔ PiTun cache. Refresh-button does the local
@@ -220,27 +227,40 @@ function ServerDetail({ server }: { server: XuiServer }) {
   // clients the operator made via the panel UI and cascades any
   // Node rows whose backing client vanished.
   const syncMut = useMutation({
-    mutationFn: () => xuiApi.syncServer(server.id),
-    onSuccess: () => {
+    mutationFn: () => xuiApi.syncServer(server.id, direct),
+    onSuccess: (summary) => {
       qc.invalidateQueries({ queryKey: ['xui', 'inbounds', server.id] })
       qc.invalidateQueries({ queryKey: ['nodes'] })
+      // ServerDetail remounts on `key={server.id}`, so switching panels
+      // mid-sync used to discard the summary — including the fact that
+      // orphan Nodes were cascade-deleted. Park it per panel instead.
+      qc.setQueryData(['xui', 'sync-result', server.id], summary)
     },
+  })
+
+  // Last sync summary for THIS panel, surviving a panel switch.
+  const { data: syncSummary } = useQuery<Awaited<ReturnType<typeof xuiApi.syncServer>> | null>({
+    queryKey: ['xui', 'sync-result', server.id],
+    queryFn: async () => null,
+    initialData: null,
+    staleTime: Infinity,
+    gcTime: Infinity,
   })
 
   // Fakesite rotation — xui-pro only. The "rotate" button just calls
   // the backend (random template from the bundled archive); upload
   // is gated by a hidden <input type=file> wired to a button.
   const rotateMut = useMutation({
-    mutationFn: () => xuiApi.rotateFakesite(server.id),
+    mutationFn: () => xuiApi.rotateFakesite(server.id, direct),
   })
   const uploadMut = useMutation({
-    mutationFn: (zip: File) => xuiApi.uploadFakesite(server.id, zip),
+    mutationFn: (zip: File) => xuiApi.uploadFakesite(server.id, zip, direct),
   })
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const isXuiPro = server.mode === 'xui-pro'
 
   const delInboundMut = useMutation({
-    mutationFn: (id: number) => xuiApi.deleteInbound(server.id, id),
+    mutationFn: (id: number) => xuiApi.deleteInbound(server.id, id, direct),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['xui', 'inbounds', server.id] })
     },
@@ -266,7 +286,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
               href={panelUrl}
               target="_blank"
               rel="noreferrer"
-              className="text-brand-400 hover:text-brand-300 inline-flex items-center gap-1"
+              className="text-brand-400 hover:text-brand-700 dark:hover:text-brand-300 inline-flex items-center gap-1"
             >
               {t('Open panel', 'Открыть панель')}
               <ExternalLink className="h-3 w-3" />
@@ -275,7 +295,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
             <span className="font-mono">{server.panel_user}</span>
           </div>
           {server.last_check_error && (
-            <div className="mt-2 rounded-md bg-red-900/20 border border-red-700/40 px-2 py-1 text-[11px] text-red-300 flex items-start gap-1.5">
+            <div className="mt-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700/40 px-2 py-1 text-[11px] text-red-700 dark:text-red-300 flex items-start gap-1.5">
               <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
               <span>{server.last_check_error}</span>
             </div>
@@ -284,7 +304,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
               Lives next to the header so the operator sees what just
               happened without an extra modal. */}
           {rotateMut.data && (
-            <div className="mt-2 rounded-md bg-green-900/20 border border-green-700/40 px-2 py-1 text-[11px] text-green-300 flex items-start gap-1.5">
+            <div className="mt-2 rounded-md bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700/40 px-2 py-1 text-[11px] text-green-700 dark:text-green-300 flex items-start gap-1.5">
               <Check className="h-3 w-3 mt-0.5 shrink-0" />
               <span>
                 {t(`Fakesite rotated → ${rotateMut.data.name || '(unknown)'}`, `Фейк-сайт обновлён → ${rotateMut.data.name || '(неизвестно)'}`)}
@@ -292,7 +312,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
             </div>
           )}
           {rotateMut.error && (
-            <div className="mt-2 rounded-md bg-red-900/20 border border-red-700/40 px-2 py-1 text-[11px] text-red-300 flex items-start gap-1.5">
+            <div className="mt-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700/40 px-2 py-1 text-[11px] text-red-700 dark:text-red-300 flex items-start gap-1.5">
               <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
               <span>
                 {t('Rotation failed', 'Ошибка ротации')}: {
@@ -304,24 +324,24 @@ function ServerDetail({ server }: { server: XuiServer }) {
             </div>
           )}
           {uploadMut.data && (
-            <div className="mt-2 rounded-md bg-green-900/20 border border-green-700/40 px-2 py-1 text-[11px] text-green-300 flex items-start gap-1.5">
+            <div className="mt-2 rounded-md bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700/40 px-2 py-1 text-[11px] text-green-700 dark:text-green-300 flex items-start gap-1.5">
               <Check className="h-3 w-3 mt-0.5 shrink-0" />
               <span>{t('Fakesite uploaded', 'Фейк-сайт загружен')}</span>
             </div>
           )}
-          {syncMut.data && (
-            <div className="mt-2 rounded-md bg-blue-900/20 border border-blue-700/40 px-2 py-1 text-[11px] text-blue-200 flex items-start gap-1.5">
+          {syncSummary && (
+            <div className="mt-2 rounded-md bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700/40 px-2 py-1 text-[11px] text-blue-800 dark:text-blue-200 flex items-start gap-1.5">
               <Check className="h-3 w-3 mt-0.5 shrink-0" />
               <span>
                 {t(
-                  `Sync: +${syncMut.data.added} added · ${syncMut.data.updated} updated · -${syncMut.data.removed} removed${syncMut.data.orphan_nodes_removed ? ` · ${syncMut.data.orphan_nodes_removed} orphan Node(s) cleaned` : ''}${syncMut.data.chain_skipped ? ` · ${syncMut.data.chain_skipped} chain inbound(s) skipped` : ''}`,
-                  `Синхронизация: +${syncMut.data.added} добавлено · ${syncMut.data.updated} обновлено · -${syncMut.data.removed} удалено${syncMut.data.orphan_nodes_removed ? ` · ${syncMut.data.orphan_nodes_removed} осиротевших Node убрано` : ''}${syncMut.data.chain_skipped ? ` · ${syncMut.data.chain_skipped} chain-инбаунда пропущено` : ''}`,
+                  `Sync: +${syncSummary.added} added · ${syncSummary.updated} updated · -${syncSummary.removed} removed${syncSummary.orphan_nodes_removed ? ` · ${syncSummary.orphan_nodes_removed} orphan Node(s) cleaned` : ''}${syncSummary.chain_skipped ? ` · ${syncSummary.chain_skipped} chain inbound(s) skipped` : ''}`,
+                  `Синхронизация: +${syncSummary.added} добавлено · ${syncSummary.updated} обновлено · -${syncSummary.removed} удалено${syncSummary.orphan_nodes_removed ? ` · ${syncSummary.orphan_nodes_removed} осиротевших Node убрано` : ''}${syncSummary.chain_skipped ? ` · ${syncSummary.chain_skipped} chain-инбаунда пропущено` : ''}`,
                 )}
               </span>
             </div>
           )}
           {syncMut.error && (
-            <div className="mt-2 rounded-md bg-red-900/20 border border-red-700/40 px-2 py-1 text-[11px] text-red-300 flex items-start gap-1.5">
+            <div className="mt-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700/40 px-2 py-1 text-[11px] text-red-700 dark:text-red-300 flex items-start gap-1.5">
               <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
               <span>
                 {t('Sync failed', 'Ошибка синхронизации')}: {
@@ -333,7 +353,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
             </div>
           )}
           {uploadMut.error && (
-            <div className="mt-2 rounded-md bg-red-900/20 border border-red-700/40 px-2 py-1 text-[11px] text-red-300 flex items-start gap-1.5">
+            <div className="mt-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700/40 px-2 py-1 text-[11px] text-red-700 dark:text-red-300 flex items-start gap-1.5">
               <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
               <span>
                 {t('Upload failed', 'Ошибка загрузки')}: {
@@ -398,6 +418,11 @@ function ServerDetail({ server }: { server: XuiServer }) {
               : <RefreshCw className="h-3.5 w-3.5" />}
             {t('Sync', 'Синхронизация')}
           </button>
+          {/* Direct-connection toggle: dial the panel off the active node's
+              tunnel (SO_MARK bypass). Off = through the active node. Applies
+              to every panel op on this server (probe, sync, add-client,
+              create-inbound, fakesite) via the ?direct= flag. */}
+          <DirectToggle checked={direct} onChange={setDirect} className="px-1" />
           {/* Fakesite controls — xui-pro only. Bare panels run no
               nginx fronting, so there's no /var/www/html to rotate. */}
           {isXuiPro && (
@@ -465,7 +490,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
       )}
 
       {error && (
-        <div className="rounded-lg border border-red-700/40 bg-red-900/20 px-3 py-2 text-sm text-red-300">
+        <div className="rounded-lg border border-red-200 dark:border-red-700/40 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
           {t('Failed to load inbounds from panel', 'Не удалось получить инбаунды с панели')}
         </div>
       )}
@@ -480,6 +505,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
         <InboundCard
           key={ib.id}
           serverId={server.id}
+          direct={direct}
           inbound={ib}
           onAddClient={() => setShowAddClientFor(ib.id)}
           onDelete={async () => {
@@ -501,6 +527,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
       {showAddInbound && (
         <AddInboundModal
           server={server}
+          direct={direct}
           onClose={() => setShowAddInbound(false)}
           onCreated={() => {
             setShowAddInbound(false)
@@ -513,6 +540,7 @@ function ServerDetail({ server }: { server: XuiServer }) {
         <AddClientModal
           serverId={server.id}
           inboundId={showAddClientFor}
+          direct={direct}
           onClose={() => setShowAddClientFor(null)}
           onCreated={() => {
             setShowAddClientFor(null)
@@ -556,9 +584,9 @@ function HealthCheckModal({
     : null
 
   const statusPill = (s: 'ok' | 'warn' | 'fail') => {
-    if (s === 'ok') return 'bg-green-900/30 text-green-300 border-green-700/40'
-    if (s === 'warn') return 'bg-yellow-900/30 text-yellow-300 border-yellow-700/40'
-    return 'bg-red-900/30 text-red-300 border-red-700/40'
+    if (s === 'ok') return 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 border-green-200 dark:border-green-700/40'
+    if (s === 'warn') return 'bg-yellow-50 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 border-yellow-200 dark:border-yellow-700/40'
+    return 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-red-200 dark:border-red-700/40'
   }
 
   return (
@@ -577,7 +605,7 @@ function HealthCheckModal({
         )}
 
         {!loading && errMsg && (
-          <div className="rounded-lg bg-red-900/20 border border-red-700/40 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
+          <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700/40 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
             <AlertTriangle className="h-3.5 w-3.5 mt-0.5" />
             <span>{String(errMsg)}</span>
           </div>
@@ -588,8 +616,8 @@ function HealthCheckModal({
             <div className={
               'rounded-lg border px-3 py-2 text-sm flex items-center gap-2 ' +
               (result.ok
-                ? 'bg-green-900/20 border-green-700/40 text-green-300'
-                : 'bg-yellow-900/20 border-yellow-700/40 text-yellow-200')
+                ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-700/40 text-green-700 dark:text-green-300'
+                : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-700/40 text-yellow-800 dark:text-yellow-200')
             }>
               {result.ok ? <Check className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
               <span>
@@ -613,7 +641,7 @@ function HealthCheckModal({
                     )}
                   </div>
                   <span className={
-                    'shrink-0 text-[10px] px-1.5 py-0.5 rounded border uppercase font-mono ' +
+                    'shrink-0 text-[10px] px-1.5 py-0.5 rounded-sm border uppercase font-mono ' +
                     statusPill(c.status)
                   }>
                     {c.status}
@@ -651,9 +679,10 @@ function HealthCheckModal({
 // ── Inbound card ────────────────────────────────────────────────────────────
 
 function InboundCard({
-  serverId, inbound, onAddClient, onDelete, removing,
+  serverId, direct, inbound, onAddClient, onDelete, removing,
 }: {
   serverId: number
+  direct: boolean
   inbound: XuiInbound
   onAddClient: () => void
   onDelete: () => void
@@ -745,7 +774,7 @@ function InboundCard({
   })
   const delClientMut = useMutation({
     mutationFn: (clientUuid: string) =>
-      xuiApi.deleteClient(serverId, inbound.id, clientUuid),
+      xuiApi.deleteClient(serverId, inbound.id, clientUuid, direct),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['xui', 'inbounds', serverId] })
     },
@@ -776,32 +805,32 @@ function InboundCard({
                   the same): protocol=blue, transport=green,
                   reality=purple, tls=orange, chain=red. */}
               <span className="text-[11px] text-gray-500 font-mono">:{inbound.port}</span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/30 text-blue-300 border border-blue-700/40 uppercase font-mono">
+              <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-blue-100 text-blue-700 border border-blue-200 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-700/40 uppercase font-mono">
                 {inbound.protocol}
               </span>
               {inboundNetwork && inboundNetwork !== 'tcp' && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-900/30 text-green-300 border border-green-700/40 uppercase font-mono">
+                <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-green-100 text-green-700 border border-green-200 dark:bg-green-900/30 dark:text-green-300 dark:border-green-700/40 uppercase font-mono">
                   {inboundNetwork}
                 </span>
               )}
               {inboundSecurity === 'reality' && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-900/30 text-purple-300 border border-purple-700/40 uppercase font-mono">
+                <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-purple-100 text-purple-700 border border-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:border-purple-700/40 uppercase font-mono">
                   reality
                 </span>
               )}
               {inboundSecurity === 'tls' && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-900/30 text-orange-300 border border-orange-700/40 uppercase font-mono">
+                <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-orange-100 text-orange-700 border border-orange-200 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-700/40 uppercase font-mono">
                   tls
                 </span>
               )}
               {!inbound.enable && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-900/30 text-yellow-300 border border-yellow-700/40">
+                <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-yellow-50 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 border border-yellow-200 dark:border-yellow-700/40">
                   disabled
                 </span>
               )}
               {isChainManaged && (
                 <span
-                  className="text-[10px] px-1.5 py-0.5 rounded bg-red-900/30 text-red-300 border border-red-700/40 font-mono uppercase"
+                  className="text-[10px] px-1.5 py-0.5 rounded-sm bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-700/40 font-mono uppercase"
                   title={t(
                     'This inbound is part of a chain. Manage its clients on the Chains tab.',
                     'Этот инбаунд принадлежит цепочке. Управление клиентами — на вкладке «Цепочки».',
@@ -842,7 +871,7 @@ function InboundCard({
                   'Инбаунд цепочки — удалите цепочку на вкладке «Цепочки», чтобы убрать его.',
                 )
               : t('Delete inbound', 'Удалить инбаунд')}
-            className="rounded-md border border-gray-700 hover:bg-red-900/30 hover:border-red-700/40 hover:text-red-300 disabled:hover:bg-transparent disabled:hover:border-gray-700 disabled:hover:text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed p-1 text-gray-500"
+            className="rounded-md border border-gray-700 hover:bg-red-50 dark:hover:bg-red-900/30 hover:border-red-700/40 hover:text-red-700 dark:hover:text-red-300 disabled:hover:bg-transparent disabled:hover:border-gray-700 disabled:hover:text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed p-1 text-gray-500"
           >
             {removing
               ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -884,7 +913,7 @@ function InboundCard({
                       <span className="text-gray-600 ml-1.5">· {c.flow}</span>
                     )}
                     {c.enable === false && (
-                      <span className="text-yellow-300 ml-1.5">· disabled</span>
+                      <span className="text-yellow-700 dark:text-yellow-300 ml-1.5">· disabled</span>
                     )}
                   </div>
                 </div>
@@ -901,7 +930,7 @@ function InboundCard({
                         'Show QR code (scan into mobile client)',
                         'Показать QR-код (для сканирования в мобильный клиент)',
                       )}
-                      className="rounded-md border border-gray-700 hover:bg-brand-900/30 hover:border-brand-700/50 hover:text-brand-300 p-1 text-gray-400"
+                      className="rounded-md border border-gray-700 hover:bg-brand-50 dark:hover:bg-brand-900/30 hover:border-brand-400/50 hover:text-brand-700 dark:hover:text-brand-300 p-1 text-gray-400"
                     >
                       <QrCode className="h-3 w-3" />
                     </button>
@@ -916,7 +945,7 @@ function InboundCard({
                     if (exportedNodeId !== undefined) {
                       return (
                         <span
-                          className="rounded-md border border-green-700/50 bg-green-900/20 text-green-300 px-1.5 py-0.5 text-[10px] inline-flex items-center gap-1"
+                          className="rounded-md border border-green-200 dark:border-green-700/50 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 px-1.5 py-0.5 text-[10px] inline-flex items-center gap-1"
                           title={t(
                             `Already exported as Node #${exportedNodeId}`,
                             `Уже экспортировано как Node #${exportedNodeId}`,
@@ -954,7 +983,7 @@ function InboundCard({
                         onClick={() => naturalId && exportMut.mutate(naturalId)}
                         disabled={!naturalId || isExporting}
                         title={t('Export this client as a Node', 'Экспортировать этого клиента в Nodes')}
-                        className="rounded-md border border-gray-700 hover:bg-brand-900/30 hover:border-brand-700/50 hover:text-brand-300 px-1.5 py-0.5 text-[10px] text-gray-300 inline-flex items-center gap-1 disabled:opacity-50"
+                        className="rounded-md border border-gray-700 hover:bg-brand-50 dark:hover:bg-brand-900/30 hover:border-brand-400/50 hover:text-brand-700 dark:hover:text-brand-300 px-1.5 py-0.5 text-[10px] text-gray-300 inline-flex items-center gap-1 disabled:opacity-50"
                       >
                         {isExporting
                           ? <Loader2 className="h-3 w-3 animate-spin" />
@@ -985,7 +1014,7 @@ function InboundCard({
                           'Клиент цепочки — управление на вкладке «Цепочки».',
                         )
                       : t('Delete client', 'Удалить клиента')}
-                    className="rounded-md border border-gray-700 hover:bg-red-900/30 hover:border-red-700/40 hover:text-red-300 disabled:hover:bg-transparent disabled:hover:border-gray-700 disabled:hover:text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed p-1 text-gray-500"
+                    className="rounded-md border border-gray-700 hover:bg-red-50 dark:hover:bg-red-900/30 hover:border-red-700/40 hover:text-red-700 dark:hover:text-red-300 disabled:hover:bg-transparent disabled:hover:border-gray-700 disabled:hover:text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed p-1 text-gray-500"
                   >
                     {isDeleting
                       ? <Loader2 className="h-3 w-3 animate-spin" />
@@ -996,7 +1025,7 @@ function InboundCard({
             )
           })}
           {exportMut.error && (
-            <div className="text-[11px] text-red-300 pt-1">
+            <div className="text-[11px] text-red-700 dark:text-red-300 pt-1">
               {t('Export failed', 'Ошибка экспорта')}: {String((exportMut.error as Error).message)}
             </div>
           )}
@@ -1019,9 +1048,10 @@ function InboundCard({
 // ── Add inbound modal ──────────────────────────────────────────────────────
 
 function AddInboundModal({
-  server, onClose, onCreated,
+  server, direct, onClose, onCreated,
 }: {
   server: XuiServer
+  direct: boolean
   onClose: () => void
   onCreated: () => void
 }) {
@@ -1035,6 +1065,25 @@ function AddInboundModal({
   const [presetId, setPresetId] = useState<string | null>(null)
   const [values, setValues] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
+
+  // REALITY dest / SNI scan — probe whatever's in the `sni` field (a domain
+  // OR a bare IP) THROUGH THE ACTIVE NODE and surface what turns up: TLS 1.3 /
+  // HTTP-2 suitability plus the certificate domain the endpoint presents, so
+  // the operator can pick a working serverName. Mirrors 3x-ui's reality-sni
+  // scan, but routed through the active node like every other server op.
+  const [sniScan, setSniScan] = useState<{ loading: boolean; res: SniScanResult | null; err: string }>(
+    { loading: false, res: null, err: '' },
+  )
+  const scanSni = async (fieldName: string) => {
+    const target = (values[fieldName] || '').trim()
+    if (!target) return
+    setSniScan({ loading: true, res: null, err: '' })
+    try {
+      setSniScan({ loading: false, res: await diagnosticsApi.sniScan(target), err: '' })
+    } catch {
+      setSniScan({ loading: false, res: null, err: t('scan failed', 'ошибка сканирования') })
+    }
+  }
 
   const preset = presets.find((p) => p.id === presetId) ?? null
 
@@ -1063,7 +1112,7 @@ function AddInboundModal({
       return xuiApi.createInbound(server.id, {
         preset_id: preset.id,
         values: { ...values },
-      })
+      }, direct)
     },
     onSuccess: onCreated,
     onError: (err: unknown) => {
@@ -1111,7 +1160,7 @@ function AddInboundModal({
         </p>
 
         {error && (
-          <div className="mb-3 rounded-lg bg-red-900/30 border border-red-700/40 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
+          <div className="mb-3 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700/40 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
             <AlertTriangle className="h-3.5 w-3.5 mt-0.5" />
             <span>{error}</span>
           </div>
@@ -1141,19 +1190,19 @@ function AddInboundModal({
                   className={
                     'rounded-lg border px-3 py-2 text-left transition-colors ' +
                     (p.id === presetId
-                      ? 'border-brand-500/60 bg-brand-600/10 text-brand-200'
+                      ? 'border-brand-500/60 bg-brand-50 dark:bg-brand-600/10 text-brand-700 dark:text-brand-200'
                       : 'border-gray-800 bg-gray-900/40 text-gray-400 hover:border-gray-700 hover:text-gray-200')
                   }
                 >
                   <div className="text-sm font-medium flex items-center gap-1.5 flex-wrap">
                     <span>{p.label}</span>
                     {p.supports_reality && (
-                      <span className="text-[10px] px-1 py-0.5 rounded bg-purple-900/30 text-purple-300 border border-purple-700/40 font-mono">
+                      <span className="text-[10px] px-1 py-0.5 rounded-sm bg-purple-100 text-purple-700 border border-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:border-purple-700/40 font-mono">
                         reality
                       </span>
                     )}
                     {p.needs_domain && (
-                      <span className="text-[10px] px-1 py-0.5 rounded bg-blue-900/30 text-blue-300 border border-blue-700/40 font-mono">
+                      <span className="text-[10px] px-1 py-0.5 rounded-sm bg-blue-100 text-blue-700 border border-blue-200 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-700/40 font-mono">
                         domain
                       </span>
                     )}
@@ -1184,8 +1233,51 @@ function AddInboundModal({
                   value={values[f.name] ?? ''}
                   onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
                   placeholder={f.placeholder || (f.default ?? '')}
-                  className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+                  className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
                 />
+                {f.type === 'sni' && (
+                  <div className="mt-1.5 space-y-1">
+                    <button
+                      type="button"
+                      onClick={() => scanSni(f.name)}
+                      disabled={sniScan.loading || !values[f.name]?.trim()}
+                      className="rounded-sm bg-gray-800 px-2 py-1 text-[11px] text-gray-300 hover:bg-gray-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+                    >
+                      {sniScan.loading
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : <Radar className="h-3 w-3" />}
+                      {sniScan.loading
+                        ? t('Scanning…', 'Сканирую…')
+                        : t('Scan (via active node)', 'Сканировать (через активную ноду)')}
+                    </button>
+                    {(sniScan.res || sniScan.err) && (
+                      <div className={
+                        'text-[11px] ' +
+                        (sniScan.err
+                          ? 'text-red-600 dark:text-red-400'
+                          : sniScan.res!.ok
+                          ? 'text-green-600 dark:text-green-400'
+                          : 'text-amber-600 dark:text-amber-400')
+                      }>
+                        {sniScan.err || (
+                          <>
+                            {sniScan.res!.ok ? '✓ ' : '• '}{sniScan.res!.detail}
+                            {sniScan.res!.tls13 != null && ` · TLS1.3 ${sniScan.res!.tls13 ? '✓' : '✗'}`}
+                            {sniScan.res!.http2 != null && ` · h2 ${sniScan.res!.http2 ? '✓' : '✗'}`}
+                            {(sniScan.res!.cert_name || sniScan.res!.cert_subject) && (
+                              <> · {t('cert', 'серт')}:{' '}
+                                <span className="text-gray-300">
+                                  {sniScan.res!.cert_name || sniScan.res!.cert_subject}
+                                </span>
+                              </>
+                            )}
+                            {` · via ${sniScan.res!.via}`}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {f.help && (
                   <p className="text-[11px] text-gray-500 mt-1 leading-snug">{f.help}</p>
                 )}
@@ -1221,10 +1313,11 @@ function AddInboundModal({
 // ── Add client modal ───────────────────────────────────────────────────────
 
 function AddClientModal({
-  serverId, inboundId, onClose, onCreated,
+  serverId, inboundId, direct, onClose, onCreated,
 }: {
   serverId: number
   inboundId: number
+  direct: boolean
   onClose: () => void
   onCreated: () => void
 }) {
@@ -1238,7 +1331,7 @@ function AddClientModal({
     mutationFn: () =>
       xuiApi.addClient(serverId, inboundId, {
         label: label.trim() || undefined,
-      }),
+      }, direct),
     onSuccess: (data) => setCreated(data),
     onError: (err: unknown) => {
       let msg = 'Add client failed'
@@ -1277,7 +1370,7 @@ function AddClientModal({
         </p>
 
         {error && (
-          <div className="mb-3 rounded-lg bg-red-900/30 border border-red-700/40 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
+          <div className="mb-3 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700/40 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
             <AlertTriangle className="h-3.5 w-3.5 mt-0.5" />
             <span>{error}</span>
           </div>
@@ -1294,7 +1387,7 @@ function AddClientModal({
                 value={label}
                 onChange={(e) => setLabel(e.target.value)}
                 placeholder={t('auto-generated: pi-XXXXXXXX', 'автоматически: pi-XXXXXXXX')}
-                className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+                className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
               />
               <p className="text-[11px] text-gray-500 mt-1 leading-snug">
                 {t(
@@ -1325,7 +1418,7 @@ function AddClientModal({
           </form>
         ) : (
           <div className="space-y-3">
-            <div className="rounded-lg border border-emerald-700/40 bg-emerald-900/10 px-3 py-2 text-sm text-emerald-200 flex items-start gap-2">
+            <div className="rounded-lg border border-emerald-200 dark:border-emerald-700/40 bg-emerald-50 dark:bg-emerald-900/10 px-3 py-2 text-sm text-emerald-800 dark:text-emerald-200 flex items-start gap-2">
               <ShieldCheck className="h-4 w-4 mt-0.5" />
               <span>{t('Client created', 'Клиент создан')}</span>
             </div>
@@ -1339,7 +1432,7 @@ function AddClientModal({
               <div>
                 <div className="text-[11px] uppercase tracking-wider text-gray-500 mb-1">UUID</div>
                 <div className="flex items-center gap-2">
-                  <code className="flex-1 rounded bg-gray-900 border border-gray-800 px-2 py-1 text-xs font-mono text-gray-200 break-all">
+                  <code className="flex-1 rounded-sm bg-gray-900 border border-gray-800 px-2 py-1 text-xs font-mono text-gray-200 break-all">
                     {created.client_uuid}
                   </code>
                   <button
@@ -1348,7 +1441,7 @@ function AddClientModal({
                     className="rounded-md border border-gray-700 hover:bg-gray-800 p-1.5 text-gray-400 hover:text-gray-200"
                     title={t('Copy UUID', 'Копировать UUID')}
                   >
-                    {copied ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                    {copied ? <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
                   </button>
                 </div>
               </div>

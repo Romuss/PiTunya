@@ -69,11 +69,12 @@ export interface Node {
   latency_ms?: number
   last_check?: string
   is_online: boolean
-  order: number
-  // v1.6.0 — speed test results (renamed from last_speed_test to match upstream)
+  // Last speed reading (Mbps) + when it was taken. The UI greys/reddens a
+  // reading older than ~6h.
   speed_mbps?: number | null
   speed_max_mbps?: number | null
   speed_tested_at?: string | null
+  order: number
   chain_node_id?: number | null
   // Optional link to a Server (the VPS hosting this node's upstream).
   // Purely informational — does not affect routing/connection.
@@ -86,6 +87,10 @@ export interface Node {
   // (sync detected the peer is gone) or via Remove client. The Node
   // keeps working but warns the admin that the upstream peer is dead.
   client_orphan?: boolean
+  /** `chain_node_id` points at a node that no longer exists. Computed
+   *  server-side on every read, so it also catches rows broken by an
+   *  older version or an external DB edit. */
+  chain_orphan?: boolean
 }
 
 export type NodeCreate = Omit<Node, 'id' | 'latency_ms' | 'last_check' | 'is_online'>
@@ -127,8 +132,6 @@ export interface NodePageParams {
   /** Tiebreaker direction for the `id` column. Default `desc` shows
    *  newest-added Nodes first (natural for subscription imports). */
   direction?: 'asc' | 'desc'
-  /** v1.5.0 — 'quality' sorts by online + speed + latency. */
-  sort?: 'default' | 'quality'
 }
 
 export interface NodeImportResponse {
@@ -370,6 +373,42 @@ export interface Subscription {
 export type SubscriptionCreate = Omit<Subscription, 'id' | 'last_updated' | 'node_count' | 'last_error'>
 export type SubscriptionUpdate = Partial<SubscriptionCreate>
 
+// ── User-Agent templates ──────────────────────────────────────────────────────
+
+/** The client fingerprint a subscription fetch presents. */
+export interface UserAgentTemplate {
+  id: number
+  /** Stable slug in `Subscription.ua`; renaming re-points its subscriptions. */
+  key: string
+  name: string
+  user_agent: string
+  /**
+   * Extra request headers merged over the base set. An empty value drops
+   * that header instead of sending it blank. Transport-owned names
+   * (`User-Agent`, `Host`, …) are rejected by the backend.
+   */
+  headers: Record<string, string>
+  description?: string | null
+  /** Set on seeded rows; drives a badge and a louder delete confirmation. */
+  builtin: boolean
+  /** Lower number = earlier in the dropdown. */
+  order: number
+  /** How many subscriptions currently reference this template's key. */
+  usage_count: number
+}
+
+export type UserAgentTemplateCreate = Omit<
+  UserAgentTemplate, 'id' | 'builtin' | 'usage_count'
+>
+export type UserAgentTemplateUpdate = Partial<UserAgentTemplateCreate>
+
+export interface UserAgentTemplateImportResult {
+  imported: number
+  updated: number
+  skipped: number
+  errors: string[]
+}
+
 // ── System ────────────────────────────────────────────────────────────────────
 
 export type ProxyMode = 'global' | 'rules' | 'bypass'
@@ -480,6 +519,8 @@ export interface SystemSettings {
   health_timeout?: number
   health_fail_threshold?: number
   health_full_check_interval?: number
+  // TLS-ClientHello fragmentation (anti-DPI, client-side)
+  xray_fragment_enabled?: boolean
   // Misc
   disable_ipv6?: boolean
   dns_over_tcp?: boolean
@@ -642,8 +683,7 @@ export interface HealthResult {
 export interface SpeedTestResult {
   node_id: number
   node_name: string
-  speed_mbps?: number
-  duration_s?: number
+  download_mbps?: number
   error?: string
 }
 
@@ -690,14 +730,29 @@ export interface NodeCircle {
   mode: 'sequential' | 'random' | 'best'
   interval_min: number
   interval_max: number
+  // Candidate filters (0 = disabled). max_latency_ms drops slow-RTT
+  // candidates; min_speed_mbps drops candidates below the speed floor.
+  max_latency_ms: number
+  min_speed_mbps: number
   current_index: number
   last_rotated?: string
   current_node_name?: string
-  // v1.5.0
-  subscription_id?: number | null
-  min_speed_mbps?: number
-  max_latency_ms?: number
 }
+export type AutoCheckScope = 'all' | 'subscription' | 'group' | 'nodes'
+
+export interface AutoCheck {
+  enabled: boolean
+  interval_minutes: number
+  scope_kind: AutoCheckScope
+  // subscription id / group name / JSON "[1,2,3]"; empty for "all".
+  scope_value: string
+  last_sweep?: string | null
+  // Live status from the backend (not stored).
+  is_sweeping: boolean
+}
+
+export type AutoCheckUpdate = Partial<Pick<AutoCheck, 'enabled' | 'interval_minutes' | 'scope_kind' | 'scope_value'>>
+
 export type NodeCircleCreate = Omit<NodeCircle, 'id' | 'current_index' | 'last_rotated' | 'current_node_name'>
 export type NodeCircleUpdate = Partial<NodeCircleCreate>
 

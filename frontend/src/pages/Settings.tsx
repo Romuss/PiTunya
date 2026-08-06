@@ -1,7 +1,8 @@
-import { useState, useRef } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { systemApi } from '@/api/client'
 import HostNetworkSection from '@/components/HostNetworkSection'
+import { UpdateSection } from '@/components/UpdateSection'
 import {
   Settings as SettingsIcon,
   Network,
@@ -18,8 +19,6 @@ import {
   Lock,
   Eye,
   EyeOff,
-  Download,
-  Upload,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useT } from '@/hooks/useT'
@@ -68,9 +67,6 @@ export function Settings() {
 
   const [draft, setDraft] = useState<PartialSettings>({})
   const [saved, setSaved] = useState(false)
-  const [exporting, setExporting] = useState(false)
-  const [importing, setImporting] = useState(false)
-  const importRef = useRef<HTMLInputElement>(null)
   const [error, setError] = useState('')
 
   const mutation = useMutation({
@@ -130,7 +126,7 @@ export function Settings() {
 
   if (isLoading) return (
     <div className="p-6">
-      <div className="h-8 w-48 rounded bg-gray-800 animate-pulse mb-4" />
+      <div className="h-8 w-48 rounded-sm bg-gray-800 animate-pulse mb-4" />
       <div className="space-y-4">
         {[1, 2, 3].map(i => <div key={i} className="h-40 rounded-xl bg-gray-800/50 animate-pulse" />)}
       </div>
@@ -146,7 +142,7 @@ export function Settings() {
         onChange={(e) => set(key, e.target.value)}
         placeholder={placeholder}
         className={clsx(
-          'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-none transition-colors',
+          'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-hidden transition-colors',
           draft[key] !== undefined ? 'border-brand-500' : 'border-gray-800 focus:border-gray-600',
         )}
       />
@@ -163,7 +159,7 @@ export function Settings() {
         min={min}
         max={max}
         className={clsx(
-          'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-none transition-colors',
+          'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-hidden transition-colors',
           draft[key] !== undefined ? 'border-brand-500' : 'border-gray-800 focus:border-gray-600',
         )}
       />
@@ -229,53 +225,6 @@ export function Settings() {
     </div>
   )
 
-  const handleExport = async () => {
-    setExporting(true)
-    try {
-      const token = localStorage.getItem('pitun_token')
-      const resp = await fetch('/api/system/export', {
-        headers: { 'Authorization': `Bearer ${token}` }
-      })
-      const blob = await resp.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `pitun-config-${new Date().toISOString().slice(0,10)}.json`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (e) {
-      alert('Export failed: ' + e)
-    }
-    setExporting(false)
-  }
-
-  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setImporting(true)
-    try {
-      const token = localStorage.getItem('pitun_token')
-      const formData = new FormData()
-      formData.append('file', file)
-      const resp = await fetch('/api/system/import', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` },
-        body: formData,
-      })
-      const result = await resp.json()
-      if (resp.ok) {
-        alert(`Import complete: ${JSON.stringify(result.results)}`)
-        qc.invalidateQueries()
-      } else {
-        alert('Import failed: ' + (result.detail || 'Unknown error'))
-      }
-    } catch (err) {
-      alert('Import error: ' + err)
-    }
-    setImporting(false)
-    if (importRef.current) importRef.current.value = ''
-  }
-
   return (
     <div className="p-6 space-y-4 max-w-5xl">
       {/* Header */}
@@ -285,28 +234,8 @@ export function Settings() {
           <p className="text-sm text-gray-500 mt-0.5">Network, ports, safety and health check configuration</p>
         </div>
         <div className="flex items-center gap-2">
-          {/* v1.5.2 — Config Export/Import */}
-          <button
-            onClick={handleExport}
-            disabled={exporting}
-            className="flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:border-gray-600 hover:text-gray-100 transition-colors disabled:opacity-50"
-            title="Export all configuration as JSON"
-          >
-            <Download className="h-4 w-4" />
-            <span className="hidden sm:inline">Export Config</span>
-          </button>
-          <button
-            onClick={() => importRef.current?.click()}
-            disabled={importing}
-            className="flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:border-gray-600 hover:text-gray-100 transition-colors disabled:opacity-50"
-            title="Import configuration from JSON file"
-          >
-            <Upload className="h-4 w-4" />
-            <span className="hidden sm:inline">{importing ? 'Importing…' : 'Import Config'}</span>
-          </button>
-          <input ref={importRef} type="file" accept=".json" onChange={handleImport} className="hidden" />
           {saved && (
-            <span className="flex items-center gap-1 text-xs text-green-400">
+            <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
               <CheckCircle2 className="h-3.5 w-3.5" /> Saved
             </span>
           )}
@@ -331,16 +260,21 @@ export function Settings() {
 
       {/* Error */}
       {error && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-950/30 border border-red-900/50 px-4 py-2.5 text-xs text-red-300">
-          <XCircle className="h-4 w-4 text-red-400 flex-shrink-0" />
+        <div className="flex items-center gap-2 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 px-4 py-2.5 text-xs text-red-700 dark:text-red-300">
+          <XCircle className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0" />
           {error}
         </div>
       )}
 
+      {/* Updates — first block on the page: it is an action, not a
+          setting, and burying it inside a settings card made it
+          unfindable. */}
+      <UpdateSection />
+
       {/* Restart warning */}
       {hasChanges && (
-        <div className="flex items-center gap-2 rounded-lg bg-yellow-950/30 border border-yellow-900/50 px-4 py-2.5 text-xs text-yellow-300">
-          <AlertTriangle className="h-4 w-4 text-yellow-400 flex-shrink-0" />
+        <div className="flex items-center gap-2 rounded-lg bg-yellow-50 dark:bg-yellow-950/30 border border-yellow-200 dark:border-yellow-900/50 px-4 py-2.5 text-xs text-yellow-700 dark:text-yellow-300">
+          <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-400 shrink-0" />
           Changes to network and ports require xray restart to take effect.
         </div>
       )}
@@ -440,6 +374,7 @@ export function Settings() {
           {toggle('bypass_private', 'Bypass Private IPs', t('Skip proxying for 10.x, 192.168.x, etc.', 'Не проксировать трафик 10.x, 192.168.x и т.д.'), t('LAN traffic (including access to this device) will go through VPN.\nYou may lose access to the web panel!\n\nDisable?', 'LAN-трафик (включая доступ к панели) пойдёт через VPN.\nВы можете потерять доступ к веб-панели!\n\nОтключить?'))}
           {toggle('disable_ipv6', 'Disable IPv6 (host only)', t('Disables IPv6 on THIS box only (sysctl). Does NOT stop LAN clients from using IPv6 — they get their IPv6 route from the router directly. To prevent the IPv6 bypass leak for clients, the DNS engine already returns IPv4-only answers (queryStrategy=UseIPv4).', 'Отключает IPv6 только на ЭТОЙ машине (sysctl). НЕ мешает LAN-клиентам использовать IPv6 — они получают IPv6-маршрут от роутера напрямую. Чтобы закрыть IPv6-утечку у клиентов, DNS-движок уже отдаёт только IPv4-ответы (queryStrategy=UseIPv4).'))}
           {toggle('dns_over_tcp', 'DNS over TCP', t('Use TCP for DNS queries (fixes networks where UDP:53 is blocked)', 'Использовать TCP для DNS (исправляет сети где UDP:53 заблокирован)'))}
+          {toggle('xray_fragment_enabled', 'TLS Fragment (anti-DPI)', t('Split the TLS ClientHello into fragments so DPI can\'t match the SNI in one packet. Client-side — the server is unaware and reassembles normally. Routes proxy nodes through a fragmenting outbound; may slightly reduce throughput. Needs xray 26.x.', 'Разбивать TLS ClientHello на фрагменты, чтобы DPI не мог сматчить SNI в одном пакете. Клиентская фича — сервер не в курсе и собирает поток как обычно. Прокси-ноды идут через фрагментирующий outbound; может немного снизить скорость. Требует xray 26.x.'))}
         </div>
       ))}
 
@@ -493,7 +428,7 @@ export function Settings() {
               value={val('timezone') || 'UTC'}
               onChange={(e) => set('timezone', e.target.value)}
               className={clsx(
-                'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-none',
+                'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-hidden',
                 draft['timezone'] !== undefined ? 'border-brand-500' : 'border-gray-800',
               )}
             >
@@ -511,7 +446,7 @@ export function Settings() {
               value={val('log_level')}
               onChange={(e) => set('log_level', e.target.value)}
               className={clsx(
-                'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-none',
+                'w-full rounded-lg bg-gray-950 border px-3 py-2 text-sm text-gray-100 focus:outline-hidden',
                 draft['log_level'] !== undefined ? 'border-brand-500' : 'border-gray-800',
               )}
             >
@@ -554,7 +489,7 @@ function PasswordField({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           className={clsx(
-            'w-full rounded-lg bg-gray-950 border pr-9 px-3 py-2 text-sm text-gray-100 focus:outline-none transition-colors',
+            'w-full rounded-lg bg-gray-950 border pr-9 px-3 py-2 text-sm text-gray-100 focus:outline-hidden transition-colors',
             draft ? 'border-brand-500' : 'border-gray-800 focus:border-gray-600',
           )}
           autoComplete="off"
@@ -562,7 +497,7 @@ function PasswordField({
         <button
           type="button"
           onClick={() => setReveal((v) => !v)}
-          className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1.5 text-gray-500 hover:text-brand-400 hover:bg-gray-800 transition-colors"
+          className="absolute right-1 top-1/2 -translate-y-1/2 rounded-sm p-1.5 text-gray-500 hover:text-brand-400 hover:bg-gray-800 transition-colors"
           title={reveal ? 'Hide' : 'Reveal'}
         >
           {reveal ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}

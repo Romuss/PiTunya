@@ -2,16 +2,13 @@ import { useState } from 'react'
 import * as React from 'react'
 import {
   Users, Plus, RefreshCw, Trash2, Download, Network, Loader2,
-  AlertTriangle, AlertCircle, CheckCircle2, ExternalLink, QrCode,
-  ArrowDown,
+  AlertTriangle, AlertCircle, CheckCircle2, ExternalLink,
 } from 'lucide-react'
-import { QRCodeSVG } from 'qrcode.react'
 
 import { serversApi } from '@/api/client'
 import { ModalShell } from '@/components/ModalShell'
 import { useT } from '@/hooks/useT'
 import { useConfirm } from '@/components/ConfirmModal'
-import { apiError } from '@/lib/apiError'
 import {
   useDeploymentClients,
   useAddClient,
@@ -50,9 +47,13 @@ import type {
  */
 export function ManageClientsModal({
   server,
+  direct = false,
   onClose,
 }: {
   server: Server
+  /** Route the WG-client SSH ops directly (SO_MARK bypass) instead of
+   * through the active node. Inherited from the Servers page toggle. */
+  direct?: boolean
   onClose: () => void
 }) {
   const t = useT()
@@ -68,10 +69,6 @@ export function ManageClientsModal({
 
   const [newName, setNewName] = useState('')
   const [actionError, setActionError] = useState<string>('')
-  const [qrConf, setQrConf] = useState<string | null>(null)
-  const [qrName, setQrName] = useState('')
-  const [stats, setStats] = useState<Record<string, { rx_mb: number; tx_mb: number; online: boolean }>>({})
-  const [statsLoading, setStatsLoading] = useState(false)
   const [lastSync, setLastSync] = useState<{
     added: string[]; unchanged: string[]; orphaned: string[]
   } | null>(null)
@@ -84,7 +81,7 @@ export function ManageClientsModal({
       return
     }
     try {
-      await addClient.mutateAsync({ serverId: server.id, body: { name: newName.trim() } })
+      await addClient.mutateAsync({ serverId: server.id, body: { name: newName.trim() }, direct })
       setNewName('')
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
@@ -95,7 +92,7 @@ export function ManageClientsModal({
     setActionError('')
     setLastSync(null)
     try {
-      const r = await syncClients.mutateAsync(server.id)
+      const r = await syncClients.mutateAsync({ serverId: server.id, direct })
       setLastSync(r)
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
@@ -124,7 +121,7 @@ export function ManageClientsModal({
     if (!ok) return
     setActionError('')
     try {
-      await removeClient.mutateAsync({ serverId: server.id, name: c.name })
+      await removeClient.mutateAsync({ serverId: server.id, name: c.name, direct })
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
     }
@@ -135,7 +132,7 @@ export function ManageClientsModal({
     try {
       // Pass an empty body — backend defaults node_name=client_name and
       // enabled=true. Future iteration can offer a small picker form.
-      await exportToNode.mutateAsync({ serverId: server.id, name: c.name, body: {} })
+      await exportToNode.mutateAsync({ serverId: server.id, name: c.name, body: {}, direct })
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
     }
@@ -144,7 +141,9 @@ export function ManageClientsModal({
   const onDownloadConf = async (c: DeploymentClient) => {
     setActionError('')
     try {
-      const conf = await serversApi.getClientConf(server.id, c.name)
+      const conf = await serversApi.getClientConf(server.id, c.name, direct)
+      // Trigger a browser download — `<server>-<client>.conf` is the
+      // typical naming used by wg-quick / mobile apps.
       const blob = new Blob([conf.wg_conf], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -157,45 +156,11 @@ export function ManageClientsModal({
     }
   }
 
-  const onShowQR = async (c: DeploymentClient) => {
-    setActionError('')
-    try {
-      const conf = await serversApi.getClientConf(server.id, c.name)
-      setQrConf(conf.wg_conf)
-      setQrName(c.name)
-    } catch (err: unknown) {
-      setActionError(extractAxiosError(err))
-    }
-  }
-
-  const onFetchStats = async () => {
-    setStatsLoading(true)
-    setActionError('')
-    try {
-      const results: Record<string, { rx_mb: number; tx_mb: number; online: boolean }> = {}
-      let firstError = ''
-      for (const c of clients) {
-        try {
-          const s = await serversApi.getClientStats(server.id, c.name)
-          results[c.name] = { rx_mb: s.rx_mb, tx_mb: s.tx_mb, online: s.online }
-          if (s.error && !firstError) firstError = `${c.name}: ${s.error}`
-        } catch {
-          results[c.name] = { rx_mb: 0, tx_mb: 0, online: false }
-        }
-      }
-      setStats(results)
-      if (firstError) setActionError(firstError)
-    } catch (err: unknown) {
-      setActionError(extractAxiosError(err))
-    }
-    setStatsLoading(false)
-  }
-
   return (
     <ModalShell onClose={onClose} labelledBy="manage-clients-title">
       <div className="w-full max-w-3xl rounded-2xl bg-gray-950/95 border border-gray-800 p-6 m-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-start gap-3 mb-4">
-          <div className="rounded-lg bg-brand-600/15 p-2 text-brand-400">
+          <div className="rounded-lg bg-brand-50 dark:bg-brand-600/15 p-2 text-brand-400">
             <Users className="h-5 w-5" />
           </div>
           <div className="flex-1 min-w-0">
@@ -227,14 +192,14 @@ export function ManageClientsModal({
         </div>
 
         {actionError && (
-          <div className="mb-3 rounded-lg bg-red-900/30 border border-red-700/50 px-3 py-2 text-sm text-red-300 flex items-start gap-2">
-            <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+          <div className="mb-3 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700/50 px-3 py-2 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
             <span>{actionError}</span>
           </div>
         )}
 
         {lastSync && (
-          <div className="mb-3 rounded-lg border border-emerald-700/40 bg-emerald-900/10 px-3 py-2 text-xs text-emerald-300 flex items-start gap-2">
+          <div className="mb-3 rounded-lg border border-emerald-200 dark:border-emerald-700/40 bg-emerald-50 dark:bg-emerald-900/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300 flex items-start gap-2">
             <CheckCircle2 className="h-4 w-4 mt-0.5" />
             <div>
               {t('Sync result: ', 'Результат синхронизации: ')}
@@ -244,7 +209,7 @@ export function ManageClientsModal({
               <span className="font-mono">{lastSync.unchanged.length}</span>
               {' '}{t('unchanged', 'без изменений')}
               {' · '}
-              <span className="font-mono text-yellow-300">{lastSync.orphaned.length}</span>
+              <span className="font-mono text-yellow-700 dark:text-yellow-300">{lastSync.orphaned.length}</span>
               {' '}{t('orphaned', 'осиротевших')}
             </div>
           </div>
@@ -265,7 +230,7 @@ export function ManageClientsModal({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 placeholder="phone-2"
-                className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+                className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
               />
             </label>
           </div>
@@ -295,18 +260,18 @@ export function ManageClientsModal({
             {t('Loading clients…', 'Загрузка клиентов…')}
           </div>
         ) : error ? (
-          <div className="rounded-lg border border-red-700/40 bg-red-900/10 px-3 py-3 text-sm text-red-300 flex items-start gap-2">
+          <div className="rounded-lg border border-red-200 dark:border-red-700/40 bg-red-50 dark:bg-red-900/10 px-3 py-3 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
             <AlertTriangle className="h-4 w-4 mt-0.5" />
             <div>
               <div className="font-medium">{t('Failed to load clients', 'Не удалось загрузить клиентов')}</div>
-              <div className="text-xs text-red-300/80 mt-0.5 break-words font-mono">
+              <div className="text-xs text-red-700 dark:text-red-300/80 mt-0.5 wrap-break-word font-mono">
                 {(error as Error).message}
               </div>
               <button
                 type="button"
                 onClick={() => refetch()}
                 disabled={isRefetching}
-                className="mt-2 rounded border border-red-700/50 px-2 py-0.5 text-xs hover:bg-red-900/20 disabled:opacity-50"
+                className="mt-2 rounded-sm border border-red-200 dark:border-red-700/50 px-2 py-0.5 text-xs hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
               >
                 {t('Retry', 'Повторить')}
               </button>
@@ -331,8 +296,6 @@ export function ManageClientsModal({
                   <th className="px-3 py-2 text-left">{t('Name', 'Имя')}</th>
                   <th className="px-3 py-2 text-left">{t('Status', 'Статус')}</th>
                   <th className="px-3 py-2 text-left">{t('Address', 'Адрес')}</th>
-                  <th className="px-3 py-2 text-right">RX</th>
-                  <th className="px-3 py-2 text-right">TX</th>
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
@@ -350,27 +313,12 @@ export function ManageClientsModal({
                     onRemove={() => onRemove(c)}
                     onExport={() => onExport(c)}
                     onDownload={() => onDownloadConf(c)}
-                    onShowQR={() => onShowQR(c)}
-                    clientStats={stats}
                   />
                 ))}
               </tbody>
             </table>
           </div>
         )}
-
-        {/* Stats button */}
-        <div className="flex items-center gap-2 pt-2">
-          <button
-            type="button"
-            onClick={onFetchStats}
-            disabled={statsLoading || clients.length === 0}
-            className="flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-300 hover:border-gray-600 hover:text-gray-100 transition-colors disabled:opacity-50"
-          >
-            {statsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowDown className="h-3.5 w-3.5" />}
-            {statsLoading ? t('Loading...', 'Загрузка...') : t('Fetch Stats', 'Статистика')}
-          </button>
-        </div>
 
         {/* Footer */}
         <div className="flex justify-end pt-4">
@@ -383,26 +331,6 @@ export function ManageClientsModal({
           </button>
         </div>
       </div>
-      {/* QR Code Modal for WG client */}
-      {qrConf && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={() => setQrConf(null)}>
-          <div className="rounded-2xl bg-gray-950 border border-gray-800 p-6 max-w-sm" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-semibold text-gray-200">{qrName} — QR</h3>
-              <button onClick={() => setQrConf(null)} className="text-gray-500 hover:text-gray-300">
-                <Trash2 className="h-4 w-4" />
-              </button>
-            </div>
-            <div className="flex justify-center rounded-xl bg-white p-4">
-              <QRCodeSVG value={qrConf} size={240} />
-            </div>
-            <p className="text-xs text-gray-500 mt-3 text-center">
-              Scan with WireGuard app (iOS/Android)
-            </p>
-          </div>
-        </div>
-      )}
-
     </ModalShell>
   )
 }
@@ -417,8 +345,6 @@ function ClientRow({
   onRemove,
   onExport,
   onDownload,
-  onShowQR,
-  clientStats,
 }: {
   client: DeploymentClient
   busy: boolean
@@ -426,8 +352,6 @@ function ClientRow({
   onRemove: () => void
   onExport: () => void
   onDownload: () => void
-  onShowQR?: () => void
-  clientStats?: Record<string, { rx_mb: number; tx_mb: number; online: boolean }>
 }) {
   const t = useT()
   const exportedCount = client.exported_node_ids.length
@@ -449,20 +373,8 @@ function ClientRow({
       <td className="px-3 py-2 text-xs text-gray-400 font-mono">
         {client.wg_local_address || <span className="text-gray-600">—</span>}
       </td>
-      <td className="px-3 py-2 text-xs text-gray-400 font-mono text-right">
-        {clientStats && clientStats[client.name] ? `${clientStats[client.name].rx_mb} MB` : '—'}
-      </td>
-      <td className="px-3 py-2 text-xs text-gray-400 font-mono text-right">
-        {clientStats && clientStats[client.name] ? `${clientStats[client.name].tx_mb} MB` : '—'}
-      </td>
       <td className="px-3 py-2">
         <div className="flex justify-end gap-1">
-          <IconBtn
-            onClick={() => onShowQR?.()}
-            title={t('Show QR code', 'Показать QR-код')}
-            icon={QrCode}
-            disabled={isOrphan}
-          />
           <IconBtn
             onClick={onDownload}
             title={t('Download .conf', 'Скачать .conf')}
@@ -499,7 +411,7 @@ function ClientStatusBadge({ status }: { status: DeploymentClientStatus }) {
   const t = useT()
   if (status === 'orphan') {
     return (
-      <span className="inline-flex items-center gap-1 rounded bg-yellow-900/30 border border-yellow-700/40 px-2 py-0.5 text-xs text-yellow-300">
+      <span className="inline-flex items-center gap-1 rounded-sm bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-700/40 px-2 py-0.5 text-xs text-yellow-700 dark:text-yellow-300">
         <AlertCircle className="h-3 w-3" />
         {t('orphan', 'осиротел')}
       </span>
@@ -507,14 +419,14 @@ function ClientStatusBadge({ status }: { status: DeploymentClientStatus }) {
   }
   if (status === 'exported') {
     return (
-      <span className="inline-flex items-center gap-1 rounded bg-emerald-900/30 border border-emerald-700/40 px-2 py-0.5 text-xs text-emerald-300">
+      <span className="inline-flex items-center gap-1 rounded-sm bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-700/40 px-2 py-0.5 text-xs text-emerald-700 dark:text-emerald-300">
         <CheckCircle2 className="h-3 w-3" />
         {t('exported', 'экспортирован')}
       </span>
     )
   }
   return (
-    <span className="inline-flex items-center gap-1 rounded bg-gray-800 px-2 py-0.5 text-xs text-gray-400">
+    <span className="inline-flex items-center gap-1 rounded-sm bg-gray-800 px-2 py-0.5 text-xs text-gray-400">
       {t('available', 'доступен')}
     </span>
   )
@@ -532,8 +444,8 @@ function IconBtn({
   spinning?: boolean
 }) {
   const cls = danger
-    ? 'p-1.5 rounded text-gray-500 hover:text-red-400 hover:bg-red-900/20 disabled:opacity-30 disabled:hover:bg-transparent transition-colors'
-    : 'p-1.5 rounded text-gray-500 hover:text-brand-400 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent transition-colors'
+    ? 'p-1.5 rounded-sm text-gray-500 hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-30 disabled:hover:bg-transparent transition-colors'
+    : 'p-1.5 rounded-sm text-gray-500 hover:text-brand-400 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent transition-colors'
   return (
     <button type="button" onClick={onClick} title={title} disabled={disabled} className={cls}>
       {spinning ? (
@@ -546,5 +458,18 @@ function IconBtn({
 }
 
 
-// Replaced by shared apiError() from @/lib/apiError (upstream v1.4.7).
-const extractAxiosError = apiError
+function extractAxiosError(err: unknown): string {
+  if (typeof err === 'object' && err !== null) {
+    const e = err as { response?: { data?: { detail?: unknown } }, message?: string }
+    const detail = e.response?.data?.detail
+    if (typeof detail === 'string') return detail
+    if (Array.isArray(detail)) {
+      return detail
+        .map((d: { msg?: string; loc?: unknown }) => (d?.msg ?? '') + (d?.loc ? ' (' + JSON.stringify(d.loc) + ')' : ''))
+        .filter(Boolean)
+        .join('; ')
+    }
+    if (e.message) return e.message
+  }
+  return 'Request failed'
+}
