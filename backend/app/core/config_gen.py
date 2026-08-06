@@ -89,7 +89,11 @@ def _tls_settings(node: Node) -> Optional[Dict[str, Any]]:
 
 
 def _stream_settings(node: Node) -> Dict[str, Any]:
-    stream: Dict[str, Any] = {"network": node.transport}
+    # Xray v25.x renamed "tcp" → "raw"; if a node was stored with
+    # transport="raw" (from a subscription that emitted type=raw),
+    # fold it back so every bundled xray version accepts the config.
+    transport = "tcp" if node.transport == "raw" else node.transport
+    stream: Dict[str, Any] = {"network": transport}
 
     if node.transport == "ws":
         # xray deprecated "Host" inside "headers" — use top-level "host" field instead
