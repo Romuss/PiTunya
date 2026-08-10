@@ -137,8 +137,8 @@ async def download_list(list_id: int) -> int:
             return 0
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(lst.url, follow_redirects=True)
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                resp = await client.get(lst.url)
                 resp.raise_for_status()
                 text = resp.text
         except Exception as exc:
@@ -153,17 +153,18 @@ async def download_list(list_id: int) -> int:
                 continue
 
             if lst.format == "hosts":
-                # /etc/hosts format: "0.0.0.0 domain.com" or "127.0.0.1 domain.com"
                 parts = line.split()
                 if len(parts) >= 2:
                     domain = parts[-1].lower()
                     if domain and domain not in ("localhost",):
                         domains.append(domain)
             elif lst.format == "domain":
-                # Plain domain list: "domain.com" or "||domain.com^"
                 domain = line.lstrip("|").rstrip("^").lower()
                 if domain and "." in domain:
                     domains.append(domain)
+
+        # Deduplicate
+        domains = list(set(domains))
 
         # Remove old entries from this list
         from sqlmodel import delete
@@ -171,23 +172,28 @@ async def download_list(list_id: int) -> int:
             delete(AdBlockRule).where(AdBlockRule.source == lst.name)
         )
 
-        # Insert new entries
+        # Bulk insert using SQLModel session (batch to avoid memory issues)
+        now = datetime.now(tz=timezone.utc)
         added = 0
-        for domain in domains:
-            session.add(AdBlockRule(
-                domain_pattern=domain,
-                rule_type="block",
-                source=lst.name,
-                enabled=lst.enabled,
-            ))
-            added += 1
+        batch_size = 500
+        for i in range(0, len(domains), batch_size):
+            batch = domains[i:i + batch_size]
+            for domain in batch:
+                session.add(AdBlockRule(
+                    domain_pattern=domain,
+                    rule_type="block",
+                    source=lst.name,
+                    enabled=lst.enabled,
+                ))
+            await session.commit()  # commit in batches
+            added += len(batch)
 
-        lst.last_updated = datetime.now(tz=timezone.utc)
+        lst.last_updated = now
         lst.entry_count = added
         session.add(lst)
         await session.commit()
 
-        logger.info("AdBlock: downloaded %s — %d domains", lst.name, added)
+        logger.info("AdBlock: downloaded %s, %d domains", lst.name, added)
 
         # Recompile rules
         await compile_rules()
