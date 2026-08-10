@@ -107,8 +107,12 @@ async def delete_list(list_id: int, session: AsyncSession = Depends(get_session)
 
 
 @router.post("/lists/{list_id}/refresh")
-async def refresh_list(list_id: int, session: AsyncSession = Depends(get_session)):
-    """Download + parse a blocklist, updating all its rules."""
+async def refresh_list(list_id: int):
+    """Download + parse a blocklist, updating all its rules.
+
+    No session dependency — download_list creates its own session
+    (avoids MissingGreenlet from nested async session).
+    """
     from app.core.adblock import download_list
     count = await download_list(list_id)
     return {"downloaded": count}
