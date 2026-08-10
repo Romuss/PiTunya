@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Shield, Plus, Trash2, RefreshCw, Download } from 'lucide-react'
+import { Shield, Plus, Trash2, RefreshCw } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { adblockApi } from '@/api/client'
