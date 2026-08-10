@@ -195,9 +195,10 @@ async def download_list(list_id: int) -> int:
 
         logger.info("AdBlock: downloaded %s, %d domains", lst.name, added)
 
-        # Recompile rules
-        await compile_rules()
-        return added
+    # Recompile rules in a SEPARATE session (outside the download session)
+    # to avoid MissingGreenlet from nested async sessions
+    await compile_rules()
+    return added
 
 
 async def seed_default_lists() -> None:
