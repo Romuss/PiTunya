@@ -90,6 +90,45 @@ export function AdBlock() {
         </div>
       )}
 
+      {/* Blocking stats (v2.0.2) */}
+      {stats?.total_blocked !== undefined && stats.total_blocked > 0 && (
+        <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-gray-200">Blocking Stats</h2>
+            <button
+              onClick={() => fetch('/api/adblock/stats/reset', { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('pitun_token')}` } }).then(() => qc.invalidateQueries({ queryKey: ['adblock-stats'] }))}
+              className="text-xs text-gray-500 hover:text-red-400 transition-colors"
+            >
+              Reset
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">
+              <div className="text-xl font-bold text-red-400">{stats.total_blocked?.toLocaleString() ?? 0}</div>
+              <div className="text-xs text-gray-500">Total Blocked</div>
+            </div>
+            <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">
+              <div className="text-xl font-bold text-yellow-400">{stats.unique_domains_blocked?.toLocaleString() ?? 0}</div>
+              <div className="text-xs text-gray-500">Unique Domains</div>
+            </div>
+          </div>
+          {stats.top_blocked && stats.top_blocked.length > 0 && (
+            <div className="space-y-1">
+              <div className="text-xs text-gray-500 mb-1">Top Blocked Domains</div>
+              <div className="max-h-48 overflow-y-auto space-y-1">
+                {stats.top_blocked.map((item: any, i: number) => (
+                  <div key={i} className="flex items-center gap-2 text-xs">
+                    <span className="text-gray-600 font-mono w-6">{i + 1}.</span>
+                    <span className="flex-1 text-gray-300 font-mono truncate">{item.domain}</span>
+                    <span className="text-gray-500 font-mono">{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Blocklists */}
       <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-4 space-y-3">
         <h2 className="text-sm font-semibold text-gray-200">Blocklists</h2>
