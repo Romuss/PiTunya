@@ -730,6 +730,10 @@ export interface NodeCircle {
   mode: 'sequential' | 'random' | 'best'
   interval_min: number
   interval_max: number
+  // Auto-sync from subscription (v1.5.2 fork feature — preserved from
+  // our fork; upstream removed it). When set, circle.node_ids auto-
+  // updates on every subscription refresh.
+  subscription_id?: number | null
   // Candidate filters (0 = disabled). max_latency_ms drops slow-RTT
   // candidates; min_speed_mbps drops candidates below the speed floor.
   max_latency_ms: number

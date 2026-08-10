@@ -4,13 +4,13 @@ import { Plus, Pencil, Trash2, ToggleLeft, ToggleRight, RefreshCw, Circle } from
 import { InfoTip } from '@/components/InfoTip'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { circleApi } from '@/api/client'
+import { circleApi, subsApi } from '@/api/client'
 import { useNodes } from '@/hooks/useNodes'
 import { useSystemSettings, useUpdateSettings } from '@/hooks/useSystem'
 import { useT } from '@/hooks/useT'
 import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
-import type { NodeCircle, NodeCircleCreate } from '@/types'
+import type { NodeCircle, NodeCircleCreate, Subscription } from '@/types'
 
 const MODE_LABELS: Record<string, string> = {
   sequential: 'Sequential',
@@ -60,6 +60,11 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
   // be transiently empty. "0" / empty = disabled.
   const [maxLatency, setMaxLatency] = useState(String(initial?.max_latency_ms ?? 0))
   const [minSpeed, setMinSpeed] = useState(String(initial?.min_speed_mbps ?? 0))
+  const [subscriptionId, setSubscriptionId] = useState(String(initial?.subscription_id ?? ''))
+  const { data: subscriptions = [] } = useQuery<Subscription[]>({
+    queryKey: ['subscriptions'],
+    queryFn: () => subsApi.list(),
+  })
   // Interval inputs are kept as strings so the user can transiently clear
   // the field while typing (`Number('')` = 0, which would lock them into
   // a leading-zero state like "035"). We parse on submit; empty/invalid
@@ -110,6 +115,7 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
       max_latency_ms: mode === 'best' ? Math.max(0, parseInt(maxLatency, 10) || 0) : 0,
       min_speed_mbps: mode === 'best' ? Math.max(0, parseFloat(minSpeed) || 0) : 0,
       node_ids: Array.from(selectedIds),
+      subscription_id: subscriptionId ? Number(subscriptionId) : null,
     })
   }
 
@@ -274,6 +280,24 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
             ))
           )}
         </div>
+      </div>
+
+      {/* Auto-sync from subscription (fork feature — preserved from v1.5.2) */}
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-1">
+          Auto-sync from subscription
+          <InfoTip position="bottom" className="ml-0.5" text="Link this circle to a subscription. On every refresh, node_ids auto-update: new nodes added (sorted by latency), removed ones dropped. Manually-added nodes are preserved." />
+        </label>
+        <select
+          value={subscriptionId}
+          onChange={(e) => setSubscriptionId(e.target.value)}
+          className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none"
+        >
+          <option value="">None (manual)</option>
+          {subscriptions.map((s) => (
+            <option key={s.id} value={String(s.id)}>{s.name}</option>
+          ))}
+        </select>
       </div>
 
       <div className="flex items-center gap-2">
