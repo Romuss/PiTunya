@@ -115,6 +115,21 @@ async def create_list(data: ListCreate, session: AsyncSession = Depends(get_sess
     return lst
 
 
+@router.patch("/lists/{list_id}", response_model=ListRead)
+async def update_list(list_id: int, data: dict, session: AsyncSession = Depends(get_session)):
+    """Update a blocklist (enable/disable, rename, etc.)."""
+    lst = await session.get(AdBlockList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    for k, v in data.items():
+        if hasattr(lst, k):
+            setattr(lst, k, v)
+    session.add(lst)
+    await session.commit()
+    await session.refresh(lst)
+    return lst
+
+
 @router.delete("/lists/{list_id}", status_code=204)
 async def delete_list(list_id: int, session: AsyncSession = Depends(get_session)):
     lst = await session.get(AdBlockList, list_id)
