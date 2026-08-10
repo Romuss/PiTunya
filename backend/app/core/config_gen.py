@@ -690,6 +690,16 @@ def _build_dns_section(
             ip = m.group(1)
             dns_hosts[ip] = ip  # identity mapping — skip resolution
 
+    # v2.0.1 — AdBlock: add blocked domains to DNS hosts map.
+    # xray DNS returns 0.0.0.0 for these — browser doesn't connect,
+    # traffic never reaches the proxy.
+    try:
+        from app.core.adblock import get_blocked_domains_for_config
+        adblock_hosts = get_blocked_domains_for_config()
+        dns_hosts.update(adblock_hosts)
+    except Exception:
+        pass  # AdBlock not initialized — skip silently
+
     # Pin every DNS server entry to a fixed outbound (since v1.3.5).
     #
     # xray-core treats DNS-upstream connections as regular outbound dials

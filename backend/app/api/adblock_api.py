@@ -1,4 +1,5 @@
 """AdBlock API — DNS-level ad/tracker blocking management."""
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,7 +10,25 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.database import get_session
 from app.models import AdBlockRule, AdBlockList
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/adblock", tags=["adblock"])
+
+
+async def _reload_xray_after_adblock_change() -> None:
+    """Regenerate xray config + reload so DNS hosts map picks up the
+    new blocked domains. Best-effort — if xray isn't running, silently skip."""
+    try:
+        from app.core.xray import xray_manager
+        from app.api.system import _regenerate_and_write
+        from app.database import get_async_engine
+        from sqlmodel.ext.asyncio.session import AsyncSession
+        async with AsyncSession(get_async_engine()) as session:
+            await _regenerate_and_write(session)
+        if xray_manager.is_running:
+            await xray_manager.reload()
+            logger.info("AdBlock: xray config regenerated + reloaded")
+    except Exception as exc:
+        logger.warning("AdBlock: xray reload after change failed: %s", exc)
 
 
 class RuleCreate(BaseModel):
@@ -59,9 +78,10 @@ async def create_rule(data: RuleCreate, session: AsyncSession = Depends(get_sess
     session.add(r)
     await session.commit()
     await session.refresh(r)
-    # Recompile in-memory block set
+    # Recompile in-memory block set + reload xray DNS
     from app.core.adblock import compile_rules
     await compile_rules()
+    await _reload_xray_after_adblock_change()
     return r
 
 
@@ -74,6 +94,7 @@ async def delete_rule(rule_id: int, session: AsyncSession = Depends(get_session)
     await session.commit()
     from app.core.adblock import compile_rules
     await compile_rules()
+    await _reload_xray_after_adblock_change()
 
 
 # ── Lists ────────────────────────────────────────────────────────────────────
@@ -104,6 +125,7 @@ async def delete_list(list_id: int, session: AsyncSession = Depends(get_session)
     await session.commit()
     from app.core.adblock import compile_rules
     await compile_rules()
+    await _reload_xray_after_adblock_change()
 
 
 @router.post("/lists/{list_id}/refresh")
@@ -115,6 +137,7 @@ async def refresh_list(list_id: int):
     """
     from app.core.adblock import download_list
     count = await download_list(list_id)
+    await _reload_xray_after_adblock_change()
     return {"downloaded": count}
 
 
