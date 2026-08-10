@@ -57,6 +57,8 @@ const NAV = [
   { to: '/chains',       icon: GitBranch,       label: 'Chains'        },
   { to: '/dns',          icon: Network,         label: 'DNS'           },
   { to: '/geodata',      icon: Globe,           label: 'GeoData'       },
+  { to: '/adblock',      icon: Shield,          label: 'AdBlock'       },
+  { to: '/connections',  icon: Activity,        label: 'Connections'   },
   { to: '/devices',      icon: Monitor,         label: 'Devices'       },
   { to: '/logs',         icon: ScrollText,      label: 'Logs'          },
   { to: '/diagnostics',  icon: Activity,        label: 'Diagnostics'   },
@@ -65,7 +67,7 @@ const NAV = [
 ]
 
 // Routes after which a thin separator line groups the nav visually.
-const DIVIDE_AFTER = new Set(['/routing', '/subscriptions', '/chains', '/devices', '/settings'])
+const DIVIDE_AFTER = new Set(['/routing', '/subscriptions', '/chains', '/adblock', '/devices', '/settings'])
 
 export function Layout() {
   const {

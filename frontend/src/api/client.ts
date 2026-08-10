@@ -1400,3 +1400,46 @@ export function createLogSocket(onLine: (line: string) => void): WebSocket {
   }
   return ws
 }
+
+// ── v2.0 APIs ────────────────────────────────────────────────────────────────
+
+export const adblockApi = {
+  listRules: (source?: string) => http.get('/adblock/rules', { params: source ? { source } : {} }).then(r => r.data),
+  createRule: (data: { domain_pattern: string; rule_type?: string }) => http.post('/adblock/rules', data).then(r => r.data),
+  deleteRule: (id: number) => http.delete(`/adblock/rules/${id}`),
+  listLists: () => http.get('/adblock/lists').then(r => r.data),
+  createList: (data: { name: string; url: string; format?: string; enabled?: boolean }) => http.post('/adblock/lists', data).then(r => r.data),
+  deleteList: (id: number) => http.delete(`/adblock/lists/${id}`),
+  refreshList: (id: number) => http.post(`/adblock/lists/${id}/refresh`).then(r => r.data),
+  stats: () => http.get('/adblock/stats').then(r => r.data),
+}
+
+export const slaApi = {
+  summary: () => http.get('/sla/summary').then(r => r.data),
+  node: (nodeId: number, days?: number) => http.get(`/sla/nodes/${nodeId}`, { params: days ? { days } : {} }).then(r => r.data),
+}
+
+export const trafficApi = {
+  summary: (hours?: number) => http.get('/traffic/summary', { params: hours ? { hours } : {} }).then(r => r.data),
+  device: (deviceId: number, hours?: number) => http.get(`/traffic/device/${deviceId}`, { params: hours ? { hours } : {} }).then(r => r.data),
+  aggregate: (hours?: number) => http.get('/traffic/aggregate', { params: hours ? { hours } : {} }).then(r => r.data),
+}
+
+export const quotaApi = {
+  list: () => http.get('/quotas').then(r => r.data),
+  create: (data: any) => http.post('/quotas', data).then(r => r.data),
+  update: (id: number, data: any) => http.patch(`/quotas/${id}`, data).then(r => r.data),
+  delete: (id: number) => http.delete(`/quotas/${id}`),
+  usage: () => http.get('/quotas/usage').then(r => r.data),
+}
+
+export const suggestionsApi = {
+  list: (status?: string) => http.get('/suggestions', { params: status ? { status } : {} }).then(r => r.data),
+  accept: (id: number) => http.post(`/suggestions/${id}/accept`).then(r => r.data),
+  dismiss: (id: number) => http.post(`/suggestions/${id}/dismiss`).then(r => r.data),
+}
+
+export const connectionsApi = {
+  snapshot: () => http.get('/connections/snapshot').then(r => r.data),
+  summary: () => http.get('/connections/summary').then(r => r.data),
+}
