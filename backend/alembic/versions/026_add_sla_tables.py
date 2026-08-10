@@ -35,7 +35,7 @@ def upgrade() -> None:
         "nodesladaily",
         sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
         sa.Column("node_id", sa.Integer(), nullable=False),
-        sa.Column("date", sa.Date(), nullable=False),
+        sa.Column("sla_date", sa.Date(), nullable=False),
         sa.Column("uptime_percentage", sa.Float(), nullable=False, server_default="0"),
         sa.Column("total_checks", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("failed_checks", sa.Integer(), nullable=False, server_default="0"),
@@ -46,11 +46,11 @@ def upgrade() -> None:
         sa.Column("total_downtime_seconds", sa.Integer(), nullable=False, server_default="0"),
     )
     op.create_index("ix_nodesladaily_node_id", "nodesladaily", ["node_id"])
-    op.create_index("ix_nodesladaily_date", "nodesladaily", ["date"])
+    op.create_index("ix_nodesladaily_sla_date", "nodesladaily", ["sla_date"])
 
 
 def downgrade() -> None:
-    op.drop_index("ix_nodesladaily_date", table_name="nodesladaily")
+    op.drop_index("ix_nodesladaily_sla_date", table_name="nodesladaily")
     op.drop_index("ix_nodesladaily_node_id", table_name="nodesladaily")
     op.drop_table("nodesladaily")
     op.drop_index("ix_nodeslarecord_ts", table_name="nodeslarecord")

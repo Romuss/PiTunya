@@ -16,7 +16,7 @@ router = APIRouter(prefix="/sla", tags=["sla"])
 class SLADailyRead(BaseModel):
     node_id: int
     node_name: str
-    date: date
+    date: "date"
     uptime_percentage: float
     total_checks: int
     failed_checks: int
@@ -47,7 +47,7 @@ async def sla_summary(session: AsyncSession = Depends(get_session)):
     name_by_id = {n.id: n.name for n in nodes}
 
     records = (await session.exec(
-        select(NodeSLADaily).where(NodeSLADaily.date >= d30)
+        select(NodeSLADaily).where(NodeSLADaily.sla_date >= d30)
     )).all()
 
     # Group by node_id
@@ -58,7 +58,7 @@ async def sla_summary(session: AsyncSession = Depends(get_session)):
     result = []
     for node in nodes:
         recs = by_node.get(node.id, [])
-        r7 = [r for r in recs if r.date >= d7]
+        r7 = [r for r in recs if r.sla_date >= d7]
         r30 = recs  # all are >= d30
 
         def _uptime(items: list[NodeSLADaily]) -> float:
@@ -70,7 +70,7 @@ async def sla_summary(session: AsyncSession = Depends(get_session)):
             lats = [i.avg_latency_ms for i in items if i.avg_latency_ms is not None]
             return sum(lats) / len(lats) if lats else None
 
-        last = max((r.date for r in recs), default=None)
+        last = max((r.sla_date for r in recs), default=None)
 
         result.append(SLASummary(
             node_id=node.id,
@@ -93,8 +93,8 @@ async def node_sla(
     cutoff = date.today() - timedelta(days=days)
     records = (await session.exec(
         select(NodeSLADaily)
-        .where(NodeSLADaily.node_id == node_id, NodeSLADaily.date >= cutoff)
-        .order_by(NodeSLADaily.date.asc())
+        .where(NodeSLADaily.node_id == node_id, NodeSLADaily.sla_date >= cutoff)
+        .order_by(NodeSLADaily.sla_date.asc())
     )).all()
 
     node = await session.get(Node, node_id)
@@ -104,7 +104,7 @@ async def node_sla(
         SLADailyRead(
             node_id=r.node_id,
             node_name=node_name,
-            date=r.date,
+            date=r.sla_date,
             uptime_percentage=r.uptime_percentage,
             total_checks=r.total_checks,
             failed_checks=r.failed_checks,

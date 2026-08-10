@@ -113,7 +113,7 @@ class SLAAggregator:
                 existing = (await session.exec(
                     select(NodeSLADaily).where(
                         NodeSLADaily.node_id == node_id,
-                        NodeSLADaily.date == day,
+                        NodeSLADaily.sla_date == day,
                     )
                 )).first()
                 if existing:
@@ -129,7 +129,7 @@ class SLAAggregator:
                 else:
                     session.add(NodeSLADaily(
                         node_id=node_id,
-                        date=day,
+                        sla_date=day,
                         uptime_percentage=uptime_pct,
                         total_checks=total,
                         failed_checks=failed,

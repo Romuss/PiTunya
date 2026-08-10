@@ -641,7 +641,9 @@ class NodeSLADaily(SQLModel, table=True):
     """
     id: Optional[int] = Field(default=None, primary_key=True)
     node_id: int = Field(index=True)
-    date: date = Field(index=True)  # calendar date (UTC)
+    # Use a forward-reference string annotation to avoid the field name
+    # `date` shadowing the `date` type imported from datetime.
+    sla_date: "date" = Field(default=None, index=True)  # type: ignore  # calendar date (UTC)
     uptime_percentage: float = 0.0   # 0.0 - 100.0
     total_checks: int = 0
     failed_checks: int = 0
