@@ -54,11 +54,11 @@ class ListCreate(BaseModel):
 
 class ListRead(ListCreate):
     id: int
-    last_updated: Optional[str] = None
+    last_updated: Optional[datetime] = None
     entry_count: int = 0
     class Config:
         from_attributes = True
-        json_encoders = {datetime: lambda v: v.isoformat() if v else None}
+        
 
 
 # ── Rules ────────────────────────────────────────────────────────────────────
