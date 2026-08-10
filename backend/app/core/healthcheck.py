@@ -121,6 +121,16 @@ class HealthChecker:
                 db_node.last_check = datetime.now(tz=timezone.utc)
                 db_node.is_online = result["is_online"]
                 session.add(db_node)
+                # Write SLA record (v2.0) — one row per active-node check
+                try:
+                    from app.models import NodeSLARecord
+                    session.add(NodeSLARecord(
+                        node_id=node_id,
+                        is_online=result["is_online"],
+                        latency_ms=result.get("latency_ms"),
+                    ))
+                except Exception:
+                    pass  # SLA table may not exist on pre-v2.0 DBs
                 await session.commit()
 
             if result["is_online"]:
@@ -599,6 +609,16 @@ class HealthChecker:
                     db_node.latency_ms = result["latency_ms"]
                     db_node.last_check = datetime.now(tz=timezone.utc)
                     session.add(db_node)
+                    # Write SLA record (v2.0)
+                    try:
+                        from app.models import NodeSLARecord
+                        session.add(NodeSLARecord(
+                            node_id=nd["id"],
+                            is_online=result["is_online"],
+                            latency_ms=result.get("latency_ms"),
+                        ))
+                    except Exception:
+                        pass
 
                 output.append({
                     "node_id": nd["id"],

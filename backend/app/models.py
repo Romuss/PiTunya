@@ -1,7 +1,7 @@
 from sqlmodel import SQLModel, Field
 from sqlalchemy import UniqueConstraint
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 
 class DNSQueryLog(SQLModel, table=True):
@@ -530,6 +530,39 @@ class SystemMetric(SQLModel, table=True):
     disk_total_gb: float = 0.0
     net_sent_bytes: int = 0
     net_recv_bytes: int = 0
+
+
+class NodeSLARecord(SQLModel, table=True):
+    """Per-checkpoint SLA record — one row per healthcheck tick.
+
+    Provides raw data for the SLA dashboard (uptime %, latency trends,
+    downtime events). Pruned to 30 days by `sla_aggregator` — older
+    data lives in the `NodeSLADaily` aggregate table.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    node_id: int = Field(index=True)
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
+    is_online: bool
+    latency_ms: Optional[int] = None
+
+
+class NodeSLADaily(SQLModel, table=True):
+    """Daily aggregate of node SLA — uptime %, latency stats, downtime.
+
+    Computed by `sla_aggregator` scheduler at midnight. Retained for
+    1 year. Drives the SLA dashboard widget.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    node_id: int = Field(index=True)
+    date: date = Field(index=True)  # calendar date (UTC)
+    uptime_percentage: float = 0.0   # 0.0 - 100.0
+    total_checks: int = 0
+    failed_checks: int = 0
+    avg_latency_ms: Optional[float] = None
+    max_latency_ms: Optional[int] = None
+    min_latency_ms: Optional[int] = None
+    downtime_events: int = 0         # transitions online → offline
+    total_downtime_seconds: int = 0
 
 
 class User(SQLModel, table=True):

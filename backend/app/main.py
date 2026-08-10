@@ -137,6 +137,13 @@ async def lifespan(app: FastAPI):
     from app.core.speed_scheduler import speed_test_scheduler
     speed_test_scheduler.start()
     _sup.register("speed_test", speed_test_scheduler.start, speed_test_scheduler.stop)
+    # v2.0 — SLA aggregator: daily uptime aggregates + prune old records
+    try:
+        from app.core.sla_aggregator import sla_aggregator
+        sla_aggregator.start()
+        _sup.register("sla", sla_aggregator.start, sla_aggregator.stop)
+    except Exception as exc:
+        logger.warning("SLA aggregator failed to start: %s", exc)
     # v1.6.0 — background autocheck scheduler (upstream merge): periodic
     # speed-test sweep scoped to all / subscription / group / specific nodes.
     try:
@@ -353,6 +360,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
+        from app.core.sla_aggregator import sla_aggregator
+        sla_aggregator.stop()
+    except Exception:
+        pass
+    try:
         from app.core.naive_supervisor import naive_supervisor
         naive_supervisor.stop()
     except Exception:
@@ -450,7 +462,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck
+from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck, sla
 from app.core.auth import get_current_user
 
 app.include_router(auth.router, prefix="/api")
@@ -490,6 +502,8 @@ app.include_router(config_io.router, prefix="/api", dependencies=_auth)
 # v1.6.0 — UA Templates + Autocheck (upstream merge)
 app.include_router(user_agents.router, prefix="/api", dependencies=_auth)
 app.include_router(autocheck.router, prefix="/api", dependencies=_auth)
+# v2.0 — SLA (uptime dashboard)
+app.include_router(sla.router, prefix="/api", dependencies=_auth)
 
 
 # ── Prometheus metrics (no auth — for scraping) ──────────────────────────────
