@@ -5,6 +5,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { adblockApi } from '@/api/client'
 import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
+import { Power } from 'lucide-react'
 
 export function AdBlock() {
   const qc = useQueryClient()
@@ -55,10 +56,30 @@ export function AdBlock() {
     <div className="p-4 sm:p-6 space-y-5">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-2">
-          <Shield className="h-5 w-5 text-brand-500" />
+          <Shield className={clsx('h-5 w-5', stats?.adblock_enabled === false ? 'text-gray-500' : 'text-brand-500')} />
           <h1 className="text-xl font-bold text-gray-100">Ad Blocking</h1>
+          {stats?.adblock_enabled === false && (
+            <span className="rounded-full bg-red-900/60 px-2 py-0.5 text-xs font-medium text-red-300">DISABLED</span>
+          )}
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={async () => {
+              const newState = !(stats?.adblock_enabled !== false)
+              await fetch(`/api/adblock/kill-switch?enable=${newState}`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('pitun_token')}` } })
+              qc.invalidateQueries({ queryKey: ['adblock-stats'] })
+            }}
+            className={clsx(
+              'flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm transition-colors',
+              stats?.adblock_enabled !== false
+                ? 'bg-gray-700 text-gray-200 hover:bg-gray-600'
+                : 'bg-green-700 text-white hover:bg-green-600'
+            )}
+            title={stats?.adblock_enabled !== false ? 'Emergency disable' : 'Re-enable'}
+          >
+            <Power className="h-4 w-4" />
+            {stats?.adblock_enabled !== false ? 'Disable' : 'Enable'}
+          </button>
           <button onClick={() => setShowAddRule(true)} className="flex items-center gap-1.5 rounded-lg bg-gray-700 px-3 py-2 text-sm text-gray-200 hover:bg-gray-600 transition-colors">
             <Plus className="h-4 w-4" /> Add Rule
           </button>
