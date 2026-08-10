@@ -476,6 +476,21 @@ class NodeCircle(SQLModel, table=True):
     max_latency_ms: int = 0
 
 
+class DeviceTraffic(SQLModel, table=True):
+    """Per-device bandwidth usage — 5-minute aggregates.
+
+    Polled from xray stats API (per-inbound) and nftables counters.
+    Pruned to 7 days of 5min buckets; hourly/daily aggregates can be
+    computed on-the-fly from these rows.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    device_id: Optional[int] = Field(default=None, index=True)
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    period: str = "5min"
+
+
 class AutoCheckConfig(SQLModel, table=True):
     """Singleton config (row id=1) for the background auto-speedtest sweep.
 

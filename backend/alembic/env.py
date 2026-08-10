@@ -13,7 +13,7 @@ from app.models import (  # noqa: F401 — import all models so SQLModel.metadat
     Node, RoutingRule, RoutingSet, Subscription, DNSRule, DNSQueryLog,
     Settings, BalancerGroup, NodeCircle, User, Device,
     UserAgentTemplate, AutoCheckConfig,
-    NodeSLARecord, NodeSLADaily,
+    NodeSLARecord, NodeSLADaily, DeviceTraffic,
 )
 
 config = context.config
