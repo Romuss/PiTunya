@@ -90,6 +90,20 @@ async def process_log_line(line: str) -> None:
     entry = parse_dns_line(line)
     if entry is None:
         return
+
+    # v2.0.3 — AdBlock: check if domain is blocked and record stats.
+    # This runs on EVERY DNS log line, so the AdBlock stats reflect
+    # real-time blocking activity (per-query, not just config-gen time).
+    try:
+        from app.core.adblock import check_domain
+        if check_domain(entry.domain):
+            # Domain is in the AdBlock list — but xray already returns
+            # 0.0.0.0 for it (from DNS hosts map). The query itself
+            # was blocked by xray, so we count it here.
+            pass  # check_domain already incremented _block_stats
+    except Exception:
+        pass  # AdBlock not initialized — skip
+
     try:
         async with AsyncSession(get_async_engine()) as session:
             session.add(entry)
