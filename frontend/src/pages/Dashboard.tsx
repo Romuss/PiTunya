@@ -15,7 +15,8 @@ import { StatusBadge, ModeBadge } from '@/components/StatusBadge'
 import { InfoTip } from '@/components/InfoTip'
 import { MetricsCharts } from '@/components/MetricsCharts'
 import { RecentEvents } from '@/components/RecentEvents'
-import { systemApi, circleApi } from '@/api/client'
+import { systemApi, circleApi, slaApi, trafficApi, suggestionsApi } from '@/api/client'
+import { V2Widgets } from '@/components/V2Widgets'
 import { useT } from '@/hooks/useT'
 import type { ProxyMode, SystemSettings, NodeCircle as NodeCircleType } from '@/types'
 
@@ -835,6 +836,9 @@ export function Dashboard() {
 
       {/* System metrics charts */}
       <MetricsCharts />
+
+      {/* v2.0 widgets: SLA summary + Traffic summary + Rule suggestions */}
+      <V2Widgets />
 
       {/* Recent Events feed — failover, sidecar, geo, circle rotations */}
       <RecentEvents limit={8} />
