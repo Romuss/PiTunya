@@ -159,6 +159,18 @@ async def lifespan(app: FastAPI):
         _sup.register("autocheck", autocheck_scheduler.start, autocheck_scheduler.stop)
     except Exception as exc:
         logger.warning("AutoCheck scheduler failed to start: %s", exc)
+    try:
+        from app.core.quota_checker import quota_checker
+        quota_checker.start()
+        _sup.register("quota", quota_checker.start, quota_checker.stop)
+    except Exception as exc:
+        logger.warning("Quota checker failed to start: %s", exc)
+    try:
+        from app.core.rule_suggester import rule_suggester
+        rule_suggester.start()
+        _sup.register("rule_suggestions", rule_suggester.start, rule_suggester.stop)
+    except Exception as exc:
+        logger.warning("Rule suggester failed to start: %s", exc)
     _sup.register("health",       health_checker.start,        health_checker.stop)
     _sup.register("subs",         subscription_scheduler.start, subscription_scheduler.stop)
     _sup.register("circle",       circle_scheduler.start,       circle_scheduler.stop)
@@ -377,6 +389,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
+        from app.core.quota_checker import quota_checker
+        quota_checker.stop()
+    except Exception:
+        pass
+    try:
+        from app.core.rule_suggester import rule_suggester
+        rule_suggester.stop()
+    except Exception:
+        pass
+    try:
         from app.core.naive_supervisor import naive_supervisor
         naive_supervisor.stop()
     except Exception:
@@ -474,7 +496,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck, sla, traffic_api
+from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck, sla, traffic_api, quota_api, suggestions, connections
 from app.core.auth import get_current_user
 
 app.include_router(auth.router, prefix="/api")
@@ -518,6 +540,12 @@ app.include_router(autocheck.router, prefix="/api", dependencies=_auth)
 app.include_router(sla.router, prefix="/api", dependencies=_auth)
 # v2.0 — Traffic (bandwidth per device)
 app.include_router(traffic_api.router, prefix="/api", dependencies=_auth)
+# v2.0 — Quotas (traffic caps)
+app.include_router(quota_api.router, prefix="/api", dependencies=_auth)
+# v2.0 — Rule suggestions (DNS-log analysis)
+app.include_router(suggestions.router, prefix="/api", dependencies=_auth)
+# v2.0 — Connection tracker (live conntrack view)
+app.include_router(connections.router, prefix="/api", dependencies=_auth)
 
 
 # ── Prometheus metrics (no auth — for scraping) ──────────────────────────────

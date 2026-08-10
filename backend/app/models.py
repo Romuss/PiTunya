@@ -491,6 +491,53 @@ class DeviceTraffic(SQLModel, table=True):
     period: str = "5min"
 
 
+class SuggestedRule(SQLModel, table=True):
+    """DNS-log-derived routing suggestion (v2.0).
+
+    Created by rule_suggester scheduler from DNSQueryLog frequency analysis.
+    Status lifecycle: pending → accepted (rule created) | dismissed.
+    Auto-expired after 7 days if not acted on.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    domain: str = Field(index=True)
+    query_count: int = 0
+    last_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    current_node_id: Optional[int] = None
+    suggested_node_id: Optional[int] = None
+    suggestion_type: str = "latency"  # "latency" | "geoip" | "load_balance"
+    reason: str = ""
+    status: str = "pending"  # "pending" | "accepted" | "dismissed"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class TrafficQuota(SQLModel, table=True):
+    """Monthly traffic cap per device / routing_set / global.
+
+    When current month's usage exceeds monthly_limit_gb, the configured
+    action fires: "block" (nftables drop), "fallback" (switch node),
+    or "throttle" (nftables rate-limit).
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scope_type: str = "device"    # "device" | "routing_set" | "global"
+    scope_id: Optional[int] = None
+    monthly_limit_gb: float = 0   # 0 = unlimited
+    action: str = "block"         # "block" | "fallback" | "throttle"
+    fallback_node_id: Optional[int] = None
+    reset_day: int = 1            # day of month to reset counter
+    enabled: bool = True
+
+
+class TrafficUsage(SQLModel, table=True):
+    """Monthly traffic aggregate per scope (for quota enforcement)."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scope_type: str
+    scope_id: Optional[int] = None
+    year: int
+    month: int          # 1-12
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+
+
 class AutoCheckConfig(SQLModel, table=True):
     """Singleton config (row id=1) for the background auto-speedtest sweep.
 
