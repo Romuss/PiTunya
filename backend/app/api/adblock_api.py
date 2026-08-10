@@ -163,6 +163,7 @@ async def refresh_list(list_id: int):
 @router.get("/stats")
 async def adblock_stats(session: AsyncSession = Depends(get_session)):
     """Summary: total rules, blocklists, top sources + blocking stats."""
+    from app.core.adblock import is_enabled
     total_rules = (await session.exec(
         select(func.count()).select_from(AdBlockRule)
     )).one()
@@ -181,6 +182,7 @@ async def adblock_stats(session: AsyncSession = Depends(get_session)):
         "blocklists": len(lists),
         "active_lists": sum(1 for l in lists if l.enabled),
         "total_entries": sum(l.entry_count for l in lists),
+        "adblock_enabled": is_enabled(),
         # Blocking stats (v2.0.2)
         "total_blocked": block_stats["total_blocked"],
         "unique_domains_blocked": block_stats["unique_domains_blocked"],
@@ -194,3 +196,16 @@ async def reset_blocking_stats():
     from app.core.adblock import reset_block_stats
     reset_block_stats()
     return {"status": "ok"}
+
+
+@router.post("/kill-switch")
+async def adblock_kill_switch(enable: bool = True):
+    """Emergency on/off switch for AdBlock.
+
+    When disabled: no DNS hosts map, no check_domain matches.
+    xray config regenerated immediately.
+    """
+    from app.core.adblock import set_enabled
+    set_enabled(enable)
+    await _reload_xray_after_adblock_change()
+    return {"adblock_enabled": enable}

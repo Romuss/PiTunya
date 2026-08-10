@@ -32,6 +32,12 @@ _allowed_domains: Set[str] = set()
 _last_compile: Optional[datetime] = None
 _compile_lock = asyncio.Lock()
 
+# Master switch — when False, AdBlock is completely disabled (no DNS
+# hosts map, no check_domain matches). Set via set_enabled(False) by
+# the API or a kill-switch toggle. Prevents xray from loading 254k
+# domains into DNS hosts when resources are tight.
+_adblock_enabled: bool = True
+
 # Blocking stats (v2.0.2) — in-memory counters, reset on restart
 _block_stats: dict[str, int] = {}  # domain → block count
 _total_blocked: int = 0
@@ -91,6 +97,20 @@ async def compile_rules() -> None:
         )
 
 
+def is_enabled() -> bool:
+    """Check if AdBlock master switch is on."""
+    return _adblock_enabled
+
+
+def set_enabled(enabled: bool) -> None:
+    """Master kill-switch — when False, AdBlock is completely disabled.
+    No DNS hosts map, no check_domain matches.
+    """
+    global _adblock_enabled
+    _adblock_enabled = enabled
+    logger.info("AdBlock: %s", "enabled" if enabled else "DISABLED (kill-switch)")
+
+
 def check_domain(domain: str) -> bool:
     """Check if a domain should be blocked.
 
@@ -98,7 +118,7 @@ def check_domain(domain: str) -> bool:
     Domain matching: exact match + wildcard (*.example.com matches sub.example.com).
     Records block stats (v2.0.2) — increments per-domain counter.
     """
-    if not domain:
+    if not domain or not _adblock_enabled:
         return False
 
     domain = domain.lower().rstrip(".")
@@ -154,9 +174,11 @@ def reset_block_stats() -> None:
 def get_blocked_domains_for_config() -> dict[str, str]:
     """Return a {domain: "0.0.0.0"} map for xray DNS hosts config.
 
-    Called by config_gen when building the DNS section. Returns only
-    the domains that should resolve to 0.0.0.0 (blocked).
+    Returns empty dict when AdBlock is disabled (kill-switch).
+    Called by config_gen when building the DNS section.
     """
+    if not _adblock_enabled:
+        return {}
     return {d: "0.0.0.0" for d in _blocked_domains if not d.startswith("*")}
 
 
