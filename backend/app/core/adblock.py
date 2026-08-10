@@ -131,50 +131,55 @@ async def download_list(list_id: int) -> int:
     """
     import httpx
 
+    # 1. Fetch list metadata (capture attributes before session closes)
     async with AsyncSession(get_async_engine()) as session:
         lst = await session.get(AdBlockList, list_id)
         if not lst:
             return 0
+        list_name = lst.name
+        list_url = lst.url
+        list_format = lst.format
+        list_enabled = lst.enabled
 
-        try:
-            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                resp = await client.get(lst.url)
-                resp.raise_for_status()
-                text = resp.text
-        except Exception as exc:
-            logger.error("AdBlock: failed to download %s: %s", lst.name, exc)
-            return 0
+    # 2. Download the list (no DB session)
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            resp = await client.get(list_url)
+            resp.raise_for_status()
+            text = resp.text
+    except Exception as exc:
+        logger.error("AdBlock: failed to download %s: %s", list_name, exc)
+        return 0
 
-        # Parse based on format
-        domains: list[str] = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            if lst.format == "hosts":
-                parts = line.split()
-                if len(parts) >= 2:
-                    domain = parts[-1].lower()
-                    if domain and domain not in ("localhost",):
-                        domains.append(domain)
-            elif lst.format == "domain":
-                domain = line.lstrip("|").rstrip("^").lower()
-                if domain and "." in domain:
+    # 3. Parse
+    domains: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if list_format == "hosts":
+            parts = line.split()
+            if len(parts) >= 2:
+                domain = parts[-1].lower()
+                if domain and domain not in ("localhost",):
                     domains.append(domain)
+        elif list_format == "domain":
+            domain = line.lstrip("|").rstrip("^").lower()
+            if domain and "." in domain:
+                domains.append(domain)
 
-        # Deduplicate
-        domains = list(set(domains))
+    domains = list(set(domains))
+    added = len(domains)
 
-        # Remove old entries from this list
-        from sqlmodel import delete
+    # 4. Store in DB (separate session, batched commits)
+    from sqlmodel import delete as sqlmodel_delete
+    async with AsyncSession(get_async_engine()) as session:
         await session.exec(
-            delete(AdBlockRule).where(AdBlockRule.source == lst.name)
+            sqlmodel_delete(AdBlockRule).where(AdBlockRule.source == list_name)
         )
+        await session.commit()
 
-        # Bulk insert using SQLModel session (batch to avoid memory issues)
         now = datetime.now(tz=timezone.utc)
-        added = 0
         batch_size = 500
         for i in range(0, len(domains), batch_size):
             batch = domains[i:i + batch_size]
@@ -182,21 +187,22 @@ async def download_list(list_id: int) -> int:
                 session.add(AdBlockRule(
                     domain_pattern=domain,
                     rule_type="block",
-                    source=lst.name,
-                    enabled=lst.enabled,
+                    source=list_name,
+                    enabled=list_enabled,
                 ))
-            await session.commit()  # commit in batches
-            added += len(batch)
+            await session.commit()
 
-        lst.last_updated = now
-        lst.entry_count = added
-        session.add(lst)
-        await session.commit()
+        # Update list metadata (fresh fetch to avoid expired object)
+        lst_obj = await session.get(AdBlockList, list_id)
+        if lst_obj:
+            lst_obj.last_updated = now
+            lst_obj.entry_count = added
+            session.add(lst_obj)
+            await session.commit()
 
-        logger.info("AdBlock: downloaded %s, %d domains", lst.name, added)
+    logger.info("AdBlock: downloaded %s, %d domains", list_name, added)
 
-    # Recompile rules in a SEPARATE session (outside the download session)
-    # to avoid MissingGreenlet from nested async sessions
+    # 5. Recompile (separate session)
     await compile_rules()
     return added
 
