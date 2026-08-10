@@ -1,5 +1,6 @@
 """AdBlock API — DNS-level ad/tracker blocking management."""
 import logging
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -57,6 +58,7 @@ class ListRead(ListCreate):
     entry_count: int = 0
     class Config:
         from_attributes = True
+        json_encoders = {datetime: lambda v: v.isoformat() if v else None}
 
 
 # ── Rules ────────────────────────────────────────────────────────────────────
