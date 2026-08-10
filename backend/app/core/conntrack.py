@@ -22,21 +22,21 @@ _CONNTRACK_RE = re.compile(
 
 
 async def read_conntrack() -> list[dict]:
-    """Read /proc/net/nf_conntrack and parse into structured dicts.
+    """Read active connections. Tries /proc/net/nf_conntrack first,
+    falls back to `ss` command, then `conntrack -L`.
 
-    Returns a list of connection records. Each contains:
-      protocol, state, src_ip, dst_ip, bytes (if available)
+    Returns a list of connection records.
     """
+    # Try /proc/net/nf_conntrack first
+    raw = ""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "cat", "/proc/net/nf_conntrack",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-        raw = stdout.decode(errors="replace")
-    except (FileNotFoundError, asyncio.TimeoutError, OSError):
-        # Fallback: try conntrack command
+        with open("/proc/net/nf_conntrack", "r") as f:
+            raw = f.read()
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # Fallback: conntrack command
+    if not raw:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "conntrack", "-L",
@@ -46,8 +46,13 @@ async def read_conntrack() -> list[dict]:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
             raw = stdout.decode(errors="replace")
         except Exception:
-            return []
+            pass
 
+    # Fallback: ss command (shows TCP connections, no conntrack needed)
+    if not raw:
+        return await _read_ss()
+
+    # Parse conntrack format
     connections = []
     for line in raw.splitlines():
         m = _CONNTRACK_RE.match(line.strip())
@@ -59,6 +64,53 @@ async def read_conntrack() -> list[dict]:
             "src_ip": m.group("src"),
             "dst_ip": m.group("dst"),
             "bytes": int(m.group("bytes")) if m.group("bytes") else 0,
+        })
+    return connections
+
+
+async def _read_ss() -> list[dict]:
+    """Fallback: use `ss` to list TCP connections.
+
+    Works without nf_conntrack module — shows active TCP sockets.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ss", "-tunH",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        lines = stdout.decode(errors="replace").splitlines()
+    except Exception:
+        return []
+
+    connections = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        # ss output: tcp ESTAB 0 0 192.168.1.5:443 1.2.3.4:443
+        proto = "tcp" if parts[0].startswith("tcp") else "udp" if parts[0].startswith("udp") else parts[0]
+        state = parts[1] if len(parts) > 1 else "UNKNOWN"
+        src_full = parts[4] if len(parts) > 4 else ""
+        dst_full = parts[5] if len(parts) > 5 else (parts[3] if len(parts) > 3 else "")
+
+        src_ip = src_full.rsplit(":", 1)[0] if ":" in src_full else src_full
+        dst_ip = dst_full.rsplit(":", 1)[0] if ":" in dst_full else dst_full
+        dst_port = 0
+        if ":" in dst_full:
+            try:
+                dst_port = int(dst_full.rsplit(":", 1)[1])
+            except ValueError:
+                pass
+
+        connections.append({
+            "protocol": proto,
+            "state": state,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "dst_port": dst_port,
+            "bytes": 0,
         })
     return connections
 

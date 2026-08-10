@@ -32,6 +32,11 @@ _allowed_domains: Set[str] = set()
 _last_compile: Optional[datetime] = None
 _compile_lock = asyncio.Lock()
 
+# Blocking stats (v2.0.2) — in-memory counters, reset on restart
+_block_stats: dict[str, int] = {}  # domain → block count
+_total_blocked: int = 0
+_stats_lock = asyncio.Lock()
+
 # Default blocklists (seeded on first run)
 DEFAULT_LISTS = [
     {
@@ -91,6 +96,7 @@ def check_domain(domain: str) -> bool:
 
     Returns True if blocked, False if allowed.
     Domain matching: exact match + wildcard (*.example.com matches sub.example.com).
+    Records block stats (v2.0.2) — increments per-domain counter.
     """
     if not domain:
         return False
@@ -101,18 +107,48 @@ def check_domain(domain: str) -> bool:
     if domain in _allowed_domains:
         return False
 
+    blocked = False
+
     # Check exact block
     if domain in _blocked_domains:
-        return True
+        blocked = True
 
     # Check wildcard patterns (*.example.com)
-    parts = domain.split(".")
-    for i in range(1, len(parts)):
-        wildcard = "*." + ".".join(parts[i:])
-        if wildcard in _blocked_domains:
-            return True
+    if not blocked:
+        parts = domain.split(".")
+        for i in range(1, len(parts)):
+            wildcard = "*." + ".".join(parts[i:])
+            if wildcard in _blocked_domains:
+                blocked = True
+                break
 
-    return False
+    # Record stats (v2.0.2)
+    if blocked:
+        global _total_blocked
+        _total_blocked += 1
+        _block_stats[domain] = _block_stats.get(domain, 0) + 1
+
+    return blocked
+
+
+def get_block_stats() -> dict:
+    """Return blocking statistics (v2.0.2).
+
+    Returns: {"total_blocked": int, "top_blocked": [(domain, count), ...]}
+    """
+    top = sorted(_block_stats.items(), key=lambda x: x[1], reverse=True)[:20]
+    return {
+        "total_blocked": _total_blocked,
+        "unique_domains_blocked": len(_block_stats),
+        "top_blocked": [{"domain": d, "count": c} for d, c in top],
+    }
+
+
+def reset_block_stats() -> None:
+    """Reset blocking stats (v2.0.2)."""
+    global _total_blocked
+    _total_blocked = 0
+    _block_stats.clear()
 
 
 def get_blocked_domains_for_config() -> dict[str, str]:

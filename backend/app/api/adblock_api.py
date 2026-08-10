@@ -162,7 +162,7 @@ async def refresh_list(list_id: int):
 
 @router.get("/stats")
 async def adblock_stats(session: AsyncSession = Depends(get_session)):
-    """Summary: total rules, blocklists, top sources."""
+    """Summary: total rules, blocklists, top sources + blocking stats."""
     total_rules = (await session.exec(
         select(func.count()).select_from(AdBlockRule)
     )).one()
@@ -171,10 +171,26 @@ async def adblock_stats(session: AsyncSession = Depends(get_session)):
     )).one()
     lists = (await session.exec(select(AdBlockList))).all()
 
+    # v2.0.2 — blocking stats from in-memory counters
+    from app.core.adblock import get_block_stats
+    block_stats = get_block_stats()
+
     return {
         "total_rules": total_rules,
         "enabled_rules": enabled_rules,
         "blocklists": len(lists),
         "active_lists": sum(1 for l in lists if l.enabled),
         "total_entries": sum(l.entry_count for l in lists),
+        # Blocking stats (v2.0.2)
+        "total_blocked": block_stats["total_blocked"],
+        "unique_domains_blocked": block_stats["unique_domains_blocked"],
+        "top_blocked": block_stats["top_blocked"],
     }
+
+
+@router.post("/stats/reset")
+async def reset_blocking_stats():
+    """Reset blocking statistics counters."""
+    from app.core.adblock import reset_block_stats
+    reset_block_stats()
+    return {"status": "ok"}
