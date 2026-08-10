@@ -492,6 +492,20 @@ app.include_router(user_agents.router, prefix="/api", dependencies=_auth)
 app.include_router(autocheck.router, prefix="/api", dependencies=_auth)
 
 
+# ── Prometheus metrics (no auth — for scraping) ──────────────────────────────
+@app.get("/metrics", tags=["meta"], include_in_schema=False)
+async def prometheus_metrics():
+    """Prometheus text-format metrics endpoint.
+
+    No auth — Prometheus can't send Bearer tokens.
+    Protection: nftables gates port 8000 to LAN only (same as /health).
+    """
+    from fastapi.responses import PlainTextResponse
+    from app.core.prometheus import collect_metrics
+    text = await collect_metrics()
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health", tags=["meta"])
 async def health():
