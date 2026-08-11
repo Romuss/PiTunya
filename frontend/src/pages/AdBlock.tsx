@@ -3,27 +3,12 @@ import { Shield, Plus, Trash2, RefreshCw } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { adblockApi } from '@/api/client'
-import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
-import { Power } from 'lucide-react'
 
 export function AdBlock() {
   const qc = useQueryClient()
-  const confirm = useConfirm()
-  const [showAddRule, setShowAddRule] = useState(false)
   const [showAddList, setShowAddList] = useState(false)
   const [refreshingId, setRefreshingId] = useState<number | null>(null)
-
-  const { data: stats } = useQuery({
-    queryKey: ['adblock-stats'],
-    queryFn: () => adblockApi.stats(),
-    refetchInterval: 30_000,
-  })
-
-  const { data: rules = [] } = useQuery({
-    queryKey: ['adblock-rules'],
-    queryFn: () => adblockApi.listRules(),
-  })
 
   const { data: lists = [] } = useQuery({
     queryKey: ['adblock-lists'],
@@ -31,200 +16,91 @@ export function AdBlock() {
     refetchInterval: 60_000,
   })
 
-  const createRule = useMutation({
-    mutationFn: (data: { domain_pattern: string; rule_type?: string }) => adblockApi.createRule(data),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['adblock-rules'] }); qc.invalidateQueries({ queryKey: ['adblock-stats'] }); setShowAddRule(false) },
-  })
-
-  const deleteRule = useMutation({
-    mutationFn: (id: number) => adblockApi.deleteRule(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['adblock-rules'] }); qc.invalidateQueries({ queryKey: ['adblock-stats'] }) },
-  })
-
   const refreshList = useMutation({
     mutationFn: (id: number) => adblockApi.refreshList(id),
     onMutate: (id) => setRefreshingId(id),
-    onSettled: () => { setRefreshingId(null); qc.invalidateQueries({ queryKey: ['adblock-lists'] }); qc.invalidateQueries({ queryKey: ['adblock-stats'] }) },
+    onSettled: () => { setRefreshingId(null); qc.invalidateQueries({ queryKey: ['adblock-lists'] }) },
   })
 
   const deleteList = useMutation({
     mutationFn: (id: number) => adblockApi.deleteList(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['adblock-lists'] }); qc.invalidateQueries({ queryKey: ['adblock-stats'] }); qc.invalidateQueries({ queryKey: ['adblock-rules'] }) },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['adblock-lists'] }) },
   })
 
   return (
     <div className="p-4 sm:p-6 space-y-5">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-2">
-          <Shield className={clsx('h-5 w-5', stats?.adblock_enabled === false ? 'text-gray-500' : 'text-brand-500')} />
-          <h1 className="text-xl font-bold text-gray-100">Ad Blocking</h1>
-          {stats?.adblock_enabled === false && (
-            <span className="rounded-full bg-red-900/60 px-2 py-0.5 text-xs font-medium text-red-300">DISABLED</span>
-          )}
+          <Shield className="h-5 w-5 text-brand-500" />
+          <h1 className="text-xl font-bold text-gray-100">Ad Blocklists</h1>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={async () => {
-              const newState = !(stats?.adblock_enabled !== false)
-              await fetch(`/api/adblock/kill-switch?enable=${newState}`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('pitun_token')}` } })
-              qc.invalidateQueries({ queryKey: ['adblock-stats'] })
-            }}
-            className={clsx(
-              'flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm transition-colors',
-              stats?.adblock_enabled !== false
-                ? 'bg-gray-700 text-gray-200 hover:bg-gray-600'
-                : 'bg-green-700 text-white hover:bg-green-600'
-            )}
-            title={stats?.adblock_enabled !== false ? 'Emergency disable' : 'Re-enable'}
-          >
-            <Power className="h-4 w-4" />
-            {stats?.adblock_enabled !== false ? 'Disable' : 'Enable'}
-          </button>
-          <button onClick={() => setShowAddRule(true)} className="flex items-center gap-1.5 rounded-lg bg-gray-700 px-3 py-2 text-sm text-gray-200 hover:bg-gray-600 transition-colors">
-            <Plus className="h-4 w-4" /> Add Rule
-          </button>
-          <button onClick={() => setShowAddList(true)} className="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-2 text-sm font-medium text-white hover:bg-brand-500 transition-colors">
-            <Plus className="h-4 w-4" /> Add List
-          </button>
-        </div>
+        <button onClick={() => setShowAddList(true)} className="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-2 text-sm font-medium text-white hover:bg-brand-500 transition-colors">
+          <Plus className="h-4 w-4" /> Add List
+        </button>
       </div>
 
-      {/* Stats */}
-      {stats && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
-            <div className="text-2xl font-bold text-gray-100">{stats.total_rules?.toLocaleString() ?? 0}</div>
-            <div className="text-xs text-gray-500">Total Rules</div>
-          </div>
-          <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
-            <div className="text-2xl font-bold text-green-400">{stats.enabled_rules?.toLocaleString() ?? 0}</div>
-            <div className="text-xs text-gray-500">Enabled</div>
-          </div>
-          <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
-            <div className="text-2xl font-bold text-blue-400">{stats.blocklists ?? 0}</div>
-            <div className="text-xs text-gray-500">Blocklists</div>
-          </div>
-          <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
-            <div className="text-2xl font-bold text-brand-400">{stats.total_entries?.toLocaleString() ?? 0}</div>
-            <div className="text-xs text-gray-500">Total Entries</div>
-          </div>
-        </div>
-      )}
-
-      {/* Blocking stats (v2.0.2) */}
-      {stats?.total_blocked !== undefined && stats.total_blocked > 0 && (
-        <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-gray-200">Blocking Stats</h2>
-            <button
-              onClick={() => fetch('/api/adblock/stats/reset', { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('pitun_token')}` } }).then(() => qc.invalidateQueries({ queryKey: ['adblock-stats'] }))}
-              className="text-xs text-gray-500 hover:text-red-400 transition-colors"
-            >
-              Reset
-            </button>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">
-              <div className="text-xl font-bold text-red-400">{stats.total_blocked?.toLocaleString() ?? 0}</div>
-              <div className="text-xs text-gray-500">Total Blocked</div>
-            </div>
-            <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">
-              <div className="text-xl font-bold text-yellow-400">{stats.unique_domains_blocked?.toLocaleString() ?? 0}</div>
-              <div className="text-xs text-gray-500">Unique Domains</div>
-            </div>
-          </div>
-          {stats.top_blocked && stats.top_blocked.length > 0 && (
-            <div className="space-y-1">
-              <div className="text-xs text-gray-500 mb-1">Top Blocked Domains</div>
-              <div className="max-h-48 overflow-y-auto space-y-1">
-                {stats.top_blocked.map((item: any, i: number) => (
-                  <div key={i} className="flex items-center gap-2 text-xs">
-                    <span className="text-gray-600 font-mono w-6">{i + 1}.</span>
-                    <span className="flex-1 text-gray-300 font-mono truncate">{item.domain}</span>
-                    <span className="text-gray-500 font-mono">{item.count}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      <p className="text-sm text-gray-500">
+        Manage ad blocking lists. Enabled lists are automatically applied as routing rules in xray (domain → blackhole). Enable/disable lists with the toggle.
+      </p>
 
       {/* Blocklists */}
-      <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-4 space-y-3">
-        <h2 className="text-sm font-semibold text-gray-200">Blocklists</h2>
+      <div className="space-y-2">
         {lists.length === 0 ? (
-          <p className="text-sm text-gray-500">No blocklists. Add one to start blocking ads.</p>
-        ) : (
-          <div className="space-y-2">
-            {lists.map((lst: any) => (
-              <div key={lst.id} className="flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-900 p-3">
-                <div className={clsx('h-2 w-2 rounded-full', lst.enabled ? 'bg-green-400' : 'bg-gray-600')} />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm text-gray-200 font-medium">{lst.name}</div>
-                  <div className="text-xs text-gray-500 truncate">{lst.url}</div>
-                </div>
-                <div className="text-xs text-gray-500 font-mono">{lst.entry_count?.toLocaleString() ?? 0} domains</div>
-                <div className="text-xs text-gray-500">
-                  {lst.last_updated ? new Date(lst.last_updated.endsWith('Z') ? lst.last_updated : lst.last_updated + 'Z').toLocaleDateString() : 'Never'}
-                </div>
-                <button
-                  onClick={() => refreshList.mutate(lst.id)}
-                  disabled={refreshingId === lst.id}
-                  title="Refresh list"
-                  className="rounded p-1.5 text-gray-500 hover:text-brand-400 hover:bg-gray-800 transition-colors disabled:opacity-40"
-                >
-                  <RefreshCw className={clsx('h-4 w-4', refreshingId === lst.id && 'animate-spin')} />
-                </button>
-                <button
-                  onClick={async () => {
-                    const ok = await confirm({ title: `Delete "${lst.name}"?`, body: 'All rules from this list will be removed.', confirmLabel: 'Delete', danger: true })
-                    if (ok) deleteList.mutate(lst.id)
-                  }}
-                  className="rounded p-1.5 text-gray-500 hover:text-red-400 hover:bg-gray-800 transition-colors"
-                >
-                  <Trash2 className="h-4 w-4" />
-                </button>
-              </div>
-            ))}
+          <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-8 text-center">
+            <Shield className="h-10 w-10 text-gray-700 mx-auto mb-3" />
+            <p className="text-sm text-gray-500">No blocklists yet. Add one to start blocking ads.</p>
           </div>
+        ) : (
+          lists.map((lst: any) => (
+            <div key={lst.id} className="flex items-center gap-3 rounded-xl border border-gray-800 bg-gray-900 p-4">
+              <div className={clsx('flex items-center justify-center w-9 h-9 rounded-lg shrink-0', lst.enabled ? 'bg-emerald-900/40' : 'bg-gray-800')}>
+                <Shield className={clsx('h-4 w-4', lst.enabled ? 'text-emerald-400' : 'text-gray-500')} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-200 font-medium truncate">{lst.name}</span>
+                  <span className={clsx('rounded px-1.5 py-0.5 text-xs font-medium', lst.enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-gray-800 text-gray-400')}>
+                    {lst.enabled ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                <div className="text-xs text-gray-500 truncate">{lst.url}</div>
+                <div className="text-xs text-gray-600 mt-0.5">
+                  {lst.entry_count?.toLocaleString() ?? 0} domains
+                  {lst.last_updated && ' · ' + new Date(lst.last_updated.endsWith('Z') ? lst.last_updated : lst.last_updated + 'Z').toLocaleDateString('ru-RU')}
+                </div>
+              </div>
+              <button
+                onClick={async () => {
+                  await fetch(`/api/adblock/lists/${lst.id}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('pitun_token')}` },
+                    body: JSON.stringify({ enabled: !lst.enabled })
+                  })
+                  qc.invalidateQueries({ queryKey: ['adblock-lists'] })
+                }}
+                className="rounded-full px-3 py-1.5 text-xs font-medium transition-colors bg-gray-800 text-gray-300 hover:bg-gray-700"
+              >
+                {lst.enabled ? 'Disable' : 'Enable'}
+              </button>
+              <button
+                onClick={() => refreshList.mutate(lst.id)}
+                disabled={refreshingId === lst.id}
+                title="Download/refresh"
+                className="rounded-lg p-2 text-gray-500 hover:text-brand-400 hover:bg-gray-800 transition-colors disabled:opacity-40"
+              >
+                <RefreshCw className={clsx('h-4 w-4', refreshingId === lst.id && 'animate-spin')} />
+              </button>
+              <button
+                onClick={() => { if (confirm(`Delete "${lst.name}"?`)) deleteList.mutate(lst.id) }}
+                className="rounded-lg p-2 text-gray-500 hover:text-red-400 hover:bg-gray-800 transition-colors"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          ))
         )}
       </div>
 
-      {/* Manual Rules */}
-      <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-4 space-y-3">
-        <h2 className="text-sm font-semibold text-gray-200">Manual Rules</h2>
-        {rules.length === 0 ? (
-          <p className="text-sm text-gray-500">No manual rules. Add a domain to block or allow.</p>
-        ) : (
-          <div className="rounded-lg border border-gray-800 bg-gray-900 max-h-96 overflow-y-auto divide-y divide-gray-800/50">
-            {rules.slice(0, 200).map((r: any) => (
-              <div key={r.id} className="flex items-center gap-3 px-3 py-2 hover:bg-gray-800/50">
-                <span className={clsx('rounded px-1.5 py-0.5 text-xs font-mono font-medium', r.rule_type === 'block' ? 'bg-red-900/60 text-red-300' : 'bg-green-900/60 text-green-300')}>
-                  {r.rule_type}
-                </span>
-                <span className="flex-1 text-sm text-gray-200 font-mono truncate">{r.domain_pattern}</span>
-                <span className="text-xs text-gray-600">{r.source}</span>
-                <button
-                  onClick={() => deleteRule.mutate(r.id)}
-                  className="rounded p-1 text-gray-600 hover:text-red-400 transition-colors"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ))}
-            {rules.length > 200 && (
-              <div className="px-3 py-2 text-xs text-gray-500 text-center">Showing 200 of {rules.length} rules</div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Add Rule Modal */}
-      {showAddRule && (
-        <AddRuleModal onSave={(d) => createRule.mutate(d)} onCancel={() => setShowAddRule(false)} loading={createRule.isPending} />
-      )}
-      {/* Add List Modal */}
       {showAddList && (
         <AddListModal onSave={async (d) => { await adblockApi.createList(d); qc.invalidateQueries({ queryKey: ['adblock-lists'] }); setShowAddList(false) }} onCancel={() => setShowAddList(false)} />
       )}
@@ -232,70 +108,33 @@ export function AdBlock() {
   )
 }
 
-function AddRuleModal({ onSave, onCancel, loading }: { onSave: (data: { domain_pattern: string; rule_type?: string }) => void; onCancel: () => void; loading?: boolean }) {
-  const [domain, setDomain] = useState('')
-  const [ruleType, setRuleType] = useState('block')
-  return (
-    <ModalShell onClose={onCancel} labelledBy="adblock-rule-modal">
-      <div className="w-full max-w-md rounded-2xl bg-gray-950 border border-gray-800 p-6">
-        <h2 className="text-base font-semibold text-gray-100 mb-4">Add AdBlock Rule</h2>
-        <form onSubmit={(e) => { e.preventDefault(); onSave({ domain_pattern: domain, rule_type: ruleType }) }} className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-gray-400 mb-1">Domain</label>
-            <input value={domain} onChange={(e) => setDomain(e.target.value)} required autoFocus placeholder="ads.example.com"
-              className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none" />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-400 mb-1">Type</label>
-            <select value={ruleType} onChange={(e) => setRuleType(e.target.value)} className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100">
-              <option value="block">Block</option>
-              <option value="allow">Allow (whitelist)</option>
-            </select>
-          </div>
-          <div className="flex justify-end gap-3 pt-2 border-t border-gray-800">
-            <button type="button" onClick={onCancel} className="rounded-lg px-4 py-2 text-sm text-gray-400 hover:text-gray-100 hover:bg-gray-800 transition-colors">Cancel</button>
-            <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-50 transition-colors">{loading ? 'Saving…' : 'Add Rule'}</button>
-          </div>
-        </form>
-      </div>
-    </ModalShell>
-  )
-}
-
 function AddListModal({ onSave, onCancel }: { onSave: (data: { name: string; url: string; format?: string; enabled?: boolean }) => void; onCancel: () => void }) {
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [format, setFormat] = useState('hosts')
-  const [enabled, setEnabled] = useState(true)
   return (
     <ModalShell onClose={onCancel} labelledBy="adblock-list-modal">
       <div className="w-full max-w-md rounded-2xl bg-gray-950 border border-gray-800 p-6">
         <h2 className="text-base font-semibold text-gray-100 mb-4">Add Blocklist</h2>
-        <form onSubmit={(e) => { e.preventDefault(); onSave({ name, url, format, enabled }) }} className="space-y-4">
+        <form onSubmit={(e) => { e.preventDefault(); onSave({ name, url, format, enabled: true }) }} className="space-y-4">
           <div>
             <label className="block text-xs font-medium text-gray-400 mb-1">Name</label>
-            <input value={name} onChange={(e) => setName(e.target.value)} required autoFocus placeholder="My Blocklist"
-              className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none" />
+            <input value={name} onChange={(e) => setName(e.target.value)} required autoFocus placeholder="My List" className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none" />
           </div>
           <div>
             <label className="block text-xs font-medium text-gray-400 mb-1">URL</label>
-            <input value={url} onChange={(e) => setUrl(e.target.value)} required placeholder="https://example.com/hosts"
-              className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none" />
+            <input value={url} onChange={(e) => setUrl(e.target.value)} required placeholder="https://..." className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 focus:border-brand-500 focus:outline-none" />
           </div>
           <div>
             <label className="block text-xs font-medium text-gray-400 mb-1">Format</label>
             <select value={format} onChange={(e) => setFormat(e.target.value)} className="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100">
               <option value="hosts">Hosts file (0.0.0.0 domain)</option>
-              <option value="domain">Domain list</option>
+              <option value="domain">Domain list (one per line)</option>
             </select>
-          </div>
-          <div className="flex items-center gap-2">
-            <input type="checkbox" id="list-enabled" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="rounded border-gray-600 bg-gray-800 text-brand-500" />
-            <label htmlFor="list-enabled" className="text-sm text-gray-300">Enabled</label>
           </div>
           <div className="flex justify-end gap-3 pt-2 border-t border-gray-800">
             <button type="button" onClick={onCancel} className="rounded-lg px-4 py-2 text-sm text-gray-400 hover:text-gray-100 hover:bg-gray-800 transition-colors">Cancel</button>
-            <button type="submit" className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-500 transition-colors">Add List</button>
+            <button type="submit" className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-500 transition-colors">Add</button>
           </div>
         </form>
       </div>

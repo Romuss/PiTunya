@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
-import { Plus, Pencil, Trash2, ToggleLeft, ToggleRight, GripVertical, Upload, Zap, FileUp, FileDown, HelpCircle, AlertTriangle, Tag, Loader2 } from 'lucide-react'
+import { Plus, Pencil, Trash2, ToggleLeft, ToggleRight, GripVertical, Upload, Zap, FileUp, FileDown, HelpCircle, AlertTriangle, Tag, Loader2, Shield } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { isAxiosError } from 'axios'
+import { adblockApi } from '@/api/client'
 import { routingApi } from '@/api/client'
 import { useNodes } from '@/hooks/useNodes'
 import { RuleEditor } from '@/components/RuleEditor'
@@ -527,6 +529,8 @@ export function Routing() {
 
   return (
     <div className="p-4 sm:p-6 space-y-5">
+      {/* AdBlock status bar */}
+      <AdBlockStatusBar />
       {rulesIgnored && tab === 'rules' && (
         <div className="rounded-lg border border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-900/15 px-4 py-3 text-amber-800 dark:text-amber-200 text-sm flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
@@ -1525,6 +1529,78 @@ function AutoDisabledBanner() {
           </li>
         ))}
       </ul>
+    </div>
+  )
+}
+
+// ── AdBlock status bar (v2.1) ─────────────────────────────────────────────────
+
+function AdBlockStatusBar() {
+  const qc = useQueryClient()
+  const { data: stats } = useQuery({
+    queryKey: ['adblock-stats'],
+    queryFn: () => adblockApi.stats(),
+    refetchInterval: 30_000,
+  })
+
+  const enabled = stats?.adblock_enabled !== false
+  const domains = stats?.enabled_rules ?? 0
+  const lists = stats?.active_lists ?? 0
+
+  return (
+    <div className={clsx(
+      'rounded-xl border p-4 flex items-center gap-4 transition-colors',
+      enabled && domains > 0
+        ? 'border-emerald-700/40 bg-emerald-900/10'
+        : 'border-gray-800 bg-gray-900/50'
+    )}>
+      <div className={clsx(
+        'flex items-center justify-center w-10 h-10 rounded-lg shrink-0',
+        enabled ? 'bg-emerald-900/40' : 'bg-gray-800'
+      )}>
+        <Shield className={clsx('h-5 w-5', enabled ? 'text-emerald-400' : 'text-gray-500')} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-gray-200">Ad Blocking</span>
+          <span className={clsx(
+            'rounded-full px-2 py-0.5 text-xs font-medium',
+            enabled && domains > 0
+              ? 'bg-emerald-900/60 text-emerald-300'
+              : 'bg-gray-800 text-gray-400'
+          )}>
+            {enabled && domains > 0 ? 'Active' : 'Inactive'}
+          </span>
+        </div>
+        <p className="text-xs text-gray-500 mt-0.5">
+          {enabled && domains > 0
+            ? `${domains.toLocaleString()} domains blocked via routing rules · ${lists} active lists`
+            : 'No domains blocked. Add blocklists to start blocking ads.'}
+        </p>
+      </div>
+      <button
+        onClick={async () => {
+          await fetch(`/api/adblock/kill-switch?enable=${!enabled}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${localStorage.getItem('pitun_token')}` }
+          })
+          qc.invalidateQueries({ queryKey: ['adblock-stats'] })
+        }}
+        className={clsx(
+          'rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+          enabled
+            ? 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+            : 'bg-green-700 text-white hover:bg-green-600'
+        )}
+      >
+        {enabled ? 'Disable' : 'Enable'}
+      </button>
+      <Link
+        to="/adblock"
+        className="rounded-lg bg-gray-800 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-700 transition-colors shrink-0"
+      >
+        Manage Lists
+      </Link>
     </div>
   )
 }
