@@ -182,6 +182,17 @@ def get_blocked_domains_for_config() -> dict[str, str]:
     return {d: "0.0.0.0" for d in _blocked_domains if not d.startswith("*")}
 
 
+def get_blocked_domains_list() -> list[str]:
+    """Return a list of blocked domain patterns for routing rules (v2.1).
+
+    Used by config_gen to create domain→block routing rules.
+    Returns empty list when AdBlock is disabled.
+    """
+    if not _adblock_enabled:
+        return []
+    return list(_blocked_domains)
+
+
 async def download_list(list_id: int) -> int:
     """Download + parse a blocklist, store as AdBlockRule rows.
 

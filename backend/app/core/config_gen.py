@@ -549,6 +549,11 @@ def _routing_rule_to_xray(
     elif rule.rule_type == "mac":
         # MAC is handled by nftables, not xray routing
         return None
+    elif rule.rule_type == "adblock_list":
+        # v2.1 — AdBlock via routing: the rule's match_value contains
+        # the AdBlockList name. We resolve it to actual domains and
+        # create a domain→block routing rule.
+        return None  # handled separately in _add_adblock_rules
     else:
         return None
 
@@ -690,15 +695,9 @@ def _build_dns_section(
             ip = m.group(1)
             dns_hosts[ip] = ip  # identity mapping — skip resolution
 
-    # v2.0.1 — AdBlock: add blocked domains to DNS hosts map.
-    # xray DNS returns 0.0.0.0 for these — browser doesn't connect,
-    # traffic never reaches the proxy.
-    try:
-        from app.core.adblock import get_blocked_domains_for_config
-        adblock_hosts = get_blocked_domains_for_config()
-        dns_hosts.update(adblock_hosts)
-    except Exception:
-        pass  # AdBlock not initialized — skip silently
+    # v2.1 — AdBlock: DNS hosts map REMOVED. Blocking now via routing rules
+    # with rule_type="adblock_list" → outboundTag="block" (blackhole).
+    # See _add_adblock_rules in the routing section.
 
     # Pin every DNS server entry to a fixed outbound (since v1.3.5).
     #
@@ -1317,6 +1316,30 @@ def generate_config(
         # doesn't exist so the rule could never match anyway. Keeping
         # them out of the config also prevents accidental "leakage"
         # into the default inbound via the no-inboundTag fallback path.
+
+        # v2.1 — AdBlock: add domain→block routing rules from enabled
+        # AdBlockRules. This replaces the DNS hosts map approach.
+        try:
+            from app.core.adblock import get_blocked_domains_list
+            blocked_domains = get_blocked_domains_list()
+            if blocked_domains:
+                routing_rules.insert(0, {
+                    "type": "field",
+                    "domain": [f"domain:{d}" for d in blocked_domains if not d.startswith("*")],
+                    "outboundTag": "block",
+                })
+                wildcard_domains = [d[2:] for d in blocked_domains if d.startswith("*.")]
+                if wildcard_domains:
+                    routing_rules.insert(0, {
+                        "type": "field",
+                        "domain": [f"domain:{d}" for d in wildcard_domains],
+                        "outboundTag": "block",
+                    })
+                logger.info("AdBlock: added %d domain->block routing rules", len(blocked_domains))
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("AdBlock routing rules failed: %s", exc)
 
         # Default: direct
         routing_rules.append({"type": "field", "ip": ["0.0.0.0/0", "::/0"], "outboundTag": "direct"})
