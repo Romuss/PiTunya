@@ -1317,30 +1317,6 @@ def generate_config(
         # them out of the config also prevents accidental "leakage"
         # into the default inbound via the no-inboundTag fallback path.
 
-        # v2.1 — AdBlock: add domain→block routing rules from enabled
-        # AdBlockRules. This replaces the DNS hosts map approach.
-        try:
-            from app.core.adblock import get_blocked_domains_list
-            blocked_domains = get_blocked_domains_list()
-            if blocked_domains:
-                routing_rules.insert(0, {
-                    "type": "field",
-                    "domain": [f"domain:{d}" for d in blocked_domains if not d.startswith("*")],
-                    "outboundTag": "block",
-                })
-                wildcard_domains = [d[2:] for d in blocked_domains if d.startswith("*.")]
-                if wildcard_domains:
-                    routing_rules.insert(0, {
-                        "type": "field",
-                        "domain": [f"domain:{d}" for d in wildcard_domains],
-                        "outboundTag": "block",
-                    })
-                logger.info("AdBlock: added %d domain->block routing rules", len(blocked_domains))
-        except ImportError:
-            pass
-        except Exception as exc:
-            logger.debug("AdBlock routing rules failed: %s", exc)
-
         # Default: direct
         routing_rules.append({"type": "field", "ip": ["0.0.0.0/0", "::/0"], "outboundTag": "direct"})
 

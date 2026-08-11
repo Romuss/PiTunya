@@ -135,9 +135,13 @@ async def delete_list(list_id: int, session: AsyncSession = Depends(get_session)
     lst = await session.get(AdBlockList, list_id)
     if not lst:
         raise HTTPException(404, "List not found")
-    # Delete all rules from this list
+    list_name = lst.name
+    # Delete all AdBlockRule entries from this list
     from sqlmodel import delete
-    await session.exec(delete(AdBlockRule).where(AdBlockRule.source == lst.name))
+    await session.exec(delete(AdBlockRule).where(AdBlockRule.source == list_name))
+    # Delete all RoutingRule entries created from this list
+    from app.models import RoutingRule
+    await session.exec(delete(RoutingRule).where(RoutingRule.name == f"adblock:{list_name}"))
     await session.delete(lst)
     await session.commit()
     from app.core.adblock import compile_rules

@@ -194,7 +194,8 @@ def get_blocked_domains_list() -> list[str]:
 
 
 async def download_list(list_id: int) -> int:
-    """Download + parse a blocklist, store as AdBlockRule rows.
+    """Download + parse a blocklist, store as AdBlockRule rows AND
+    create RoutingRule entries (domain→block) in the DB.
 
     Returns the number of domains added.
     """
@@ -240,11 +241,21 @@ async def download_list(list_id: int) -> int:
     domains = list(set(domains))
     added = len(domains)
 
-    # 4. Store in DB (separate session, batched commits)
-    from sqlmodel import delete as sqlmodel_delete
+    # 4. Store AdBlockRule rows + RoutingRule rows (domain→block)
+    from sqlmodel import delete as sqlmodel_delete, func
+    from app.models import RoutingRule
+    rule_tag = f"adblock:{list_name}"
+
     async with AsyncSession(get_async_engine()) as session:
+        # Delete old AdBlockRule entries from this list
         await session.exec(
             sqlmodel_delete(AdBlockRule).where(AdBlockRule.source == list_name)
+        )
+        await session.commit()
+
+        # Delete old RoutingRule entries from this list
+        await session.exec(
+            sqlmodel_delete(RoutingRule).where(RoutingRule.name == rule_tag)
         )
         await session.commit()
 
@@ -261,7 +272,24 @@ async def download_list(list_id: int) -> int:
                 ))
             await session.commit()
 
-        # Update list metadata (fresh fetch to avoid expired object)
+        # Create RoutingRule: rule_type=domain, action=block, match_value=comma-separated domains
+        # Group into chunks of 500 domains per rule (xray routing accepts comma-separated domain list)
+        order = 1
+        chunk_size = 500
+        for i in range(0, len(domains), chunk_size):
+            chunk = domains[i:i + chunk_size]
+            session.add(RoutingRule(
+                name=rule_tag,
+                rule_type="domain",
+                match_value=",".join(chunk),
+                action="block",
+                enabled=list_enabled,
+                order=order,
+            ))
+            order += 1
+        await session.commit()
+
+        # Update list metadata
         lst_obj = await session.get(AdBlockList, list_id)
         if lst_obj:
             lst_obj.last_updated = now
@@ -269,7 +297,7 @@ async def download_list(list_id: int) -> int:
             session.add(lst_obj)
             await session.commit()
 
-    logger.info("AdBlock: downloaded %s, %d domains", list_name, added)
+    logger.info("AdBlock: downloaded %s, %d domains, %d routing rules created", list_name, added, (added + chunk_size - 1) // chunk_size)
 
     # 5. Recompile (separate session)
     await compile_rules()
