@@ -546,23 +546,19 @@ def _routing_rule_to_xray(
         xray_rule["ip"] = [f"geoip:{v}" for v in values]
     elif rule.rule_type == "geosite":
         xray_rule["domain"] = [f"geosite:{v}" for v in values]
+
     elif rule.rule_type == "mac":
         # MAC is handled by nftables, not xray routing
         return None
-    elif rule.rule_type == "adblock_list":
-        # v2.1 — AdBlock via routing: the rule's match_value contains
-        # the AdBlockList name. We resolve it to actual domains and
-        # create a domain→block routing rule.
-        return None  # handled separately in _add_adblock_rules
     else:
         return None
-
     return xray_rule
 
 
 def _build_dns_section(
     settings_map: Dict[str, str],
     dns_rules: Optional[List[DNSRule]] = None,
+    active_node_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build the xray DNS configuration section from settings and DNS rules."""
     dns_mode = settings_map.get("dns_mode", "plain")
@@ -695,10 +691,6 @@ def _build_dns_section(
             ip = m.group(1)
             dns_hosts[ip] = ip  # identity mapping — skip resolution
 
-    # v2.1 — AdBlock: DNS hosts map REMOVED. Blocking now via routing rules
-    # with rule_type="adblock_list" → outboundTag="block" (blackhole).
-    # See _add_adblock_rules in the routing section.
-
     # Pin every DNS server entry to a fixed outbound (since v1.3.5).
     #
     # xray-core treats DNS-upstream connections as regular outbound dials
@@ -735,13 +727,15 @@ def _build_dns_section(
         # Unrecognised → safe default (don't ever emit a stray tag,
         # xray would error out on reload and the box would go dark).
         dns_route_via = "direct"
-    # `proxy` is xray's "follow routing rules" outbound name — but at
-    # the DNS-server-config level we want "match the active node",
-    # which xray represents as the literal tag `proxy` (see config_gen
-    # routing section). If the active_balancer is in play, xray would
-    # itself reroute; for DNS-specific use we accept simplicity.
+    # `proxy` means "ride the active node's outbound" — but the generated
+    # config has NO outbound tagged `proxy` (outbounds are `direct`,
+    # `block`, `dns-out`, `node-<id>`). Emitting `outboundTag: proxy`
+    # would cause xray's "not all dependencies are resolved" fatal error.
+    # We resolve to the concrete `node-<id>` tag here (or `direct` when
+    # no active node is set). Same fix applied to the port-53 routing
+    # rule below.
     if dns_route_via == "proxy":
-        dns_outbound_tag = "proxy"
+        dns_outbound_tag = f"node-{active_node_id}" if active_node_id else "direct"
     elif dns_route_via.startswith("node:"):
         try:
             nid = int(dns_route_via.split(":", 1)[1])
@@ -913,7 +907,7 @@ def generate_config(
         )
 
     # DNS section (full, with rules)
-    dns_section = _build_dns_section(settings_map, dns_rules)
+    dns_section = _build_dns_section(settings_map, dns_rules, active_node.id if active_node else None)
 
     # Sniffing destOverride: include fakedns if enabled
     sniff_dest = ["http", "tls"]
@@ -1235,7 +1229,7 @@ def generate_config(
     # way. Tests cover both paths.
     _drv = settings_map.get("dns_route_via", "direct").strip() or "direct"
     if _drv == "proxy":
-        _dns_sys_tag = "proxy"
+        _dns_sys_tag = f"node-{active_node.id}" if active_node else "direct"
     elif _drv.startswith("node:"):
         try:
             _dns_sys_tag = f"node-{int(_drv.split(':', 1)[1])}"
@@ -1405,6 +1399,19 @@ _VALIDATION_HINTS: list[tuple[str, str]] = [
         "vanilla XTLS/Xray-core which doesn't implement `protocol: tun` "
         "(that's a sing-box feature). Switch Inbound Mode back to "
         "TPROXY in the Dashboard.",
+    ),
+    # A routing rule or DNS server entry references an outbound/balancer
+    # tag that doesn't exist in the outbounds/balancers sections.
+    # Typically caused by dns_route_via=proxy without an active node,
+    # a routing rule pointing at a node:<id> that was deleted/disabled,
+    # or a balancer:<id> referencing a disabled BalancerGroup.
+    (
+        r"not all dependencies are resolved",
+        "A routing rule or DNS server references an outbound/balancer tag "
+        "that does not exist. Common causes: a routing rule uses node:<id> "
+        "for a deleted/disabled node, a balancer group is disabled, or "
+        "DNS Route Via is set to 'proxy' while no active node is selected. "
+        "Check Routing rules and Settings → DNS Route Via.",
     ),
 ]
 

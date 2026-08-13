@@ -4,6 +4,42 @@ All notable user-facing changes to PiTun. Full per-release detail lives in the
 [GitHub Releases](https://github.com/DaveBugg/PiTun/releases); this file is the
 committed summary.
 
+## v2.2.0 — 2026-08-13
+
+Fixes the fatal xray startup crash (`core: not all dependencies are resolved`)
+and removes the AdBlock feature entirely.
+
+### Fixed
+
+- **Xray crash: "not all dependencies are resolved".** When `dns_route_via` was
+  set to `"proxy"`, the config generator emitted `outboundTag: "proxy"` in both
+  the DNS server entries and the port-53 routing rule — but no outbound with
+  that tag exists in the generated config (outbounds are `direct`, `block`,
+  `dns-out`, `node-<id>`). Xray's dependency resolver rejected the config on
+  startup, killing the entire proxy. The `"proxy"` value now resolves to the
+  concrete `node-<active_node_id>` tag (or `direct` when no active node is
+  selected). A validation hint for this error class has also been added so
+  future occurrences surface a human-readable message.
+
+### Removed
+
+- **AdBlock feature removed.** The entire DNS-level ad/tracker blocking
+  subsystem has been deleted: backend models (`AdBlockRule`, `AdBlockList`),
+  API router, core module, config_gen integration, DNS logger hooks, frontend
+  page, dashboard widget, sidebar link, and API client — all gone. A migration
+  (`031`) drops the orphaned DB tables and cleans up auto-generated routing
+  rules (`name LIKE 'adblock:%'`). The feature was heavyweight, rarely used,
+  and its integration with xray config generation was a recurring source of
+  complexity and breakage.
+
+### Notes
+
+- Schema migration: alembic head moves from `030` → `031`.
+- Breaking change: `GET /api/adblock/*` endpoints no longer exist. The
+  frontend AdBlock page and dashboard widget are removed.
+
+**Full Changelog:** https://github.com/DaveBugg/PiTun/compare/v2.1.1...v2.2.0
+
 ## v1.5.1 — 2026-08-06
 
 Fixes the active node reporting no speed on a general sweep, adds a REALITY

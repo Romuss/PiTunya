@@ -171,13 +171,6 @@ async def lifespan(app: FastAPI):
         _sup.register("rule_suggestions", rule_suggester.start, rule_suggester.stop)
     except Exception as exc:
         logger.warning("Rule suggester failed to start: %s", exc)
-    # v2.0 — AdBlock: seed default lists + compile rules on startup
-    try:
-        from app.core.adblock import seed_default_lists, compile_rules
-        await seed_default_lists()
-        await compile_rules()
-    except Exception as exc:
-        logger.warning("AdBlock init failed: %s", exc)
     _sup.register("health",       health_checker.start,        health_checker.stop)
     _sup.register("subs",         subscription_scheduler.start, subscription_scheduler.stop)
     _sup.register("circle",       circle_scheduler.start,       circle_scheduler.stop)
@@ -503,7 +496,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck, sla, traffic_api, quota_api, suggestions, connections, adblock_api
+from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck, sla, traffic_api, quota_api, suggestions, connections
 from app.core.auth import get_current_user
 
 app.include_router(auth.router, prefix="/api")
@@ -553,8 +546,6 @@ app.include_router(quota_api.router, prefix="/api", dependencies=_auth)
 app.include_router(suggestions.router, prefix="/api", dependencies=_auth)
 # v2.0 — Connection tracker (live conntrack view)
 app.include_router(connections.router, prefix="/api", dependencies=_auth)
-# v2.0 — AdBlock (DNS-level ad blocking)
-app.include_router(adblock_api.router, prefix="/api", dependencies=_auth)
 
 
 # ── Prometheus metrics (no auth — for scraping) ──────────────────────────────

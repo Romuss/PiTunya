@@ -1401,18 +1401,6 @@ export function createLogSocket(onLine: (line: string) => void): WebSocket {
   return ws
 }
 
-// ── v2.0 APIs ────────────────────────────────────────────────────────────────
-
-export const adblockApi = {
-  listRules: (source?: string) => http.get('/adblock/rules', { params: source ? { source } : {} }).then(r => r.data),
-  createRule: (data: { domain_pattern: string; rule_type?: string }) => http.post('/adblock/rules', data).then(r => r.data),
-  deleteRule: (id: number) => http.delete(`/adblock/rules/${id}`),
-  listLists: () => http.get('/adblock/lists').then(r => r.data),
-  createList: (data: { name: string; url: string; format?: string; enabled?: boolean }) => http.post('/adblock/lists', data).then(r => r.data),
-  deleteList: (id: number) => http.delete(`/adblock/lists/${id}`),
-  refreshList: (id: number) => http.post(`/adblock/lists/${id}/refresh`).then(r => r.data),
-  stats: () => http.get('/adblock/stats').then(r => r.data),
-}
 
 export const slaApi = {
   summary: () => http.get('/sla/summary').then(r => r.data),

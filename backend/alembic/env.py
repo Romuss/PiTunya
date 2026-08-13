@@ -15,7 +15,6 @@ from app.models import (  # noqa: F401 — import all models so SQLModel.metadat
     UserAgentTemplate, AutoCheckConfig,
     NodeSLARecord, NodeSLADaily, DeviceTraffic,
     TrafficQuota, TrafficUsage, SuggestedRule,
-    AdBlockRule, AdBlockList,
 )
 
 config = context.config

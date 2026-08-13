@@ -1,9 +1,7 @@
-import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Check, X, TrendingUp, Activity, Lightbulb, Shield, RefreshCw } from 'lucide-react'
+import { Check, X, TrendingUp, Activity, Lightbulb } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Link } from 'react-router-dom'
-import { slaApi, trafficApi, suggestionsApi, adblockApi } from '@/api/client'
+import { slaApi, trafficApi, suggestionsApi } from '@/api/client'
 
 export function V2Widgets() {
   return (
@@ -159,97 +157,4 @@ function formatBytes(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB']
   const i = Math.floor(Math.log(bytes) / Math.log(1024))
   return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i]
-}
-
-export function V2AdBlockWidget() {
-  const qc = useQueryClient()
-  const { data: stats } = useQuery({
-    queryKey: ['adblock-stats'],
-    queryFn: () => adblockApi.stats(),
-    refetchInterval: 60_000,
-  })
-
-  const { data: lists = [] } = useQuery({
-    queryKey: ['adblock-lists'],
-    queryFn: () => adblockApi.listLists(),
-    refetchInterval: 60_000,
-  })
-
-  const [refreshingId, setRefreshingId] = useState<number | null>(null)
-
-  const refreshList = useMutation({
-    mutationFn: (id: number) => adblockApi.refreshList(id),
-    onMutate: (id) => setRefreshingId(id),
-    onSettled: () => {
-      setRefreshingId(null)
-      qc.invalidateQueries({ queryKey: ['adblock-lists'] })
-      qc.invalidateQueries({ queryKey: ['adblock-stats'] })
-    },
-  })
-
-  const enabled = stats?.enabled_rules > 0
-
-  return (
-    <div className={clsx(
-      'rounded-xl border p-4 space-y-3 transition-colors',
-      enabled
-        ? 'border-emerald-700/40 bg-emerald-900/10'
-        : 'border-gray-800 bg-gray-900/50'
-    )}>
-      <div className="flex items-center gap-3">
-        <div className={clsx(
-          'flex items-center justify-center w-10 h-10 rounded-lg',
-          enabled ? 'bg-emerald-900/40' : 'bg-gray-800'
-        )}>
-          <Shield className={clsx('h-5 w-5', enabled ? 'text-emerald-400' : 'text-gray-500')} />
-        </div>
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <h3 className="text-sm font-semibold text-gray-200">Ad Blocking</h3>
-            <span className={clsx(
-              'rounded-full px-2 py-0.5 text-xs font-medium',
-              enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-gray-800 text-gray-400'
-            )}>
-              {enabled ? 'Active' : 'Inactive'}
-            </span>
-          </div>
-          <p className="text-xs text-gray-500 mt-0.5">
-            {stats?.enabled_rules?.toLocaleString() ?? 0} domains blocked
-            {stats?.total_entries ? ` · ${stats.total_entries.toLocaleString()} total` : ''}
-          </p>
-        </div>
-        <Link
-          to="/adblock"
-          className="rounded-lg bg-gray-800 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-700 transition-colors"
-        >
-          Manage
-        </Link>
-      </div>
-
-      {enabled && lists.length > 0 && (
-        <div className="space-y-1">
-          {lists.filter((l: any) => l.enabled).slice(0, 3).map((lst: any) => (
-            <div key={lst.id} className="flex items-center gap-2 text-xs">
-              <div className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              <span className="flex-1 text-gray-400 truncate">{lst.name}</span>
-              <span className="text-gray-600 font-mono">{lst.entry_count?.toLocaleString()}</span>
-              <button
-                onClick={() => refreshList.mutate(lst.id)}
-                disabled={refreshingId === lst.id}
-                className="text-gray-500 hover:text-brand-400 transition-colors disabled:opacity-30"
-              >
-                <RefreshCw className={clsx('h-3 w-3', refreshingId === lst.id && 'animate-spin')} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {!enabled && (
-        <p className="text-xs text-gray-500">
-          No domains are being blocked. <Link to="/adblock" className="text-brand-400 hover:underline">Add a blocklist</Link> to start blocking ads and trackers at the DNS level.
-        </p>
-      )}
-    </div>
-  )
 }

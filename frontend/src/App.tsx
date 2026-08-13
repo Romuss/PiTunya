@@ -18,7 +18,6 @@ import { Servers } from '@/pages/Servers'
 import { ServerTasks } from '@/pages/ServerTasks'
 import XuiPage from '@/pages/Xui'
 import ChainsPage from '@/pages/Chains'
-import { AdBlock } from '@/pages/AdBlock'
 import { Connections } from '@/pages/Connections'
 
 function isTokenValid(token: string): boolean {
@@ -68,7 +67,6 @@ export default function App() {
         <Route path="/geodata"       element={<GeoData />} />
         <Route path="/logs"          element={<Logs />} />
         <Route path="/diagnostics"   element={<Diagnostics />} />
-        <Route path="/adblock"        element={<AdBlock />} />
         <Route path="/connections"    element={<Connections />} />
         <Route path="/settings"      element={<Settings />} />
         <Route path="/kb"            element={<KnowledgeBase />} />

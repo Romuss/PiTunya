@@ -4,31 +4,6 @@ from typing import Optional
 from datetime import datetime, timezone, date
 
 
-class AdBlockRule(SQLModel, table=True):
-    """A single ad/tracker blocking rule.
-
-    Domain patterns support wildcards: "*.ads.example.com" matches
-    any subdomain. Exact match: "doubleclick.net".
-    """
-    id: Optional[int] = Field(default=None, primary_key=True)
-    domain_pattern: str = Field(index=True)
-    rule_type: str = "block"     # "block" | "allow"
-    source: str = "manual"      # "manual" | "easylist" | list name
-    enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class AdBlockList(SQLModel, table=True):
-    """A subscribed ad-blocking list (auto-downloaded + updated)."""
-    id: Optional[int] = Field(default=None, primary_key=True)
-    name: str
-    url: str
-    format: str = "hosts"        # "hosts" | "domain" | "adguard"
-    enabled: bool = True
-    last_updated: Optional[datetime] = None
-    entry_count: int = 0
-
-
 class DNSQueryLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
