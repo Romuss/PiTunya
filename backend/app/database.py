@@ -33,7 +33,17 @@ def get_async_engine() -> AsyncEngine:
     if _async_engine is None:
         _ensure_db_dir(settings.database_url)
         async_url = _to_async_url(settings.database_url)
-        _async_engine = create_async_engine(async_url, echo=False)
+        # NullPool for async SQLite — each session gets a fresh connection
+        # that's closed on session exit, preventing the "garbage collector
+        # is trying to clean up non-checked-in connection" warnings that
+        # the default AsyncAdaptedQueuePool produces when background tasks
+        # (speed tests, health checks, schedulers) create short-lived sessions.
+        # SQLite doesn't benefit from real connection pooling anyway (single
+        # writer, WAL mode handles concurrent readers).
+        from sqlalchemy.pool import NullPool
+        _async_engine = create_async_engine(
+            async_url, echo=False, poolclass=NullPool,
+        )
 
         @event.listens_for(_async_engine.sync_engine, "connect")
         def _set_sqlite_pragma(dbapi_conn, connection_record):
