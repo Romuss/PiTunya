@@ -124,6 +124,15 @@ async def lifespan(app: FastAPI):
     metrics_collector.start()
     geo_scheduler.start()
 
+    # Country-flag prefixes, applied at the model rather than at each of the
+    # nine places a node gets created — which is how nodes from a server
+    # deploy ended up without one while imported nodes had them.
+    try:
+        from app.core.geoip_lookup import install_node_listener
+        install_node_listener()
+    except Exception as exc:  # noqa: BLE001 — cosmetic, never blocks startup
+        logger.warning("Country-flag enrichment not installed: %s", exc)
+
     # Service-supervisor bookkeeping (architecture review finding 4.1 +
     # 4.2): register the already-started services so the singleton's
     # snapshot() can report live state to a future /api/health/services

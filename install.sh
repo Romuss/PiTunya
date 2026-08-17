@@ -825,6 +825,17 @@ if [[ "$SKIP_HOST_PREP" != "1" ]]; then
         run systemctl mask avahi-daemon || true
     fi
 
+    # Whoever holds 5353, say so: xray's DNS inbound will fail to bind and
+    # name resolution through PiTun silently stops working.
+    # xray excluded, because on an upgrade xray is exactly what holds this
+    # port: it IS PiTun's DNS. Warning about it told every operator of a
+    # healthy box that their DNS would not start, naming the process already
+    # serving it. The check is for something else squatting there.
+    if [[ "$DRY_RUN" != "1" ]] && command -v ss >/dev/null 2>&1; then
+        HOLDER=$(ss -lnupH 2>/dev/null | grep ':5353 ' | grep -v '"xray"' | head -1 || true)
+        [[ -n "$HOLDER" ]] && warn "UDP/5353 is held by something other than xray — PiTun's DNS will not start: $HOLDER"
+    fi
+
     info "Configuring sysctl (IP forwarding + TPROXY loopback)…"
     if [[ "$DRY_RUN" != "1" ]]; then
         cat > /etc/sysctl.d/99-pitun.conf <<'EOF'
@@ -1002,25 +1013,43 @@ fi
 # a one-line rollback. We use sqlite's online backup API via Python (the
 # container always has it) instead of a raw `cp` so concurrent backend
 # writes don't tear the file.
+#
+# The snapshot is written straight into the data directory, which is a bind
+# mount — the same disk from both sides — so there is no `docker cp` in the
+# path. There used to be, and on Docker 29 it fails with "mkdirat var/run:
+# file exists" while the snapshot inside the container succeeds: the backup
+# was skipped on every upgrade of an affected box.
+#
+# BACKUP_PATH stays empty until the file is on disk and non-empty. It used to
+# be assigned before the attempt, so the summary's fallback could never fire
+# and the post-upgrade advice named a rollback file that did not exist.
+BACKUP_PATH=""
 if [[ "$IS_UPDATE" == "1" && "$DRY_RUN" != "1" ]]; then
     step "Backing up SQLite (pre-upgrade snapshot)"
-    BACKUP_PATH="$INSTALL_DIR/data-backup-pre-${VERSION}-$(date +%s).db"
+    _bak_target="$INSTALL_DIR/data-backup-pre-${VERSION}-$(date +%s).db"
+    _bak_staged="$INSTALL_DIR/data/.pre-upgrade-snapshot.db"
+    rm -f "$_bak_staged"
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'pitun-backend'; then
         if docker exec pitun-backend python -c "
 import sqlite3
 src = sqlite3.connect('/app/data/pitun.db')
-dst = sqlite3.connect('/tmp/pitun-pre-upgrade.bak')
+dst = sqlite3.connect('/app/data/.pre-upgrade-snapshot.db')
 src.backup(dst)
 dst.close(); src.close()
-" 2>/dev/null; then
-            docker cp pitun-backend:/tmp/pitun-pre-upgrade.bak "$BACKUP_PATH" 2>/dev/null && \
-                info "  Snapshot saved to $BACKUP_PATH" || \
-                warn "  Could not docker-cp snapshot — continuing without backup"
+" 2>/dev/null && [[ -s "$_bak_staged" ]]; then
+            if mv -f "$_bak_staged" "$_bak_target" 2>/dev/null; then
+                BACKUP_PATH="$_bak_target"
+                info "  Snapshot saved to $BACKUP_PATH"
+            else
+                rm -f "$_bak_staged"
+                warn "  Could not move the snapshot into place — continuing WITHOUT a backup"
+            fi
         else
-            warn "  pitun-backend not responding — skipping pre-upgrade backup"
+            rm -f "$_bak_staged"
+            warn "  Could not snapshot the database — continuing WITHOUT a backup"
         fi
     else
-        warn "  pitun-backend container not running — skipping pre-upgrade backup"
+        warn "  pitun-backend container not running — continuing WITHOUT a backup"
     fi
 fi
 
@@ -1218,6 +1247,18 @@ if [[ "$DRY_RUN" != "1" ]]; then
     else
         docker compose up -d
     fi
+
+    # The panel's Update button writes a request file; a host-side systemd
+    # path unit is what carries it out. The installer never set that up, so
+    # the button sat at "waiting for the update agent" on every box ever
+    # installed — a UI offering an action nothing could perform. Installing
+    # it here does NOT enable unattended updates: the agent only acts on a
+    # request somebody made from the panel. (`--install-timer` is the
+    # separate, scheduled check, and stays opt-in.)
+    if [ -f "$INSTALL_DIR/scripts/pitun-update.sh" ]; then
+        bash "$INSTALL_DIR/scripts/pitun-update.sh" --install-agent \
+            || warn "Could not install the update agent — the panel's Update button will wait forever. Run: bash $INSTALL_DIR/scripts/pitun-update.sh --install-agent"
+    fi
 fi
 
 # ── Static IP / DHCP sanity check (both modes) ───────────────────────────────
@@ -1280,8 +1321,13 @@ if [[ "$IS_UPDATE" == "1" ]]; then
     echo -e "${YELLOW}Post-upgrade:${NC}"
     echo "  • Verify the UI loads cleanly and your nodes/rules are intact"
     echo "  • Check the Recent Events feed for any startup warnings"
-    echo "  • If anything broke: ${BACKUP_PATH:-pre-upgrade snapshot under $INSTALL_DIR/data-backup-pre-*.db}"
-    echo "    can be restored: stop backend, replace data/pitun.db, start backend"
+    if [[ -n "$BACKUP_PATH" ]]; then
+        echo "  • If anything broke: $BACKUP_PATH"
+        echo "    can be restored: stop backend, replace data/pitun.db, start backend"
+    else
+        echo "  • NOTE: no pre-upgrade snapshot was taken — see the warnings"
+        echo "    above. Older snapshots, if any: $INSTALL_DIR/data-backup-pre-*.db"
+    fi
 else
     echo -e "${YELLOW}Next steps:${NC}"
     echo "  1. Edit $INSTALL_DIR/.env if you haven't (LAN_CIDR / GATEWAY_IP / INTERFACE)"

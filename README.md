@@ -345,9 +345,12 @@ Frontend is a single-page React app served by nginx.
 - **User-Agent templates** — an editable table (add / edit / delete)
   replacing the old hardcoded presets; each row carries a UA string and
   optional custom request headers, with catalogue export / import
-- Optional **GeoIP country flags** on imported node names (`🇳🇱 vless-nl`)
-  — opt-in and licence-clean (drop a MaxMind `GeoLite2-Country.mmdb`
-  next to the geo data; absent it's a silent no-op)
+- **Country flags** on nodes (`🇳🇱 vless-nl`) — read back **through the
+  tunnel** by the speed test and the internet check, so the flag is where
+  traffic actually surfaces (for a chained node, the last hop — not the
+  entry whose address is stored). No database needed. Optionally also from
+  the address at import time, if you drop a MaxMind `GeoLite2-Country.mmdb`
+  next to the geo data; absent it, that half is a silent no-op
 - Optional regex filter, configurable interval
 
 **Devices & DNS**
@@ -1127,6 +1130,11 @@ projects. Without them, none of this would exist:
 - **[React Router](https://reactrouter.com/)** — routing
 - **[Recharts](https://recharts.org/)** — metrics charts
 - **[Lucide](https://lucide.dev/)** — icons
+- **[Twemoji](https://github.com/jdecked/twemoji)** — the flag artwork
+  (CC-BY 4.0), carried as the **[Twemoji Country Flags](https://github.com/talkjs/country-flag-emoji-polyfill)**
+  webfont built by TalkJS (MIT). Self-hosted, flags only, 78 KB: Windows
+  ships no flag glyphs at all, so without it a node named `🇨🇭 vless-…`
+  renders as the bare letters `CH vless-…`
 - **[axios](https://github.com/axios/axios)** — HTTP client
 - **[Vitest](https://vitest.dev/)** + **[Testing Library](https://testing-library.com/)** — tests
 

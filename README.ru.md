@@ -316,8 +316,18 @@ xray-core, набором правил nftables и SQLite-базой со все
 **Подписки**
 - Периодическое обновление с VLESS / VMess / Trojan / SS / Hysteria2 /
   Clash YAML / xray JSON URL-подписок
-- User-Agent на каждую подписку (v2ray, clash, sing-box, happ, …),
-  опциональный regex-фильтр, настраиваемый интервал
+- **User-Agent шаблоны** — редактируемая таблица (add / edit / delete)
+  вместо старых захардкоженных пресетов; каждая строка несёт UA-строку
+  и опциональные кастомные request-заголовки, с экспортом / импортом
+  каталога
+- **Флаги стран** у нод (`🇳🇱 vless-nl`) — считываются **через сам
+  туннель** тестом скорости и проверкой интернета, поэтому флаг
+  показывает, где трафик реально выходит наружу (у цепочки — последний
+  хоп, а не входной, чей адрес хранится). База для этого не нужна.
+  Дополнительно можно определять страну по адресу при импорте — если
+  положить MaxMind `GeoLite2-Country.mmdb` рядом с geo-данными; без него
+  эта половина просто молчит
+- Опциональный regex-фильтр, настраиваемый интервал
 
 **Устройства и DNS**
 - Сканирование LAN через `arp-scan`, OUI vendor lookup
@@ -752,6 +762,10 @@ PiTun — это glue-код поверх зрелых проектов, без 
 - **[React Router](https://reactrouter.com/)** — роутинг
 - **[Recharts](https://recharts.org/)** — графики метрик
 - **[Lucide](https://lucide.dev/)** — иконки
+- **[Twemoji](https://github.com/jdecked/twemoji)** — рисунки флагов
+  (CC-BY 4.0) в виде вебшрифта **[Twemoji Country Flags](https://github.com/talkjs/country-flag-emoji-polyfill)**
+  сборки TalkJS (MIT). Лежит у нас, только флаги, 78 КБ: в Windows глифов
+  флагов нет вовсе, и без него нода `🇨🇭 vless-…` выглядит как `CH vless-…`
 - **[axios](https://github.com/axios/axios)** — HTTP-клиент
 - **[Vitest](https://vitest.dev/)** + **[Testing Library](https://testing-library.com/)** — тесты
 
