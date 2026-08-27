@@ -20,6 +20,21 @@ per-circle country exclusion feature.
   `<protocol>-<flag>-<addr>:<port>` using the GeoLite2 mmdb, while curated
   names (`Tokyo-1`, `Frankfurt`, …) are left untouched.
 
+- **NodeCircle only rotated between 2 nodes.** Two issues conspired to
+  keep the circle stuck on the same pair of nodes:
+  1. The smart rotation guard skipped rotation whenever the active node
+     was healthy (online + latency ≤ 80ms), even with `min_speed_mbps=0`
+     (default). This defeated the anti-DPI purpose — the circle never
+     rotated away from a healthy node. Now smart-skip only activates when
+     `min_speed_mbps > 0` (operator explicitly opted in); with the default
+     0, the circle rotates on schedule regardless of health.
+  2. In "best" mode, candidates were probed in strict quality order, so
+     the same top-2 nodes (current excluded, next-best picked) were always
+     reached first. Nodes 3+ were never probed. Now both "best" and
+     "random" modes shuffle within the top-3 healthy candidates, providing
+     real exit-point variety. The shuffle threshold also dropped from >3
+     to >2 candidates, so circles with exactly 3 nodes get variety too.
+
 ### Added
 
 - **Per-circle country exclusion.** NodeCircle now has an `excluded_countries`

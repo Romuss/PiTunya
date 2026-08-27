@@ -107,19 +107,22 @@ class CircleScheduler:
                     self._next_rotate[cid] = now
 
             if now >= self._next_rotate[cid]:
-                # ── Smart rotation guard (v1.5.0) ──────────────────────
-                # Skip rotation when the active node is healthy:
+                # ── Smart rotation guard (v1.5.0, revised v2.4.0) ─────────
+                # Skip rotation when the active node is healthy AND the
+                # operator explicitly opted into smart-skip (min_speed_mbps > 0):
                 #   * is_online = True
-                #   * latency_ms <= 80 (or None = untested = rotate anyway)
-                #   * speed_mbps >= min_speed_mbps (if min_speed_mbps > 0)
+                #   * latency_ms <= max_latency_ms (or 80ms default)
+                #   * speed_mbps >= min_speed_mbps
                 #
-                # Default behavior (min_speed_mbps = 0): still skips if
-                # the node is online AND latency is good (<80ms). This
-                # prevents unnecessary jumps between equal-quality nodes
-                # while still rotating if the active node degrades.
-                #
-                # Set min_speed_mbps > 0 to additionally require the
-                # speed test to have measured a minimum throughput.
+                # v2.4.0 fix: previously, min_speed_mbps=0 (default) still
+                # skipped rotation whenever the node was online + low-latency.
+                # This defeated the anti-DPI purpose of the circle — it never
+                # rotated away from a healthy node, so traffic always egressed
+                # from the same exit point. Now:
+                #   * min_speed_mbps > 0 → smart-skip is ACTIVE (stay on fast
+                #     nodes, only rotate when degraded — the operator chose this)
+                #   * min_speed_mbps = 0 → smart-skip is OFF: rotate on schedule
+                #     regardless of health (anti-DPI rotation is the point)
                 min_speed = cd.get("min_speed_mbps", 0) or 0
                 node_ids = cd["node_ids"]
                 should_skip = False
@@ -141,8 +144,11 @@ class CircleScheduler:
                     except (ValueError, TypeError):
                         pass
 
-                if active_id is not None and active_id in node_ids:
-                    # The actual active node is in this circle — check its health
+                if active_id is not None and active_id in node_ids and min_speed > 0:
+                    # v2.4.0 — only check health for smart-skip when the
+                    # operator explicitly set min_speed_mbps > 0. With the
+                    # default (0), the circle rotates on schedule regardless
+                    # — anti-DPI rotation requires actually changing exit points.
                     active_node = (await session.exec(
                         select(Node).where(Node.id == active_id)
                     )).first()
@@ -152,15 +158,17 @@ class CircleScheduler:
                             latency_ok = (active_node.latency_ms or 999) <= latency_limit
                         else:
                             latency_ok = (active_node.latency_ms or 999) <= 80
-                        speed_ok = (active_node.speed_mbps or 0) >= min_speed if min_speed > 0 else True
+                        speed_ok = (active_node.speed_mbps or 0) >= min_speed
                         if latency_ok and speed_ok:
                             should_skip = True
                             logger.debug(
-                                "NodeCircle %d: skipping rotation — active node "
-                                "%d (%s) is healthy (%dms, online, %.1f MB/s)",
+                                "NodeCircle %d: smart-skip — active node "
+                                "%d (%s) is healthy (%dms, online, %.1f MB/s, "
+                                "min_speed=%.1f)",
                                 cid, active_id, active_node.name,
                                 active_node.latency_ms or 0,
                                 active_node.speed_mbps or 0,
+                                min_speed,
                             )
                 elif active_id is not None and active_id not in node_ids:
                     # Active node is NOT in this circle — the operator
@@ -407,13 +415,25 @@ class CircleScheduler:
             ))
 
             # v1.5.0 — three modes:
-            #   best: strict best-first order (top candidate always probed first)
+            #   best: shuffle within top-3 healthy candidates for anti-DPI variety
             #   random: shuffle within top-3 best for anti-DPI variety
             #   sequential: best-first order (same as best, but user chose it)
-            if circle.mode == "random" and len(all_candidates) > 3:
-                top3 = all_candidates[:3]
-                random.shuffle(top3)
-                order_pool = top3 + all_candidates[3:]
+            #
+            # v2.4.0 fix — "best" mode used to be strict best-first, which
+            # meant the circle always picked the SAME top-2 nodes (current
+            # excluded, next-best picked, then back). With 3+ nodes the 3rd+
+            # were never reached. Now both "best" and "random" shuffle within
+            # their top candidates: this distributes traffic across more exit
+            # points (better anti-DPI) while still preferring healthy/low-
+            # latency nodes. "sequential" stays deterministic per its name.
+            # The threshold is now >2 (not >3): with exactly 3 candidates,
+            # shuffling top-3 gives real variety instead of always the
+            # same order.
+            if circle.mode in ("best", "random") and len(all_candidates) > 2:
+                top_count = min(3, len(all_candidates))
+                top_n = all_candidates[:top_count]
+                random.shuffle(top_n)
+                order_pool = top_n + all_candidates[top_count:]
             else:
                 order_pool = all_candidates
 
