@@ -76,6 +76,7 @@ class CircleScheduler:
                     "last_rotated": c.last_rotated,
                     "min_speed_mbps": getattr(c, "min_speed_mbps", 0) or 0,
                     "max_latency_ms": getattr(c, "max_latency_ms", 0) or 0,
+                    "excluded_countries": getattr(c, "excluded_countries", "") or "",
                 })
 
         live_ids = {cd["id"] for cd in circle_data}
@@ -338,6 +339,7 @@ class CircleScheduler:
                     "is_online": cand.is_online,
                     "latency_ms": cand.latency_ms,
                     "speed_mbps": cand.speed_mbps,
+                    "country": getattr(cand, "country", None),
                 })
 
             # v1.5.0 — apply quality filters to rotation candidates.
@@ -352,6 +354,40 @@ class CircleScheduler:
             # a slow/untested node than no proxy at all).
             min_speed_threshold = getattr(circle, 'min_speed_mbps', 0) or 0
             max_latency_threshold = getattr(circle, 'max_latency_ms', 0) or 0
+            excluded_raw = getattr(circle, 'excluded_countries', '') or ''
+            # Parse "DE, NL, us" → {"DE","NL","US"} (uppercased, stripped,
+            # empty discarded). Stored as a comma-separated string in the
+            # DB for human-editability; compared as a set of 2-letter codes.
+            excluded_set: set[str] = {
+                cc.strip().upper()
+                for cc in excluded_raw.split(',')
+                if cc.strip() and len(cc.strip()) == 2 and cc.strip().isalpha()
+            }
+
+            # v1.7.0 — exclude candidates whose exit country is in the
+            # operator's block-list. The use case is data-limited LTE
+            # proxies: the operator has e.g. 30GB/month in DE and doesn't
+            # want the circle to burn through it. `country` is the exit
+            # identity observed by the speed test (authoritative), not an
+            # inference from the address — so a chained node whose last
+            # hop exits in DE is correctly excluded.
+            if excluded_set:
+                filtered = [
+                    c for c in all_candidates
+                    if not (c.get('country') and c['country'].upper() in excluded_set)
+                ]
+                # Guard: if ALL candidates are excluded (e.g. every node
+                # exits in a blocked country), keep them all — better to
+                # rotate through a blocked country than to have no proxy
+                # at all. The operator should fix their config instead.
+                if filtered:
+                    all_candidates = filtered
+                else:
+                    logger.warning(
+                        "NodeCircle %d: ALL candidates are in excluded_countries "
+                        "(%s) — keeping them to avoid losing proxy",
+                        circle_id, excluded_raw,
+                    )
 
             if min_speed_threshold > 0:
                 filtered = [c for c in all_candidates if c['speed_mbps'] is not None and c['speed_mbps'] >= min_speed_threshold]

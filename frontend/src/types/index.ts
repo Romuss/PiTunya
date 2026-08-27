@@ -745,6 +745,10 @@ export interface NodeCircle {
   // candidates; min_speed_mbps drops candidates below the speed floor.
   max_latency_ms: number
   min_speed_mbps: number
+  // Comma-separated ISO country codes to exclude from rotation (e.g. "DE,NL").
+  // Candidates whose exit country matches are skipped. Useful for data-limited
+  // LTE proxies where you don't want the circle to burn through a quota.
+  excluded_countries: string
   current_index: number
   last_rotated?: string
   current_node_name?: string

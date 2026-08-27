@@ -794,26 +794,56 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
                 select(NodeCircle).where(NodeCircle.subscription_id == sub_id)
             )).all()
             if linked_circles:
-                # Build the fresh node-id list from the DB (post-upsert),
+                # Build the fresh node list from the DB (post-upsert),
                 # sorted by latency ascending so the circle's rotation
-                # order naturally prefers faster nodes.
-                fresh_nodes = (await session.exec(
-                    select(Node.id).where(
+                # order naturally prefers faster nodes. We fetch id + country
+                # so per-circle `excluded_countries` filtering can exclude
+                # nodes whose exit country is on the block-list.
+                fresh_rows = (await session.exec(
+                    select(Node.id, Node.country).where(
                         Node.subscription_id == sub_id,
                         Node.enabled == True,  # noqa: E712
                     ).order_by(Node.latency_ms.asc().nulls_last(), Node.id)
                 )).all()
-                fresh_ids = [n for n in fresh_nodes if n is not None]
+                # Normalize rows to (id, country) tuples — .exec() on a
+                # multi-column select returns Row objects without .id attr.
+                fresh_pairs: list[tuple[int, Optional[str]]] = []
+                for row in fresh_rows:
+                    if hasattr(row, "id"):
+                        fresh_pairs.append((row.id, row.country))
+                    else:
+                        fresh_pairs.append((row[0], row[1]))
+                fresh_ids = [nid for nid, _ in fresh_pairs]
                 fresh_id_set = set(fresh_ids)
                 for circle in linked_circles:
                     old_ids = _json.loads(circle.node_ids) if isinstance(circle.node_ids, str) else (circle.node_ids or [])
+                    # v1.7.0 — exclude nodes whose exit country is in the
+                    # circle's `excluded_countries` from auto-sync. This
+                    # prevents data-limited LTE proxies (e.g. 30GB/month
+                    # in DE) from being added to the circle's rotation
+                    # pool. Nodes without a known `country` (never speed-
+                    # tested) are always included — they'll be filtered
+                    # at rotation time if the exit turns out to be blocked.
+                    excluded_raw = getattr(circle, "excluded_countries", "") or ""
+                    excluded_set: set[str] = {
+                        cc.strip().upper()
+                        for cc in excluded_raw.split(",")
+                        if cc.strip() and len(cc.strip()) == 2 and cc.strip().isalpha()
+                    }
+                    if excluded_set:
+                        sub_ids = [
+                            nid for nid, ctry in fresh_pairs
+                            if not (ctry and ctry.upper() in excluded_set)
+                        ]
+                    else:
+                        sub_ids = fresh_ids
                     # MERGE semantics (v1.5.2 fix): keep manually-added nodes
                     # (from other subscriptions or standalone) that are NOT
                     # part of the linked subscription. Only the subscription's
                     # own nodes are synced (new ones added, removed ones dropped);
                     # manually-added nodes are preserved.
                     manual_ids = [i for i in old_ids if i not in fresh_id_set and i not in removed_ids]
-                    merged_ids = manual_ids + fresh_ids
+                    merged_ids = manual_ids + sub_ids
                     circle.node_ids = _json.dumps(merged_ids)
                     # Reset current_index if it points past the new list
                     if circle.current_index >= len(merged_ids):

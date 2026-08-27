@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useState } from 'react'
-import { Plus, Pencil, Trash2, ToggleLeft, ToggleRight, RefreshCw, Circle } from 'lucide-react'
+import { Plus, Pencil, Trash2, ToggleLeft, ToggleRight, RefreshCw, Circle, Ban } from 'lucide-react'
 import { InfoTip } from '@/components/InfoTip'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -10,6 +10,7 @@ import { useSystemSettings, useUpdateSettings } from '@/hooks/useSystem'
 import { useT } from '@/hooks/useT'
 import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
+import { countryFlag } from '@/lib/countries'
 import type { NodeCircle, NodeCircleCreate, Subscription } from '@/types'
 
 const MODE_LABELS: Record<string, string> = {
@@ -61,6 +62,7 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
   const [maxLatency, setMaxLatency] = useState(String(initial?.max_latency_ms ?? 0))
   const [minSpeed, setMinSpeed] = useState(String(initial?.min_speed_mbps ?? 0))
   const [subscriptionId, setSubscriptionId] = useState(String(initial?.subscription_id ?? ''))
+  const [excludedCountries, setExcludedCountries] = useState(String(initial?.excluded_countries ?? ''))
   const { data: subscriptions = [] } = useQuery<Subscription[]>({
     queryKey: ['subscriptions'],
     queryFn: () => subsApi.list(),
@@ -116,6 +118,14 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
       min_speed_mbps: mode === 'best' ? Math.max(0, parseFloat(minSpeed) || 0) : 0,
       node_ids: Array.from(selectedIds),
       subscription_id: subscriptionId ? Number(subscriptionId) : null,
+      // Normalize: uppercase, strip whitespace, filter to valid 2-letter codes,
+      // dedup, join with comma. Empty string = no exclusions.
+      excluded_countries: excludedCountries
+        .split(/[,;\s]+/)
+        .map((c) => c.trim().toUpperCase())
+        .filter((c) => /^[A-Z]{2}$/.test(c))
+        .filter((c, i, arr) => arr.indexOf(c) === i)
+        .join(','),
     })
   }
 
@@ -298,6 +308,27 @@ function CircleModal({ initial, nodeOptions, onSave, onCancel, loading }: ModalP
             <option key={s.id} value={String(s.id)}>{s.name}</option>
           ))}
         </select>
+      </div>
+
+      {/* Excluded countries — v1.7.0. Skip rotation candidates whose exit
+          country matches any code here. Useful when the operator has a
+          data-limited LTE proxy (e.g. 30GB/month in DE) and doesn't want
+          the circle to burn through that quota. Applies in all modes. */}
+      <div>
+        <label className="flex items-center gap-1 text-xs font-medium text-gray-400 mb-1">
+          {t('Excluded countries', 'Исключить страны')}
+          <InfoTip position="bottom" className="ml-0.5" text={t(
+            'Skip rotation candidates whose exit country matches any of these ISO codes (comma-separated, e.g. "DE,NL"). Useful for data-limited LTE proxies where you don\'t want the circle to burn through a monthly quota.',
+            'Пропускать кандидатов ротации, чья страна выхода совпадает с одним из этих ISO-кодов (через запятую, напр. "DE,NL"). Полезно для LTE-прокси с лимитом трафика, где не хочется, чтобы круг выжег месячный лимит.',
+          )} />
+        </label>
+        <input
+          type="text"
+          value={excludedCountries}
+          onChange={(e) => setExcludedCountries(e.target.value)}
+          placeholder="e.g. DE, NL"
+          className="w-full rounded-sm bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm text-gray-100 font-mono focus:border-brand-500 focus:outline-hidden"
+        />
       </div>
 
       <div className="flex items-center gap-2">
@@ -504,6 +535,19 @@ export function NodeCircles() {
                 <span>
                   Last rotated: {formatLastRotated(circle.last_rotated)}
                 </span>
+                {circle.excluded_countries && (
+                  <span className="flex items-center gap-1" title={t(
+                    'Excluded countries — rotation skips these',
+                    'Исключённые страны — ротация их пропускает',
+                  )}>
+                    <Ban className="h-3 w-3 text-red-400" />
+                    {circle.excluded_countries.split(',').map((cc) => cc.trim()).filter(Boolean).map((cc) => (
+                      <span key={cc} className="font-mono">
+                        {countryFlag(cc) || cc}
+                      </span>
+                    ))}
+                  </span>
+                )}
               </div>
 
               {/* Node chips */}

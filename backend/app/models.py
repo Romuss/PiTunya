@@ -484,6 +484,13 @@ class NodeCircle(SQLModel, table=True):
     # When > 0, rotation filters out candidates with latency_ms > max_latency_ms.
     # Also used by smart rotation: if active node latency > max_latency → rotate.
     max_latency_ms: int = 0
+    # v1.7.0 — exclude proxies from specific countries from rotation.
+    # Comma-separated ISO-3166-1 alpha-2 codes, e.g. "DE,NL". Useful when the
+    # operator has a data-limited LTE proxy in a country and doesn't want the
+    # circle to burn through that quota — candidates whose `country` (exit
+    # identity) matches any code here are skipped during rotation AND excluded
+    # from auto-sync. Empty string = no exclusions (default).
+    excluded_countries: str = ""
 
 
 class DeviceTraffic(SQLModel, table=True):

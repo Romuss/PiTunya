@@ -21,6 +21,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import socket
 from typing import Any, List, Optional
 
@@ -166,6 +167,93 @@ def enrich_name(
     stripped = strip_leading_flag(name)
     flag = flag_emoji(code or "")
     return f"{flag} {stripped}" if flag else stripped
+
+
+# Names that panels ship as generic placeholders — "proxy", "proxy-1",
+# "Proxy 2", blank, "node-N", or just the protocol itself. We consider
+# these "not curated" and safe to enrich/replace with a more informative
+# "<protocol>-<flag>-<addr>:<port>" shape. Anything that looks like a
+# human-picked name ("Tokyo-1", "Frankfurt", "Happ/iOS", …) is kept as-is
+# so we never overwrite a name the operator (or a polite panel) curated.
+_GENERIC_NAME_RE = re.compile(
+    r"^(?:proxy|node|server|socks|vless|vmess|trojan|hysteria|hy2)"
+    r"(?:[\s\-_.]*\d+)?$",
+    re.IGNORECASE,
+)
+_GENERIC_NAME_PATTERNS = (
+    "proxy", "node", "server", "socks", "vless", "vmess", "trojan",
+    "hysteria", "hy2", "",
+)
+
+
+def _is_generic_name(name: str) -> bool:
+    """True if `name` is a placeholder the operator wouldn't miss.
+
+    Matches:
+      * empty string
+      * "proxy", "proxy-1", "Proxy 2", "proxy_3" …
+      * "node", "node-1", "server-2" …
+      * bare protocol name ("vless", "vmess", …)
+      * "vless-1", "trojan-2" …
+    Does NOT match anything that looks like a city, a domain, a panel
+    fingerprint ("Happ/iOS"), or any string with a non-numeric suffix —
+    those are considered curated and left untouched.
+    """
+    if not name or not name.strip():
+        return True
+    if _GENERIC_NAME_RE.match(name.strip()):
+        return True
+    return False
+
+
+def enrich_node_name(
+    *,
+    current_name: str,
+    protocol: str,
+    address: str,
+    port: int,
+) -> str:
+    """Enrich a generic/placeholder node name to '<protocol>-<flag>-<addr>:<port>'.
+
+    This is the subscription-import-level enrichment: it transforms names
+    panels ship as generic placeholders ("proxy", "proxy-1", blank, "node-N")
+    into an informative '<protocol>-<flag>-<addr>:<port>' format using the
+    GeoLite2 mmdb. Curated names ("Tokyo-1", "Frankfurt", "Happ/iOS", …)
+    are kept verbatim — we never overwrite a name the operator (or a polite
+    panel) curated.
+
+    If the mmdb is absent (offline install, pre-GeoData-download) the flag
+    component is omitted and the name still becomes '<protocol>-<addr>:<port>'
+    — better than "proxy-3" any day.
+
+    If `current_name` is NOT a generic placeholder, it is returned unchanged.
+    The caller (subscription refresh) passes every parsed node through this;
+    matching the old behaviour where enrichment only happened at import time.
+    """
+    if not _is_generic_name(current_name):
+        return current_name
+
+    # Resolve the country for this address. `resolve=True` so a hostname
+    # address gets DNS-resolved best-effort (handled at import time, not
+    # inside the flush — a stalled DNS won't block the write here because
+    # the model listener's `keep_on_miss` takes the slack on the actual
+    # row write).
+    code = resolve_country(address, resolve=True)
+    flag = flag_emoji(code or "")
+
+    proto = (protocol or "").lower()
+    addr = address or ""
+    port_str = f":{port}" if port else ""
+
+    # Build the informative name. Flag is included only if we resolved it;
+    # without the flag it's still '<protocol>-<addr>:<port>' which beats
+    # "proxy-3".
+    parts = [proto]
+    if flag:
+        parts.append(flag)
+    parts.append(f"{addr}{port_str}")
+    # Filter out empty parts (e.g. no protocol) and join with dashes.
+    return "-".join(p for p in parts if p)
 
 
 def enrich_parsed_nodes(nodes: List[dict]) -> None:

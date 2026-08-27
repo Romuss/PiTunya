@@ -229,3 +229,91 @@ class TestKeepOnMiss:
         """Import paths keep stripping on a miss — only the write hook and
         the one-off button ask to preserve."""
         assert g.enrich_name("🇺🇸 node", "2.2.2.2") == "node"
+
+
+class TestEnrichNodeName:
+    """`enrich_node_name` is the subscription-import-level enrichment: it
+    transforms generic placeholder names ("proxy", "proxy-1", blank) into an
+    informative '<protocol>-<flag>-<addr>:<port>' format. Curated names are
+    left untouched. This was the bug that caused flags to "fly off" — the
+    function didn't exist, so `from app.core.geoip_lookup import enrich_node_name`
+    in subscriptions.py raised ImportError, got swallowed by a bare except,
+    and no flag enrichment ever happened at import time."""
+
+    def test_generic_name_gets_enriched(self, fake_geoip):
+        result = g.enrich_node_name(
+            current_name="proxy",
+            protocol="vless",
+            address="5.5.5.5",
+            port=443,
+        )
+        assert result == "vless-🇳🇱-5.5.5.5:443"
+
+    def test_proxy_numbered_gets_enriched(self, fake_geoip):
+        result = g.enrich_node_name(
+            current_name="proxy-3",
+            protocol="vmess",
+            address="1.1.1.1",
+            port=80,
+        )
+        assert result == "vmess-🇺🇸-1.1.1.1:80"
+
+    def test_empty_name_gets_enriched(self, fake_geoip):
+        result = g.enrich_node_name(
+            current_name="",
+            protocol="trojan",
+            address="5.5.5.5",
+            port=443,
+        )
+        assert result == "trojan-🇳🇱-5.5.5.5:443"
+
+    def test_bare_protocol_name_gets_enriched(self, fake_geoip):
+        result = g.enrich_node_name(
+            current_name="vless",
+            protocol="vless",
+            address="5.5.5.5",
+            port=443,
+        )
+        assert result == "vless-🇳🇱-5.5.5.5:443"
+
+    def test_curated_name_is_kept_verbatim(self, fake_geoip):
+        """A name that looks human-picked ("Tokyo-1", "Frankfurt") must NOT
+        be overwritten — the operator (or a polite panel) curated it."""
+        result = g.enrich_node_name(
+            current_name="Tokyo-1",
+            protocol="vless",
+            address="5.5.5.5",
+            port=443,
+        )
+        assert result == "Tokyo-1"
+
+    def test_curated_city_name_is_kept(self, fake_geoip):
+        result = g.enrich_node_name(
+            current_name="Frankfurt-Reality",
+            protocol="vless",
+            address="5.5.5.5",
+            port=443,
+        )
+        assert result == "Frankfurt-Reality"
+
+    def test_no_flag_without_db(self):
+        """No mmdb — flag component is omitted, name still gets
+        '<protocol>-<addr>:<port>' which beats 'proxy-3'."""
+        g.reset()
+        result = g.enrich_node_name(
+            current_name="proxy",
+            protocol="vless",
+            address="5.5.5.5",
+            port=443,
+        )
+        assert result == "vless-5.5.5.5:443"
+
+    def test_unknown_ip_no_flag(self, fake_geoip):
+        """IP not in the DB — no flag, but the name is still enriched."""
+        result = g.enrich_node_name(
+            current_name="proxy",
+            protocol="vless",
+            address="2.2.2.2",
+            port=443,
+        )
+        assert result == "vless-2.2.2.2:443"

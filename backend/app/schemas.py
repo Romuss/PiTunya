@@ -886,6 +886,11 @@ class NodeCircleBase(BaseModel):
     # above this threshold. 0 = always rotate (prior behavior).
     min_speed_mbps: float = 0.0
     max_latency_ms: int = 0
+    # v1.7.0 — comma-separated ISO country codes to exclude from rotation.
+    # Candidates whose exit country matches any code here are skipped.
+    # Useful for data-limited LTE proxies where you don't want the circle
+    # to burn through a monthly quota. Empty = no exclusions (default).
+    excluded_countries: str = ""
 
     @field_validator("mode")
     @classmethod
@@ -920,6 +925,7 @@ class NodeCircleUpdate(BaseModel):
     subscription_id: Optional[int] = None
     min_speed_mbps: Optional[float] = None
     max_latency_ms: Optional[int] = None
+    excluded_countries: Optional[str] = None
 
     @field_validator("mode", mode="before")
     @classmethod

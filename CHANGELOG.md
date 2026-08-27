@@ -4,6 +4,37 @@ All notable user-facing changes to PiTun. Full per-release detail lives in the
 [GitHub Releases](https://github.com/DaveBugg/PiTun/releases); this file is the
 committed summary.
 
+## v2.4.0 — 2026-08-27
+
+Fixes broken country-flag enrichment on subscription import and adds a
+per-circle country exclusion feature.
+
+### Fixed
+
+- **Country flags not applied to subscription nodes.** The subscription
+  refresh path imported `enrich_node_name` from `geoip_lookup.py`, but that
+  function did not exist — only `enrich_name` did. The `ImportError` was
+  silently swallowed by a bare `except`, so no country flags were ever
+  prefixed to imported node names. The function is now implemented: generic
+  placeholder names (`proxy`, `proxy-1`, `node-N`, blank) are enriched to
+  `<protocol>-<flag>-<addr>:<port>` using the GeoLite2 mmdb, while curated
+  names (`Tokyo-1`, `Frankfurt`, …) are left untouched.
+
+### Added
+
+- **Per-circle country exclusion.** NodeCircle now has an `excluded_countries`
+  field — a comma-separated list of ISO-3166-1 alpha-2 codes (e.g. `DE,NL`).
+  Rotation candidates whose exit country matches any code here are skipped,
+  and auto-synced nodes from excluded countries are not added to the circle.
+  Use case: an operator with a data-limited LTE proxy (e.g. 30GB/month in DE)
+  can exclude that country so the circle doesn't burn through the quota. The
+  field is editable in the NodeCircles UI and shown with flag badges on the
+  circle card.
+
+### Notes
+
+- Schema migration: alembic head moves from `032` → `033`.
+
 ## v2.2.0 — 2026-08-13
 
 Fixes the fatal xray startup crash (`core: not all dependencies are resolved`)
