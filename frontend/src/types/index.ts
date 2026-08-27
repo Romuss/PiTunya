@@ -748,7 +748,9 @@ export interface NodeCircle {
   // Comma-separated ISO country codes to exclude from rotation (e.g. "DE,NL").
   // Candidates whose exit country matches are skipped. Useful for data-limited
   // LTE proxies where you don't want the circle to burn through a quota.
-  excluded_countries: string
+  // Optional: backend defaults to "" (no exclusions). Marked optional so that
+  // older code paths that don't set it explicitly still type-check.
+  excluded_countries?: string
   current_index: number
   last_rotated?: string
   current_node_name?: string
