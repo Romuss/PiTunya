@@ -404,7 +404,14 @@ export function NodeCircles() {
     },
   })
 
-  const nodeOptions = nodes.map((n) => ({ id: n.id, name: n.name }))
+  // Filter out WireGuard nodes — they're IP tunnels managed by wg-quick,
+  // not xray proxy outbounds. The circle scheduler rotates by swapping xray
+  // outbounds via the gRPC API, which can't touch a WireGuard interface.
+  // Showing them in the selection list would let the operator add a node
+  // that can never be rotated to, producing a silently-broken circle.
+  const nodeOptions = nodes
+    .filter((n) => n.protocol !== 'wireguard')
+    .map((n) => ({ id: n.id, name: n.name }))
 
   const handleSave = (data: NodeCircleCreate) => {
     if (editCircle) {

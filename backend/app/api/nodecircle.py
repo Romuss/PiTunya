@@ -48,24 +48,38 @@ async def _validate_node_ids(
     valid intermediate state — e.g. PATCH clearing all members while
     the operator composes a new set; rejecting that would force them
     to delete + recreate instead).
+
+    v2.4.0 — also rejects WireGuard nodes. The circle scheduler rotates
+    by swapping xray outbounds via the gRPC API, but a WireGuard node is
+    an IP tunnel managed by wg-quick — it's not an xray outbound and
+    can't be dynamically swapped. Allowing it would produce a silently-
+    broken circle that can never rotate to that member.
     """
     if not node_ids:
         return
     rows = (await session.exec(
-        select(Node.id, Node.name, Node.latency_ms).where(Node.id.in_(node_ids))
+        select(Node.id, Node.name, Node.latency_ms, Node.protocol).where(Node.id.in_(node_ids))
     )).all()
-    by_id: dict[int, tuple[Optional[str], Optional[int]]] = {}
+    # by_id now carries (name, latency, protocol)
+    by_id: dict[int, tuple[Optional[str], Optional[int], Optional[str]]] = {}
     for row in rows:
-        nid, nm, lat = (row[0], row[1], row[2]) if not hasattr(row, "id") \
-            else (row.id, row.name, row.latency_ms)
-        by_id[nid] = (nm, lat)
+        if hasattr(row, "id"):
+            nid, nm, lat, proto = row.id, row.name, row.latency_ms, row.protocol
+        else:
+            nid, nm, lat, proto = row[0], row[1], row[2], row[3]
+        by_id[nid] = (nm, lat, proto)
     missing: list[int] = []
     too_slow: list[dict] = []
+    wrong_protocol: list[dict] = []
     for nid in node_ids:
         if nid not in by_id:
             missing.append(nid)
             continue
-        nm, lat = by_id[nid]
+        nm, lat, proto = by_id[nid]
+        # v2.4.0 — reject WireGuard: it's an IP tunnel, not an xray outbound.
+        if proto and proto.lower() == "wireguard":
+            wrong_protocol.append({"id": nid, "name": nm, "protocol": proto})
+            continue
         # v1.5.0 — latency cap is now a WARNING not a hard reject.
         # The operator may want high-latency nodes in the circle (they
         # can be useful as fallback). The smart rotation + best-candidate
@@ -77,14 +91,24 @@ async def _validate_node_ids(
                 "allowed but will be deprioritized by best-candidate rotation",
                 nid, nm, lat, MAX_LATENCY_MS,
             )
-    # Only reject on MISSING nodes (not on slow ones)
-    if missing:
+    # Only reject on MISSING nodes or wrong-protocol (WireGuard) nodes.
+    # High latency is just a warning (see above).
+    if missing or wrong_protocol:
+        parts = []
+        if missing:
+            parts.append(f"missing node ids: {missing}")
+        if wrong_protocol:
+            parts.append(
+                f"unsupported protocol (WireGuard can't be rotated): "
+                f"{[n['name'] for n in wrong_protocol]}"
+            )
         raise HTTPException(
             status_code=400,
             detail={
-                "message": f"missing node ids: {missing} (referenced but not in DB)",
+                "message": "; ".join(parts),
                 "missing": missing,
                 "too_slow": [],
+                "wrong_protocol": wrong_protocol,
             },
         )
 
