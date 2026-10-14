@@ -464,6 +464,9 @@ async def deploy_to_server(
                         await s.flush()
                         new_xui_server_id = xs.id
                     await s.commit()
+                    from app.api.system import refresh_panel_bypass
+                    await refresh_panel_bypass(s)
+
                 final_status = "deployed"
             else:
                 final_status = "deployed_no_uri"
