@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Any, Dict
 from datetime import datetime
 
@@ -1291,6 +1291,58 @@ class DataVersions(BaseModel):
     alembic_rev: Optional[str] = None        # current migration head in the DB
     geoip_mtime: Optional[str] = None        # ISO timestamp of geoip.dat on disk
     geosite_mtime: Optional[str] = None
+
+
+class UpdateCheckResult(BaseModel):
+    """What `/system/update/check` reports. Advisory only — nothing is
+    applied until the operator asks for it."""
+    current: str
+    latest: Optional[str] = None
+    update_available: bool = False
+    # Which route actually reached GitHub: "active node" | "direct" |
+    # "unreachable". Surfaced so the operator can tell "no update" from
+    # "we could not look".
+    network_path: str = "unknown"
+    published_at: Optional[str] = None
+    notes: Optional[str] = None
+    error: Optional[str] = None
+    # True when installing `latest` would REMOVE the in-UI updater —
+    # i.e. a downgrade below the version that introduced it. The box
+    # stays updatable from a shell, which is exactly what the operator
+    # needs to be told before, not after.
+    target_lacks_update_ui: bool = False
+    update_ui_since: str = "1.4.8"
+
+
+class UpdateStartRequest(BaseModel):
+    # Empty means "whatever GitHub calls latest".
+    version: Optional[str] = None
+    # Re-install even when the versions match — the repair path.
+    force: bool = False
+    prerelease: bool = False
+
+
+class UpdateStatus(BaseModel):
+    """Mirror of the agent's status file.
+
+    Written by the host agent, not by us: the update restarts this
+    container, so the only progress channel that outlives it is a file on
+    the shared volume.
+    """
+    state: str = "idle"        # idle|queued|running|done|failed|available|unknown
+    pct: int = 0
+    step: str = ""
+    message: str = ""
+    ok: Optional[bool] = None
+    from_version: Optional[str] = Field(default=None, alias="from")
+    to_version: Optional[str] = Field(default=None, alias="to")
+    updated_at: Optional[str] = None
+    # True while a request is on disk that the agent has not consumed —
+    # if this stays true, the agent is not installed or not running.
+    request_pending: bool = False
+
+    class Config:
+        populate_by_name = True
 
 
 class ModeUpdate(BaseModel):

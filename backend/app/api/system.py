@@ -23,6 +23,9 @@ from app.schemas import (
     SystemStatus,
     SystemVersions,
     ThirdPartyVersions,
+    UpdateCheckResult,
+    UpdateStartRequest,
+    UpdateStatus,
 )
 
 logger = logging.getLogger(__name__)
