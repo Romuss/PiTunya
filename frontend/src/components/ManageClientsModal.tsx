@@ -2,8 +2,9 @@ import { useState } from 'react'
 import * as React from 'react'
 import {
   Users, Plus, RefreshCw, Trash2, Download, Network, Loader2,
-  AlertTriangle, AlertCircle, CheckCircle2, ExternalLink,
+  AlertTriangle, AlertCircle, CheckCircle2, ExternalLink, QrCode,
 } from 'lucide-react'
+import { QRCodeSVG } from 'qrcode.react'
 
 import { serversApi } from '@/api/client'
 import { ModalShell } from '@/components/ModalShell'
@@ -58,6 +59,12 @@ export function ManageClientsModal({
 }) {
   const t = useT()
   const confirm = useConfirm()
+  // QR state — the WireGuard .conf rendered as a QR code for mobile
+  // import (the WireGuard app scans it directly; no file handling).
+  const [qrClient, setQrClient] = useState<DeploymentClient | null>(null)
+  const [qrConf, setQrConf] = useState('')
+  const [qrLoading, setQrLoading] = useState(false)
+  const [qrError, setQrError] = useState('')
 
   const { data, isLoading, error, refetch, isRefetching } = useDeploymentClients(server.id)
   const clients = data?.clients ?? []
@@ -154,6 +161,27 @@ export function ManageClientsModal({
     } catch (err: unknown) {
       setActionError(extractAxiosError(err))
     }
+  }
+
+  const onShowQr = async (c: DeploymentClient) => {
+    setQrClient(c)
+    setQrConf('')
+    setQrError('')
+    setQrLoading(true)
+    try {
+      const conf = await serversApi.getClientConf(server.id, c.name, direct)
+      setQrConf(conf.wg_conf)
+    } catch (err: unknown) {
+      setQrError(extractAxiosError(err))
+    } finally {
+      setQrLoading(false)
+    }
+  }
+
+  const onQrClose = () => {
+    setQrClient(null)
+    setQrConf('')
+    setQrError('')
   }
 
   return (
@@ -313,11 +341,23 @@ export function ManageClientsModal({
                     onRemove={() => onRemove(c)}
                     onExport={() => onExport(c)}
                     onDownload={() => onDownloadConf(c)}
+                    onShowQr={() => onShowQr(c)}
                   />
                 ))}
               </tbody>
             </table>
           </div>
+        )}
+
+        {/* QR modal — the .conf text as a scannable code */}
+        {qrClient && (
+          <WgConfQrModal
+            clientName={qrClient.name}
+            conf={qrConf}
+            loading={qrLoading}
+            error={qrError}
+            onClose={onQrClose}
+          />
         )}
 
         {/* Footer */}
@@ -345,6 +385,7 @@ function ClientRow({
   onRemove,
   onExport,
   onDownload,
+  onShowQr,
 }: {
   client: DeploymentClient
   busy: boolean
@@ -352,6 +393,7 @@ function ClientRow({
   onRemove: () => void
   onExport: () => void
   onDownload: () => void
+  onShowQr: () => void
 }) {
   const t = useT()
   const exportedCount = client.exported_node_ids.length
@@ -375,6 +417,12 @@ function ClientRow({
       </td>
       <td className="px-3 py-2">
         <div className="flex justify-end gap-1">
+          <IconBtn
+            onClick={onShowQr}
+            title={t('Show QR code', 'Показать QR-код')}
+            icon={QrCode}
+            disabled={isOrphan}
+          />
           <IconBtn
             onClick={onDownload}
             title={t('Download .conf', 'Скачать .conf')}
@@ -454,6 +502,65 @@ function IconBtn({
         <Icon className="h-4 w-4" />
       )}
     </button>
+  )
+}
+
+
+function WgConfQrModal({
+  clientName,
+  conf,
+  loading,
+  error,
+  onClose,
+}: {
+  clientName: string
+  conf: string
+  loading: boolean
+  error: string
+  onClose: () => void
+}) {
+  const t = useT()
+  return (
+    <ModalShell onClose={onClose} labelledBy="wg-qr-title">
+      <div className="w-full max-w-sm">
+        <h2 id="wg-qr-title" className="text-lg font-semibold text-gray-100 pr-8 mb-1">
+          {t('WireGuard QR', 'WireGuard QR')}
+        </h2>
+        <p className="text-xs text-gray-500 mb-4 font-mono">{clientName}</p>
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 py-16 text-sm text-gray-500">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {t('Loading conf…', 'Загрузка конфига…')}
+          </div>
+        ) : error ? (
+          <div className="rounded-lg border border-red-200 dark:border-red-700/40 bg-red-50 dark:bg-red-900/10 px-3 py-3 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div className="wrap-break-word">{error}</div>
+          </div>
+        ) : (
+          <>
+            <div className="flex justify-center bg-white p-4 rounded-lg">
+              <QRCodeSVG value={conf} size={280} level="M" />
+            </div>
+            <p className="text-xs text-gray-500 mt-3 text-center">
+              {t(
+                'Scan with the WireGuard app (Add tunnel → scan QR code).',
+                'Отсканируйте приложением WireGuard (Добавить туннель → сканировать QR-код).',
+              )}
+            </p>
+          </>
+        )}
+        <div className="flex justify-end pt-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border border-gray-700 hover:bg-gray-800 px-3 py-1.5 text-sm text-gray-300 transition-colors"
+          >
+            {t('Close', 'Закрыть')}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
   )
 }
 

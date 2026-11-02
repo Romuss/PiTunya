@@ -4,7 +4,7 @@ import {
   Layers, Loader2, AlertTriangle, ExternalLink, Trash2, Plus, RefreshCw,
   ShieldCheck, ShieldAlert, Server as ServerIcon, KeyRound, Copy, Check,
   ChevronRight, ChevronDown, Upload, Shuffle, UploadCloud, QrCode, Radar,
-  Link2, Network,
+  Network,
 } from 'lucide-react'
 
 import { xuiApi, diagnosticsApi, type SniScanResult } from '@/api/client'
