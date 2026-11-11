@@ -1215,7 +1215,7 @@ export INSTALL_PHP={shlex.quote(install_php_value)}
 export SSH_PORT={shlex.quote(ssh_port_value)}
 {template_env_lines}
 
-curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/scripts/setup-naive-server.sh \\
+curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/scripts/setup-naive-server.sh \\
   | sudo -E bash
 """
 
@@ -1348,7 +1348,7 @@ set -euo pipefail
 
 {exports_block}
 
-curl -fsSL https://raw.githubusercontent.com/DaveBugg/PiTun/master/scripts/setup-wireguard-server.sh \\
+curl -fsSL https://raw.githubusercontent.com/Romuss/PiTunya/master/scripts/setup-wireguard-server.sh \\
   -o /tmp/setup-wireguard-server.sh
 chmod +x /tmp/setup-wireguard-server.sh
 sudo -E bash /tmp/setup-wireguard-server.sh "$PITUN_WG_SUBCOMMAND"
