@@ -17,8 +17,26 @@ logger = logging.getLogger(__name__)
 _CHECK_INTERVAL = 15
 
 
+async def _get_active_node(session) -> Optional[Node]:
+    """Resolve the system's current active node from Settings, or None.
+
+    Used by smart-skip to check the ACTUAL active node's health rather than
+    trusting the circle's `current_index`, which can drift from it.
+    """
+    setting = (await session.exec(
+        select(DBSettings).where(DBSettings.key == "active_node_id")
+    )).first()
+    if not setting or not setting.value:
+        return None
+    try:
+        return await session.get(Node, int(setting.value))
+    except (ValueError, TypeError):
+        return None
+
+
 class CircleScheduler:
     def __init__(self) -> None:
+        self._speed_tokens: dict[int, float] = {}
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._next_rotate: dict[int, datetime] = {}
@@ -74,9 +92,6 @@ class CircleScheduler:
                     "interval_max": c.interval_max,
                     "current_index": c.current_index,
                     "last_rotated": c.last_rotated,
-                    "min_speed_mbps": getattr(c, "min_speed_mbps", 0) or 0,
-                    "max_latency_ms": getattr(c, "max_latency_ms", 0) or 0,
-                    "excluded_countries": getattr(c, "excluded_countries", "") or "",
                 })
 
         live_ids = {cd["id"] for cd in circle_data}
@@ -107,84 +122,7 @@ class CircleScheduler:
                     self._next_rotate[cid] = now
 
             if now >= self._next_rotate[cid]:
-                # ── Smart rotation guard (v1.5.0, revised v2.4.0) ─────────
-                # Skip rotation when the active node is healthy AND the
-                # operator explicitly opted into smart-skip (min_speed_mbps > 0):
-                #   * is_online = True
-                #   * latency_ms <= max_latency_ms (or 80ms default)
-                #   * speed_mbps >= min_speed_mbps
-                #
-                # v2.4.0 fix: previously, min_speed_mbps=0 (default) still
-                # skipped rotation whenever the node was online + low-latency.
-                # This defeated the anti-DPI purpose of the circle — it never
-                # rotated away from a healthy node, so traffic always egressed
-                # from the same exit point. Now:
-                #   * min_speed_mbps > 0 → smart-skip is ACTIVE (stay on fast
-                #     nodes, only rotate when degraded — the operator chose this)
-                #   * min_speed_mbps = 0 → smart-skip is OFF: rotate on schedule
-                #     regardless of health (anti-DPI rotation is the point)
-                min_speed = cd.get("min_speed_mbps", 0) or 0
-                node_ids = cd["node_ids"]
-                should_skip = False
-
-                # Bug fix (v1.5.0): check the ACTUAL active node (from
-                # Settings.active_node_id), NOT node_ids[current_index].
-                # The circle's current_index points to the last node the
-                # circle itself picked — but the operator may have
-                # manually switched the active node via Dashboard, or
-                # failover set a different one. The smart rotation must
-                # check whichever node traffic is ACTUALLY going through.
-                active_id_str = (await session.exec(
-                    select(DBSettings).where(DBSettings.key == "active_node_id")
-                )).first()
-                active_id = None
-                if active_id_str and active_id_str.value:
-                    try:
-                        active_id = int(active_id_str.value)
-                    except (ValueError, TypeError):
-                        pass
-
-                if active_id is not None and active_id in node_ids and min_speed > 0:
-                    # v2.4.0 — only check health for smart-skip when the
-                    # operator explicitly set min_speed_mbps > 0. With the
-                    # default (0), the circle rotates on schedule regardless
-                    # — anti-DPI rotation requires actually changing exit points.
-                    active_node = (await session.exec(
-                        select(Node).where(Node.id == active_id)
-                    )).first()
-                    if active_node is not None and active_node.is_online:
-                        latency_limit = cd.get("max_latency_ms", 0) or 0
-                        if latency_limit > 0:
-                            latency_ok = (active_node.latency_ms or 999) <= latency_limit
-                        else:
-                            latency_ok = (active_node.latency_ms or 999) <= 80
-                        speed_ok = (active_node.speed_mbps or 0) >= min_speed
-                        if latency_ok and speed_ok:
-                            should_skip = True
-                            logger.debug(
-                                "NodeCircle %d: smart-skip — active node "
-                                "%d (%s) is healthy (%dms, online, %.1f MB/s, "
-                                "min_speed=%.1f)",
-                                cid, active_id, active_node.name,
-                                active_node.latency_ms or 0,
-                                active_node.speed_mbps or 0,
-                                min_speed,
-                            )
-                elif active_id is not None and active_id not in node_ids:
-                    # Active node is NOT in this circle — the operator
-                    # manually picked a different node. Don't interfere;
-                    # let the circle rotate on its own schedule.
-                    pass
-                else:
-                    # No active node set at all — let the circle rotate
-                    pass
-
-                if should_skip:
-                    interval = self._calc_interval(cd)
-                    self._next_rotate[cid] = now + timedelta(minutes=interval)
-                    continue
-
-                await self.rotate_circle(cid)
+                await self.rotate_circle(cid, from_scheduler=True)
                 interval = self._calc_interval(cd)
                 self._next_rotate[cid] = now + timedelta(minutes=interval)
                 logger.debug("NodeCircle %d: next rotation in %.1f minutes", cid, interval)
@@ -210,7 +148,114 @@ class CircleScheduler:
     # normally (no permanent broken state).
     _ROTATE_DEADLINE_S = 20.0
 
-    async def rotate_circle(self, circle_id: int) -> bool:
+    # Optional second stage of the pre-ping: a real HTTP 204 round trip through
+    # a throwaway xray, because a node whose TCP port answers can still have a
+    # dead upstream. Bounded so a rotation (and the failover that waits on it)
+    # stays short, and skipped for WireGuard, which tolerates only one session.
+    _HTTP_PROBE_BUDGET_S = 8.0
+    _HTTP_PROBE_MAX_CANDIDATES = 3
+    # "best" mode with a speed target. Whatever intervals and target a user sets,
+    # the cost stays bounded and the behaviour stays sensible:
+    #  * a rotation speed-tests at most _SPEED_CHECKS_MAX nodes and stops testing
+    #    after _SPEED_BUDGET_S seconds (the rest is decided on what is known);
+    #  * a GOOD measurement is trusted for about one interval (clamped), so each
+    #    rotation re-checks the nodes it is about to use;
+    #  * a SLOW verdict is trusted far longer (a slow node seldom becomes fast), so
+    #    the slow nodes with a good ping are walked past for free and the search
+    #    reaches the first good one within a few rotations;
+    #  * when the budget runs out before a good node is found, an untested node is
+    #    preferred over a known-slow one (it may be fine, and it gets measured
+    #    next time); a target nobody reaches ends on the fastest measured node.
+    #  * on top of all that, a per-circle budget: every rotation earns
+    #    _SPEED_REFILL tests (up to _SPEED_BURST banked), so over any stretch of time
+    #    the average cost is at most that many tests per rotation, whatever the
+    #    intervals, the pool or the target (a target nobody reaches cannot turn
+    #    into a test storm). The first rotation after a start may spend the burst.
+    _SPEED_CHECKS_MAX = 6
+    _SPEED_REFILL = 2
+    _SPEED_BURST = 8
+    _SPEED_BUDGET_S = 120
+    _SPEED_FRESH_MIN_S = 180
+    _SPEED_FRESH_MAX_S = 1800
+    _SPEED_SLOW_FACTOR = 8
+    _SPEED_SLOW_MIN_S = 1800
+    _SPEED_SLOW_MAX_S = 14400
+    _HTTP_PROBE_EXTRA_DEADLINE_S = 30.0
+
+    @staticmethod
+    async def _http_probe_enabled() -> bool:
+        async with AsyncSession(get_async_engine()) as session:
+            row = (await session.exec(
+                select(DBSettings).where(DBSettings.key == "circle_http_probe")
+            )).first()
+        return row is None or row.value.lower() != "false"
+
+    async def _speed_verdict(
+        self, cand: dict, target_mbps: float, fresh_s: int, slow_s: int, *, allow_test: bool,
+    ) -> tuple[str, Optional[float], bool]:
+        """("ok" | "slow" | "unknown", mbps, ran_a_test) for one candidate.
+
+        A good measurement younger than `fresh_s`, or a slow one younger than
+        `slow_s`, is used as it is; an older one is replaced by a live test while
+        the rotation still has tests to spend. With none left the stored
+        (possibly stale) value decides, and a node never measured is "unknown"."""
+        from app.core.speedtest import apply_exit, speedtest_node as _speedtest
+
+        stored = cand.get("speed_mbps")
+        at = cand.get("speed_tested_at")
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(tz=timezone.utc) - at).total_seconds() if at else None
+        if stored is not None and age_s is not None:
+            good = stored >= target_mbps
+            if age_s < (fresh_s if good else slow_s):
+                return ("ok" if good else "slow", float(stored), False)
+        if allow_test:
+            try:
+                async with AsyncSession(get_async_engine()) as s:
+                    node = await s.get(Node, cand["id"])
+                    if node is None:
+                        return ("unknown", None, False)
+                    result = await _speedtest(node)
+                    mbps = result.get("download_mbps")
+                    if mbps is not None:
+                        node.speed_mbps = float(mbps)
+                        mx = result.get("max_mbps")
+                        node.speed_max_mbps = float(mx) if mx is not None else None
+                        node.speed_tested_at = datetime.now(tz=timezone.utc)
+                    apply_exit(node, result)
+                    await s.commit()
+            except Exception as exc:  # noqa: BLE001 - a failed test must not stop a rotation
+                logger.warning("NodeCircle speed check of node %s failed: %s", cand.get("id"), exc)
+                return ("unknown", None, True)
+            if mbps is None:
+                return ("unknown", None, True)
+            return ("ok" if float(mbps) >= target_mbps else "slow", float(mbps), True)
+        if stored is not None:
+            return ("ok" if stored >= target_mbps else "slow", float(stored), False)
+        return ("unknown", None, False)
+
+    async def _http_probe(self, node_id: int) -> tuple[bool, str]:
+        """(ok, detail). A fault in the probe itself counts as OK: it must not
+        keep a node out of the rotation."""
+        from app.core.speedtest import reachability_check
+        try:
+            async with AsyncSession(get_async_engine()) as session:
+                node = await session.get(Node, node_id)
+                if node is None:
+                    return True, ""
+                res = await asyncio.wait_for(
+                    reachability_check(node), timeout=self._HTTP_PROBE_BUDGET_S,
+                )
+        except asyncio.TimeoutError:
+            return False, "timed out"
+        except Exception as exc:  # noqa: BLE001
+            from app.core import error_log
+            error_log.record("circle.http_probe", exc, node_id=node_id)
+            return True, ""
+        return bool(res.get("ok")), str(res.get("detail") or "")
+
+    async def rotate_circle(self, circle_id: int, from_scheduler: bool = False) -> bool:
         """Public entry point — wraps the actual rotation in a per-circle
         lock and a hard timeout.
 
@@ -228,18 +273,24 @@ class CircleScheduler:
         """
         lock = self._get_rotate_lock(circle_id)
         async with lock:
+            deadline = self._ROTATE_DEADLINE_S
             try:
-                async with asyncio.timeout(self._ROTATE_DEADLINE_S):
-                    return await self._do_rotate(circle_id)
+                if await self._http_probe_enabled():
+                    deadline += self._HTTP_PROBE_EXTRA_DEADLINE_S
+            except Exception:  # noqa: BLE001 — never block a rotation on a settings read
+                pass
+            try:
+                async with asyncio.timeout(deadline):
+                    return await self._do_rotate(circle_id, from_scheduler)
             except asyncio.TimeoutError:
                 logger.warning(
                     "NodeCircle %d: rotation exceeded %.0fs deadline — aborted, "
                     "will retry on next tick",
-                    circle_id, self._ROTATE_DEADLINE_S,
+                    circle_id, deadline,
                 )
                 return False
 
-    async def _do_rotate(self, circle_id: int) -> bool:
+    async def _do_rotate(self, circle_id: int, from_scheduler: bool = False) -> bool:
         """Pre-ping + rotate to first alive candidate.
 
         Returns True iff `active_node_id` was actually changed. False on
@@ -321,21 +372,52 @@ class CircleScheduler:
             current_idx = circle.current_index if circle.current_index < len(node_ids) else 0
             prev_node_id = node_ids[current_idx]
 
-            # v1.5.0 — pick the BEST candidate by quality score instead
-            # of random/sequential walk. Quality = online + latency + speed.
-            # Sort all candidates by: is_online DESC, latency ASC NULLS LAST,
-            # speed_mbps DESC NULLS LAST. Then probe the TOP candidate first.
-            # If it's alive → switch. If not → probe next. This way the
-            # circle always tries the best available node first.
-            all_candidates: list[dict] = []
-            for idx in range(len(node_ids)):
-                if idx == current_idx:
-                    continue  # skip current — we're rotating away from it
+            max_latency_ms = circle.max_latency_ms or 0
+            min_speed_mbps = circle.min_speed_mbps or 0.0
+            interval_min_s = int(circle.interval_min or 5) * 60
+
+            # Smart-skip: on a SCHEDULED tick with a latency budget set, don't
+            # churn off an active node that's still online and within budget.
+            # Manual "rotate now" and failover pass from_scheduler=False and
+            # always rotate. Untested latency (None) never blocks a rotation.
+            if from_scheduler and max_latency_ms > 0:
+                active = await _get_active_node(session)
+                if (active is not None and active.is_online
+                        and active.latency_ms is not None
+                        and active.latency_ms <= max_latency_ms):
+                    logger.debug(
+                        "NodeCircle %d: active node %d healthy (%dms <= %dms) — skip rotation",
+                        circle_id, active.id, active.latency_ms, max_latency_ms,
+                    )
+                    return False
+
+            # Build candidate order: random/best collect all, sequential walks
+            # forward. "best" is ordered by quality after the filter pass below.
+            if circle.mode in ("random", "best"):
+                order = [i for i in range(len(node_ids)) if i != current_idx]
+                if circle.mode == "random":
+                    random.shuffle(order)
+            else:  # sequential — walk forward from current+1, wrap, skip current
+                order = [(current_idx + i) % len(node_ids) for i in range(1, len(node_ids))]
+
+            candidates: list[dict] = []
+            for idx in order:
                 cand = await session.get(Node, node_ids[idx])
                 if not cand or not cand.enabled:
                     continue
+                # Candidate filters (0 = disabled). Reject only on KNOWN-bad
+                # values — an untested node (None) gets the benefit of the
+                # doubt so a fresh circle isn't left with zero candidates.
+                if (max_latency_ms > 0 and cand.latency_ms is not None
+                        and cand.latency_ms > max_latency_ms):
+                    continue
+                # In "best" the live check below decides: a stale slow reading
+                # must not keep a node out of ever being measured again.
+                if (circle.mode != "best" and min_speed_mbps > 0 and cand.speed_mbps is not None
+                        and cand.speed_mbps < min_speed_mbps):
+                    continue
                 addr, port, udp = await health_checker._resolve_probe_target(session, cand)
-                all_candidates.append({
+                candidates.append({
                     "idx": idx,
                     "id": cand.id,
                     "name": cand.name,
@@ -344,100 +426,19 @@ class CircleScheduler:
                     "udp": udp,
                     "protocol": cand.protocol,
                     "internal_port": cand.internal_port,
-                    "is_online": cand.is_online,
                     "latency_ms": cand.latency_ms,
                     "speed_mbps": cand.speed_mbps,
-                    "country": getattr(cand, "country", None),
+                    "speed_tested_at": cand.speed_tested_at,
                 })
 
-            # v1.5.0 — apply quality filters to rotation candidates.
-            # When min_speed_mbps > 0: ONLY consider nodes with measured
-            # speed >= threshold. Nodes with speed_mbps = None (untested)
-            # are REJECTED — an untested node can't be "best" when the
-            # operator explicitly set a speed requirement.
-            # When max_latency_ms > 0: filter out nodes with latency >
-            # threshold. Nodes with latency_ms = None (untested) are
-            # allowed (latency check is less strict than speed check).
-            # If ALL candidates fail the filter → keep them all (better
-            # a slow/untested node than no proxy at all).
-            min_speed_threshold = getattr(circle, 'min_speed_mbps', 0) or 0
-            max_latency_threshold = getattr(circle, 'max_latency_ms', 0) or 0
-            excluded_raw = getattr(circle, 'excluded_countries', '') or ''
-            # Parse "DE, NL, us" → {"DE","NL","US"} (uppercased, stripped,
-            # empty discarded). Stored as a comma-separated string in the
-            # DB for human-editability; compared as a set of 2-letter codes.
-            excluded_set: set[str] = {
-                cc.strip().upper()
-                for cc in excluded_raw.split(',')
-                if cc.strip() and len(cc.strip()) == 2 and cc.strip().isalpha()
-            }
-
-            # v1.7.0 — exclude candidates whose exit country is in the
-            # operator's block-list. The use case is data-limited LTE
-            # proxies: the operator has e.g. 30GB/month in DE and doesn't
-            # want the circle to burn through it. `country` is the exit
-            # identity observed by the speed test (authoritative), not an
-            # inference from the address — so a chained node whose last
-            # hop exits in DE is correctly excluded.
-            if excluded_set:
-                filtered = [
-                    c for c in all_candidates
-                    if not (c.get('country') and c['country'].upper() in excluded_set)
-                ]
-                # Guard: if ALL candidates are excluded (e.g. every node
-                # exits in a blocked country), keep them all — better to
-                # rotate through a blocked country than to have no proxy
-                # at all. The operator should fix their config instead.
-                if filtered:
-                    all_candidates = filtered
-                else:
-                    logger.warning(
-                        "NodeCircle %d: ALL candidates are in excluded_countries "
-                        "(%s) — keeping them to avoid losing proxy",
-                        circle_id, excluded_raw,
-                    )
-
-            if min_speed_threshold > 0:
-                filtered = [c for c in all_candidates if c['speed_mbps'] is not None and c['speed_mbps'] >= min_speed_threshold]
-                if filtered:
-                    all_candidates = filtered
-
-            if max_latency_threshold > 0:
-                filtered = [c for c in all_candidates if (c['latency_ms'] is None or c['latency_ms'] <= max_latency_threshold)]
-                if filtered:
-                    all_candidates = filtered
-
-            # Sort by quality: online first, then lowest latency, then highest speed
-            all_candidates.sort(key=lambda c: (
-                not c["is_online"],          # online = False sorts after online = True
-                c["latency_ms"] or 999999,   # None latency = worst
-                -(c["speed_mbps"] or 0),     # higher speed = better (negate for asc sort)
-            ))
-
-            # v1.5.0 — three modes:
-            #   best: shuffle within top-3 healthy candidates for anti-DPI variety
-            #   random: shuffle within top-3 best for anti-DPI variety
-            #   sequential: best-first order (same as best, but user chose it)
-            #
-            # v2.4.0 fix — "best" mode used to be strict best-first, which
-            # meant the circle always picked the SAME top-2 nodes (current
-            # excluded, next-best picked, then back). With 3+ nodes the 3rd+
-            # were never reached. Now both "best" and "random" shuffle within
-            # their top candidates: this distributes traffic across more exit
-            # points (better anti-DPI) while still preferring healthy/low-
-            # latency nodes. "sequential" stays deterministic per its name.
-            # The threshold is now >2 (not >3): with exactly 3 candidates,
-            # shuffling top-3 gives real variety instead of always the
-            # same order.
-            if circle.mode in ("best", "random") and len(all_candidates) > 2:
-                top_count = min(3, len(all_candidates))
-                top_n = all_candidates[:top_count]
-                random.shuffle(top_n)
-                order_pool = top_n + all_candidates[top_count:]
-            else:
-                order_pool = all_candidates
-
-            candidates = order_pool
+            # "best" mode: probe in quality order — lowest latency first, then
+            # highest speed. Untested (None) sort last so known-good candidates
+            # are tried before unknowns.
+            if circle.mode == "best":
+                candidates.sort(key=lambda c: (
+                    c["latency_ms"] if c["latency_ms"] is not None else 10 ** 9,
+                    -(c["speed_mbps"] or 0.0),
+                ))
 
             circle_name = circle.name
             circle_mode = circle.mode
@@ -463,12 +464,76 @@ class CircleScheduler:
         selected: Optional[dict] = None
         failed: list[tuple[str, str]] = []  # (node_name, error_string)
 
+        try:
+            http_probe = await self._http_probe_enabled()
+        except Exception:  # noqa: BLE001
+            http_probe = False
+        http_probes_left = self._HTTP_PROBE_MAX_CANDIDATES
+        tcp_only: Optional[dict] = None  # first candidate that passed TCP but not HTTP
+
+        # Speed target ("best" with a floor set): the first candidate by ping
+        # that really delivers it wins. A slow one is remembered as a fallback,
+        # one that could not be measured likewise.
+        speed_gate = circle_mode == "best" and min_speed_mbps > 0
+        speed_tokens = min(
+            float(self._SPEED_BURST),
+            self._speed_tokens.get(circle_id, float(self._SPEED_BURST)) + self._SPEED_REFILL,
+        )
+        speed_checks_left = min(self._SPEED_CHECKS_MAX, int(speed_tokens)) if speed_gate else 0
+        speed_checks_start = speed_checks_left
+        fresh_s = max(self._SPEED_FRESH_MIN_S, min(self._SPEED_FRESH_MAX_S, interval_min_s))
+        slow_s = max(self._SPEED_SLOW_MIN_S, min(self._SPEED_SLOW_MAX_S, fresh_s * self._SPEED_SLOW_FACTOR))
+        speed_deadline = asyncio.get_event_loop().time() + self._SPEED_BUDGET_S
+        slow: list[tuple[float, dict]] = []
+        unmeasured: Optional[dict] = None
+
         for cand in candidates:
             # Probe with single retry — `_probe_with_retry` catches
             # transient SYN drops / brief packet loss that would
             # otherwise mark a healthy node as dead and cost us a
             # missed rotation tick.
             result = await _probe_with_retry(cand)
+
+            if (
+                result.get("is_online") and http_probe and http_probes_left > 0
+                and cand.get("protocol") != "wireguard"
+            ):
+                http_probes_left -= 1
+                http_ok, http_detail = await self._http_probe(cand["id"])
+                if not http_ok:
+                    if tcp_only is None:
+                        tcp_only = cand
+                    result = {
+                        "is_online": False,
+                        "error": f"port answers but no internet through the node ({http_detail or 'no response'})",
+                    }
+
+            if result.get("is_online") and speed_gate:
+                verdict, mbps, ran = await self._speed_verdict(
+                    cand, min_speed_mbps, fresh_s, slow_s,
+                    allow_test=speed_checks_left > 0 and asyncio.get_event_loop().time() < speed_deadline,
+                )
+                if ran:
+                    speed_checks_left -= 1
+                if verdict == "slow":
+                    slow.append((mbps or 0.0, cand))
+                    logger.info(
+                        "NodeCircle '%s': candidate '%s' (id=%d) is %.1f Mbit/s, below the %.0f target; trying next",
+                        circle_name, cand["name"], cand["id"], mbps or 0.0, min_speed_mbps,
+                    )
+                    await _safe_event(
+                        category="circle.candidate_slow",
+                        severity="info",
+                        title=f"Circle '{circle_name}': '{cand['name']}' below the speed target",
+                        details=f"{(mbps or 0.0):.1f} Mbit/s against a target of {min_speed_mbps:.0f}. Trying the next node by ping.",
+                        entity_id=cand["id"],
+                        dedup_window_sec=300,
+                    )
+                    continue
+                if verdict == "unknown":
+                    if unmeasured is None:
+                        unmeasured = cand
+                    continue
 
             if result.get("is_online"):
                 selected = cand
@@ -487,6 +552,56 @@ class CircleScheduler:
                 details=f"Probe error: {err_msg}. Trying next candidate.",
                 entity_id=cand["id"],
                 dedup_window_sec=120,
+            )
+
+        if speed_gate:
+            self._speed_tokens[circle_id] = speed_tokens - (speed_checks_start - speed_checks_left)
+
+        if not selected and speed_gate and (slow or unmeasured is not None):
+            # Nobody reached the target. Better the fastest node that was measured
+            # than a circle that does not move.
+            if unmeasured is not None:
+                selected = unmeasured
+                reason = (
+                    f"'{selected['name']}' has no speed measurement yet (the test budget ran out "
+                    "or the test failed), taken on its ping"
+                )
+            else:
+                best_mbps, selected = max(slow, key=lambda x: x[0])
+                reason = f"the fastest measured was '{selected['name']}' at {best_mbps:.1f} Mbit/s"
+            logger.warning(
+                "NodeCircle '%s' (id=%d): no candidate reached %.0f Mbit/s; %s",
+                circle_name, circle_id, min_speed_mbps, reason,
+            )
+            await _safe_event(
+                category="circle.speed_target_missed",
+                severity="warning",
+                title=f"Circle '{circle_name}': no node reached {min_speed_mbps:.0f} Mbit/s",
+                details=f"Rotated anyway: {reason}.",
+                entity_id=circle_id,
+                dedup_window_sec=600,
+            )
+
+        if not selected and tcp_only is not None:
+            # Every TCP-alive candidate failed the HTTP check. That is more
+            # likely a blocked test endpoint than a fleet of dead nodes, so
+            # keep rotating rather than freeze the circle.
+            selected = tcp_only
+            logger.warning(
+                "NodeCircle '%s' (id=%d): no candidate passed the HTTP check; "
+                "falling back to '%s' on its TCP result",
+                circle_name, circle_id, tcp_only["name"],
+            )
+            await _safe_event(
+                category="circle.http_probe_fallback",
+                severity="warning",
+                title=f"Circle '{circle_name}': HTTP check failed everywhere",
+                details=(
+                    f"Rotated to '{tcp_only['name']}' on its TCP check alone. If this "
+                    "repeats, the test endpoint may be blocked — see Settings → circle HTTP check."
+                ),
+                entity_id=circle_id,
+                dedup_window_sec=1800,
             )
 
         if not selected:

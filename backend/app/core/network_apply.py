@@ -244,9 +244,8 @@ def create_backup(state: nc.NetworkState) -> Backup:
 
 def list_backups() -> List[dict]:
     """Return all stored backups, newest first. The full ``files``
-    blob is omitted from the listing — only metadata, so the API
-    can show "Backup #5 from 2026-05-20 14:22, manager: ifupdown,
-    iface enp1s0, gateway 192.168.1.3" without dumping kilobytes."""
+    blob is omitted — only metadata, so the API can render a one-line
+    summary per backup without dumping kilobytes."""
     out: List[dict] = []
     for path in sorted(_list_backup_filenames(), reverse=True):
         content = nc.host_read_file(path)
@@ -480,11 +479,10 @@ def _apply_ifupdown(
         # dhcpcd refreshes (lease renewal, daemon restart, reboot on
         # systems where dhcpcd-base ships even when ifupdown owns the
         # interface), the resolv.conf we just wrote gets clobbered to
-        # an empty header and the host loses DNS.
-        # Observed in production on 192.168.1.4 during 1.3.3 burn-in:
-        # static IP applied via PiTun → resolv.conf populated →
-        # subsequent reboot → dhcpcd regenerated empty resolv.conf →
-        # every API endpoint touching getaddrinfo wedged.
+        # an empty header and the host loses DNS. The failure chain is:
+        # static IP applied → resolv.conf populated → reboot → dhcpcd
+        # regenerates it empty → every endpoint touching getaddrinfo
+        # wedges.
         nc.host_run(["tee", "/etc/resolv.conf.head"], input_data=resolv, timeout=5)
         logger.info("ifupdown: resolv.conf + .head -> %r", final_dns)
 
@@ -571,6 +569,18 @@ def apply(req: ApplyRequest) -> Backup:
     dns = _validate_dns_list(req.dns) if req.dns is not None else None
 
     state = nc.read_state()
+
+    # Never let the panel (re)introduce a routing self-loop: a default
+    # route via the box's own IP hands every off-LAN packet back to us.
+    # This is the exact footgun the Network page exists to fix, so
+    # refusing it here — with a clear message — is the whole point.
+    if gw is not None and state.ip and gw == state.ip:
+        raise NetworkApplyError(
+            f"Gateway {gw} is this host's own IP — that's a routing "
+            "self-loop, not a gateway. Use your ISP router's address "
+            "(usually 192.168.x.1)."
+        )
+
     if state.manager not in ("ifupdown", "networkmanager"):
         raise NetworkApplyError(
             f"Apply not supported on manager {state.manager!r} yet. "
@@ -669,6 +679,19 @@ def probe_gateway(ip: str) -> dict:
         return {
             "reachable": False,
             "detail": "Cannot validate — current host IP/CIDR not detected.",
+        }
+
+    # The box's own address is never a valid gateway — probing it would
+    # "succeed" (we always answer ourselves) and mask the self-loop the
+    # operator is trying to escape. Reject it explicitly instead.
+    if ip == state.ip:
+        return {
+            "reachable": False,
+            "detail": (
+                f"{ip} is THIS PiTun's own address, not a gateway. A gateway "
+                "must be a different device — your ISP router (usually "
+                "192.168.x.1)."
+            ),
         }
     try:
         candidate_net = ipaddress.ip_network(f"{state.ip}/{state.cidr}", strict=False)

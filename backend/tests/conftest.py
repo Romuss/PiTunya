@@ -14,7 +14,7 @@ os.environ["XRAY_BINARY"] = "/bin/false"
 
 from app.models import (
     User, Node, RoutingRule, Subscription, DNSRule, BalancerGroup,
-    Settings, NodeCircle, Device, DNSQueryLog,
+    Settings, NodeCircle, Device, DNSQueryLog, UserAgentTemplate,
 )
 from app.core.auth import hash_password, create_access_token
 
@@ -29,6 +29,7 @@ from app.core.auth import hash_password, create_access_token
 for _name in (
     "metrics_collector", "sub_scheduler", "circle_scheduler",
     "device_scanner", "naive_supervisor", "nftables",
+    "autocheck_scheduler",
 ):
     try:
         __import__(f"app.core.{_name}")
@@ -90,6 +91,7 @@ def client_fixture(engine):
         patch("app.core.circle_scheduler.circle_scheduler.start"),
         patch("app.core.device_scanner.device_scanner.start"),
         patch("app.core.metrics_collector.metrics_collector.start"),
+        patch("app.core.autocheck_scheduler.autocheck_scheduler.start"),
         patch("app.core.naive_supervisor.naive_supervisor.start"),
         patch("app.core.naive_supervisor.naive_supervisor.stop"),
         patch("app.core.healthcheck.health_checker.stop"),
@@ -97,6 +99,7 @@ def client_fixture(engine):
         patch("app.core.circle_scheduler.circle_scheduler.stop"),
         patch("app.core.device_scanner.device_scanner.stop"),
         patch("app.core.metrics_collector.metrics_collector.stop"),
+        patch("app.core.autocheck_scheduler.autocheck_scheduler.stop"),
         patch("app.core.xray.xray_manager.stop", new_callable=AsyncMock),
         patch("app.core.nftables.nftables_manager.flush", new_callable=AsyncMock),
     ):
@@ -247,6 +250,46 @@ def sample_subscription_fixture(session):
     session.commit()
     session.refresh(sub)
     return sub
+
+
+# ── User-Agent template fixtures ─────────────────────────────────────────────
+#
+# The test schema is built with `SQLModel.metadata.create_all`, which
+# skips Alembic 018 — so `useragenttemplate` starts EMPTY here, unlike a
+# real install. That is deliberate: it keeps the "no row for this key"
+# fallback path under test by default, and any test that needs rows asks
+# for one of these fixtures.
+
+@pytest.fixture(name="ua_template")
+def ua_template_fixture(session):
+    """One custom template with an extra header, key `panel-x`."""
+    tpl = UserAgentTemplate(
+        key="panel-x",
+        name="Panel X",
+        user_agent="PanelX/1.2.3",
+        headers=json.dumps({"X-Api-Key": "secret-token", "Referer": "https://panel.example"}),
+        description="Fixture template",
+        builtin=False,
+        order=5,
+    )
+    session.add(tpl)
+    session.commit()
+    session.refresh(tpl)
+    return tpl
+
+
+@pytest.fixture(name="seeded_ua_templates")
+def seeded_ua_templates_fixture(session):
+    """The nine built-ins, inserted the same way Alembic 018 does."""
+    from app.core.ua_templates import default_template_rows
+
+    rows = [UserAgentTemplate(**row) for row in default_template_rows()]
+    for row in rows:
+        session.add(row)
+    session.commit()
+    for row in rows:
+        session.refresh(row)
+    return rows
 
 
 # ── NodeCircle fixtures ──────────────────────────────────────────────────────

@@ -16,6 +16,18 @@ class DNSQueryLog(SQLModel, table=True):
     cache_hit: bool = False
 
 
+class DomainStat(SQLModel, table=True):
+    """One row per looked-up domain: how often, when, and the last real IPs it
+    resolved to. Opt-in (`collect_domain_stats`), capped and aged out — see
+    `core/domain_stats.py`."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    domain: str = Field(index=True, unique=True)
+    hits: int = 0
+    first_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
+    ips: str = "[]"                    # JSON: up to 4 recent public IPs
+
+
 class Node(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
@@ -39,6 +51,9 @@ class Node(SQLModel, table=True):
     fingerprint: str = "chrome"
     alpn: Optional[str] = None
     allow_insecure: bool = False
+    # SHA-256 of the server certificate to trust (hex; several joined by commas).
+    # xray dropped `allowInsecure`; pinning is how a self-signed server is accepted.
+    pinned_cert_sha256: Optional[str] = None
 
     # WebSocket
     ws_path: str = "/"
@@ -82,6 +97,10 @@ class Node(SQLModel, table=True):
     # Hysteria2
     hy2_obfs: Optional[str] = None
     hy2_obfs_password: Optional[str] = None
+    # Port hopping: the client moves across this UDP port range ("20000-40000")
+    # every interval ("10-30" seconds). The server redirects the range to its port.
+    hy2_hop_ports: Optional[str] = None
+    hy2_hop_interval: Optional[str] = None
 
     # NaiveProxy (HTTPS forward proxy via Caddy + forwardproxy plugin)
     # Auth reuses `uuid` (user) and `password` (pass) — same convention as socks.
@@ -107,6 +126,25 @@ class Node(SQLModel, table=True):
     # ported from upstream). `speed_tested_at` is the UTC timestamp when
     # the test was last run (renamed from `last_speed_test` in v1.6.0 to
     # match upstream field naming).
+    speed_mbps: Optional[float] = None
+    speed_max_mbps: Optional[float] = None
+    speed_tested_at: Optional[datetime] = None
+
+    # Exit identity — the address the internet sees when traffic leaves this
+    # node, observed THROUGH the tunnel by the same probe that measures speed.
+    # `country` is authoritative over anything derived from `address`: it is
+    # where the traffic actually surfaces, which for a chained node is the
+    # last hop, not the entry, and it answers for a hostname address that
+    # never resolved locally. The name's flag prefix is rendered from it.
+    country: Optional[str] = Field(default=None, max_length=2)
+    exit_ip: Optional[str] = None
+    exit_checked_at: Optional[datetime] = None
+
+    # Speed test — last measured throughput (Mbps) + when it was taken.
+    # `speed_mbps` is the average after warm-up; `speed_max_mbps` is the peak
+    # steady window from the same run. Written by the /speedtest endpoints +
+    # the auto-check sweep; read by NodeCircle "best" / min_speed and the UI
+    # (stale >6h shown differently).
     speed_mbps: Optional[float] = None
     speed_max_mbps: Optional[float] = None
     speed_tested_at: Optional[datetime] = None
@@ -375,9 +413,6 @@ class RoutingRule(SQLModel, table=True):
 class UserAgentTemplate(SQLModel, table=True):
     """A reusable client fingerprint for subscription fetches.
 
-    Ported from upstream DaveBugg/PiTun v1.4.7. Replaces the hardcoded
-    UA dicts that used to live in `app/api/subscriptions.py`.
-
     Header-merge order and validation: `app/core/ua_templates.py`.
     """
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -402,6 +437,8 @@ class Subscription(SQLModel, table=True):
     name: str
     url: str
     enabled: bool = True
+    # References `UserAgentTemplate.key`. Not an FK: an unknown key
+    # degrades to the built-in fallback map instead of breaking a refresh.
     ua: str = "clash"
     filter_regex: Optional[str] = None
     auto_update: bool = False
@@ -409,10 +446,8 @@ class Subscription(SQLModel, table=True):
     last_updated: Optional[datetime] = None
     node_count: int = 0
     last_error: Optional[str] = None
-    # Optional override for the User-Agent header. When set, replaces
-    # the UA derived from the `ua` preset (`_UA_MAP[ua]`). Only useful
-    # for panels that gate on a fingerprint we don't ship a preset for
-    # — most subscriptions should leave this empty and pick a preset.
+    # Overrides the UA from the `ua` template. For a one-off panel that
+    # doesn't deserve its own template; normally empty.
     custom_ua: Optional[str] = None
     # When True, generate a fresh random X-Hwid per refresh request for
     # this subscription (only effective on Happ-style presets). Off by
@@ -422,14 +457,9 @@ class Subscription(SQLModel, table=True):
     # placeholder entries instead of real nodes) rotating gets a clean
     # response.
     rotate_hwid: bool = False
-    # Per-subscription opt-in to skip TLS verification when fetching.
-    # Default False: previous behaviour was `verify=False` uncond-
-    # itionally, leaking panel credentials + node UUIDs to any MITM
-    # on the path between PiTun and the panel. Now it's opt-in: only
-    # subscriptions whose panel uses a self-signed cert that the
-    # operator can't avoid need this. See migration 018 + architecture
-    # review finding 1.3.
-    allow_insecure: bool = False
+    # Skip certificate validation when fetching this subscription. Off for new
+    # subscriptions; the migration turned it on for the ones that predate it.
+    allow_insecure_tls: bool = False
 
 
 class DNSRule(SQLModel, table=True):
@@ -463,102 +493,33 @@ class NodeCircle(SQLModel, table=True):
     name: str
     enabled: bool = False
     node_ids: str = "[]"          # JSON list of node IDs in order
-    mode: str = "sequential"      # "sequential" | "random"
+    mode: str = "sequential"      # "sequential" | "random" | "best"
     interval_min: int = 5         # minimum minutes between rotations
     interval_max: int = 15        # maximum minutes (for random interval)
     current_index: int = 0        # current position in the circle
     last_rotated: Optional[datetime] = None
-    # Auto-sync from subscription (since v1.4.8). When set, the circle's
-    # node_ids auto-update on every subscription refresh: new nodes from
-    # the sub are appended; nodes that vanished are removed. Lets the
-    # operator "link" a circle to a subscription and forget about manual
-    # edits.
-    subscription_id: Optional[int] = Field(default=None, foreign_key="subscription.id")
-    # Smart rotation guard. If the active node's `speed_mbps >= min_speed_mbps`
-    # AND `is_online == True` AND `latency_ms <= 80`, the scheduler skips the
-    # rotation tick entirely — why rotate away from a perfectly good node?
-    # Default 0 means "always rotate on schedule" (preserves prior behavior).
-    # Set e.g. 5.0 to "skip rotation while active node gives ≥5 MB/s".
-    min_speed_mbps: float = 0.0
-    # v1.5.1 — max latency for candidates. 0 = no limit (use any latency).
-    # When > 0, rotation filters out candidates with latency_ms > max_latency_ms.
-    # Also used by smart rotation: if active node latency > max_latency → rotate.
+    # Candidate filters (0 = disabled). max_latency_ms drops slow-RTT
+    # candidates; min_speed_mbps drops candidates whose last speed test
+    # was below the floor. "best" mode picks the highest-quality survivor.
     max_latency_ms: int = 0
-    # v1.7.0 — exclude proxies from specific countries from rotation.
-    # Comma-separated ISO-3166-1 alpha-2 codes, e.g. "DE,NL". Useful when the
-    # operator has a data-limited LTE proxy in a country and doesn't want the
-    # circle to burn through that quota — candidates whose `country` (exit
-    # identity) matches any code here are skipped during rotation AND excluded
-    # from auto-sync. Empty string = no exclusions (default).
-    excluded_countries: str = ""
-
-
-class DeviceTraffic(SQLModel, table=True):
-    """Per-device bandwidth usage — 5-minute aggregates.
-
-    Polled from xray stats API (per-inbound) and nftables counters.
-    Pruned to 7 days of 5min buckets; hourly/daily aggregates can be
-    computed on-the-fly from these rows.
-    """
-    id: Optional[int] = Field(default=None, primary_key=True)
-    device_id: Optional[int] = Field(default=None, index=True)
-    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
-    bytes_sent: int = 0
-    bytes_recv: int = 0
-    period: str = "5min"
-
-
-class SuggestedRule(SQLModel, table=True):
-    """DNS-log-derived routing suggestion (v2.0).
-
-    Created by rule_suggester scheduler from DNSQueryLog frequency analysis.
-    Status lifecycle: pending → accepted (rule created) | dismissed.
-    Auto-expired after 7 days if not acted on.
-    """
-    id: Optional[int] = Field(default=None, primary_key=True)
-    domain: str = Field(index=True)
-    query_count: int = 0
-    last_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    current_node_id: Optional[int] = None
-    suggested_node_id: Optional[int] = None
-    suggestion_type: str = "latency"  # "latency" | "geoip" | "load_balance"
-    reason: str = ""
-    status: str = "pending"  # "pending" | "accepted" | "dismissed"
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class TrafficQuota(SQLModel, table=True):
-    """Monthly traffic cap per device / routing_set / global.
-
-    When current month's usage exceeds monthly_limit_gb, the configured
-    action fires: "block" (nftables drop), "fallback" (switch node),
-    or "throttle" (nftables rate-limit).
-    """
-    id: Optional[int] = Field(default=None, primary_key=True)
-    scope_type: str = "device"    # "device" | "routing_set" | "global"
-    scope_id: Optional[int] = None
-    monthly_limit_gb: float = 0   # 0 = unlimited
-    action: str = "block"         # "block" | "fallback" | "throttle"
-    fallback_node_id: Optional[int] = None
-    reset_day: int = 1            # day of month to reset counter
-    enabled: bool = True
-
-
-class TrafficUsage(SQLModel, table=True):
-    """Monthly traffic aggregate per scope (for quota enforcement)."""
-    id: Optional[int] = Field(default=None, primary_key=True)
-    scope_type: str
-    scope_id: Optional[int] = None
-    year: int
-    month: int          # 1-12
-    bytes_sent: int = 0
-    bytes_recv: int = 0
+    min_speed_mbps: float = 0.0
+    # Optional link to a Subscription. When set, the circle's membership is
+    # rebuilt on every refresh of that subscription: nodes it still serves are
+    # kept/added, ones it dropped are removed, and members added by hand (or
+    # from another subscription) are preserved. NULL = manually managed, which
+    # is the existing behaviour for every pre-existing circle.
+    subscription_id: Optional[int] = Field(default=None, foreign_key="subscription.id")
+    # JSON list of every subscription the circle follows (subscription_id is its
+    # first entry, kept for older readers).
+    subscription_ids: str = "[]"
+    # What a subscription refresh must not put back (JSON lists): nodes unticked
+    # by hand, and countries (ISO codes) whose nodes never join. core/circle_filters.
+    excluded_node_ids: str = "[]"
+    excluded_countries: str = "[]"
 
 
 class AutoCheckConfig(SQLModel, table=True):
     """Singleton config (row id=1) for the background auto-speedtest sweep.
-
-    Ported from upstream DaveBugg/PiTun v1.5.0-beta.1.
 
     A scheduler periodically speed-tests the scoped nodes so `speed_mbps` /
     `speed_tested_at` stay fresh (feeds NodeCircle best/min_speed + the UI
@@ -586,6 +547,11 @@ class Device(SQLModel, table=True):
     last_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_online: bool = True
     routing_policy: str = "default"  # "default" | "include" | "exclude"
+    # Fixed address handed to this device by PiTun's DHCP server in router
+    # mode. Distinct from `ip`, which is whatever ARP scanning last observed:
+    # promoting an observation to a reservation would pin an address the
+    # device merely happened to hold. NULL = no reservation.
+    dhcp_reserved_ip: Optional[str] = Field(default=None, unique=True)
 
     # NULL = unassigned (device sees only global rules — preserves old
     # behaviour on upgrade). Set to a RoutingSet.id to apply that set's
@@ -611,54 +577,17 @@ class SystemMetric(SQLModel, table=True):
     net_recv_bytes: int = 0
 
 
-class NodeSLARecord(SQLModel, table=True):
-    """Per-checkpoint SLA record — one row per healthcheck tick.
-
-    Provides raw data for the SLA dashboard (uptime %, latency trends,
-    downtime events). Pruned to 30 days by `sla_aggregator` — older
-    data lives in the `NodeSLADaily` aggregate table.
-    """
-    id: Optional[int] = Field(default=None, primary_key=True)
-    node_id: int = Field(index=True)
-    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
-    is_online: bool
-    latency_ms: Optional[int] = None
-
-
-class NodeSLADaily(SQLModel, table=True):
-    """Daily aggregate of node SLA — uptime %, latency stats, downtime.
-
-    Computed by `sla_aggregator` scheduler at midnight. Retained for
-    1 year. Drives the SLA dashboard widget.
-    """
-    id: Optional[int] = Field(default=None, primary_key=True)
-    node_id: int = Field(index=True)
-    # Use a forward-reference string annotation to avoid the field name
-    # `date` shadowing the `date` type imported from datetime.
-    sla_date: "date" = Field(default=None, index=True)  # type: ignore  # calendar date (UTC)
-    uptime_percentage: float = 0.0   # 0.0 - 100.0
-    total_checks: int = 0
-    failed_checks: int = 0
-    avg_latency_ms: Optional[float] = None
-    max_latency_ms: Optional[int] = None
-    min_latency_ms: Optional[int] = None
-    downtime_events: int = 0         # transitions online → offline
-    total_downtime_seconds: int = 0
-
-
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     username: str = Field(unique=True, index=True)
     password_hash: str
-    # Brute-force defense (since v1.4.7 — architecture review finding
-    # 1.2). After `MAX_FAILED_ATTEMPTS` (defined in core/auth.py) proven
-    # wrong passwords, the account is locked until `locked_until` has
-    # elapsed. A successful login resets `failed_attempts` to 0 AND
-    # clears `locked_until`. Both columns are persisted: a backend
-    # restart mid-brute-force keeps the state so a restart can't be
-    # used to reset the counter.
-    failed_attempts: int = Field(default=0, nullable=False)
-    locked_until: Optional[datetime] = None
+    # Brute-force lockout for the login endpoint. `failed_attempts` counts
+    # consecutive bad logins; once it crosses the threshold `lock_until` is
+    # set and logins are rejected until it passes. Both reset on a
+    # successful login. (PiTun is LAN-only with no captcha/IP throttling, so
+    # this per-account guard is the primary brute-force protection.)
+    failed_attempts: int = 0
+    lock_until: Optional[datetime] = None
 
 
 class Event(SQLModel, table=True):
@@ -862,7 +791,7 @@ class ProxyChain(SQLModel, table=True):
 
     A `ChainClient` is one logical user — when created it spawns N
     panel-side clients (one per channel), so the user gets N VLESS
-    URIs (e.g. "VPN-VK" / "VPN-MAX" / ...) all backed by the same
+    URIs (e.g. "VPN-A" / "VPN-B" / ...) all backed by the same
     exit IP. Importing any of them as a `Node` makes PiTun route
     through that chain end-to-end.
     """

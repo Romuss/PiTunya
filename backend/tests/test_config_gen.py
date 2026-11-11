@@ -51,11 +51,41 @@ def _find_outbound(config, tag):
     return None
 
 
+def _dialer(ob):
+    return ((ob or {}).get("streamSettings") or {}).get("sockopt", {}).get("dialerProxy")
+
+
 def _find_inbound(config, tag):
     for ib in config["inbounds"]:
         if ib["tag"] == tag:
             return ib
     return None
+
+
+class TestSpeedProbeInbound:
+    """The active node is speed-tested through the LIVE tunnel: config_gen adds
+    a loopback `speed-probe` socks inbound + a top-priority rule pinning it to
+    the active outbound, so no second temp xray (and no WG session fight)."""
+
+    def test_present_and_routed_to_active_node(self):
+        from app.core.config_gen import SPEED_PROBE_PORT
+        node = _make_node(id=7, protocol="vless")
+        cfg = generate_config(node, [node], [], "global", _default_settings())
+        ib = _find_inbound(cfg, "speed-probe")
+        assert ib is not None
+        assert ib["listen"] == "127.0.0.1"
+        assert ib["port"] == SPEED_PROBE_PORT
+        assert ib["protocol"] == "socks"
+        # First routing rule pins the probe inbound → active node's outbound.
+        first = cfg["routing"]["rules"][0]
+        assert first.get("inboundTag") == ["speed-probe"]
+        assert first.get("outboundTag") == "node-7"
+
+    def test_absent_without_active_node(self):
+        node = _make_node(id=7, protocol="vless")
+        cfg = generate_config(None, [node], [], "global", _default_settings())
+        assert _find_inbound(cfg, "speed-probe") is None
+        assert all(r.get("inboundTag") != ["speed-probe"] for r in cfg["routing"]["rules"])
 
 
 # ============================================================================
@@ -93,6 +123,68 @@ class TestSockoptMark:
         ob = _find_outbound(cfg, "node-1")
         assert ob is not None
         assert ob["streamSettings"]["sockopt"]["mark"] == 255
+
+    def test_wireguard_drops_ipv6_interface_address(self):
+        # A commercial WG config hands out both an IPv4 and an IPv6
+        # interface address. Passing the IPv6 one makes xray's userspace
+        # WG bring up an IPv6 netstack that errors with "failed to find
+        # available ipv6 table" on an IPv4-only host — so we keep only IPv4.
+        node = _make_node(
+            protocol="wireguard", transport="tcp", tls="none",
+            wg_private_key="privkey", wg_public_key="pubkey",
+            wg_local_address="10.65.58.254/32,fc00:bbbb:bbbb:bb01::2:3afd/128",
+        )
+        cfg = generate_config(node, [node], [], "global", _default_settings())
+        ob = _find_outbound(cfg, "node-1")
+        assert ob is not None
+        addrs = ob["settings"]["address"]
+        assert addrs == ["10.65.58.254/32"], addrs
+        assert all(":" not in a for a in addrs)
+
+    def test_wireguard_keeps_ipv6_when_no_ipv4(self):
+        # A rare IPv6-only WG config still gets its address — better a
+        # possibly-failing v6 tunnel than none at all.
+        node = _make_node(
+            protocol="wireguard", transport="tcp", tls="none",
+            wg_private_key="privkey", wg_public_key="pubkey",
+            wg_local_address="fc00:bbbb::2/128",
+        )
+        cfg = generate_config(node, [node], [], "global", _default_settings())
+        ob = _find_outbound(cfg, "node-1")
+        assert ob["settings"]["address"] == ["fc00:bbbb::2/128"]
+
+    @pytest.mark.parametrize("kwargs", [
+        {"protocol": "vless", "uuid": "u", "tls": "none"},
+        {"protocol": "vmess", "uuid": "u", "tls": "none"},
+        {"protocol": "trojan", "password": "p"},
+        {"protocol": "ss", "password": "p"},
+    ])
+    def test_only_wireguard_has_an_interface_address(self, kwargs):
+        # The "failed to find available ipv6 table" failure comes from
+        # xray's userspace WireGuard bringing up a netstack for the
+        # `settings.address` interface CIDRs. NO other protocol has that
+        # field — they dial the server via vnext/servers — so the failure
+        # mode is WG-exclusive. Guard that it stays that way.
+        node = _make_node(transport="tcp", **kwargs)
+        cfg = generate_config(node, [node], [], "global", _default_settings())
+        ob = _find_outbound(cfg, "node-1")
+        assert ob is not None
+        assert "address" not in ob["settings"], (
+            f"{kwargs['protocol']} grew a WG-style interface address"
+        )
+
+    def test_vless_ipv6_server_address_is_not_an_interface_table(self):
+        # An IPv6 SERVER address is a dial target (goes in vnext), not an
+        # interface address — it can fail to connect on an IPv4-only box,
+        # but never with the WG "ipv6 table" error.
+        node = _make_node(
+            protocol="vless", uuid="u", tls="none",
+            address="2001:db8::1",
+        )
+        cfg = generate_config(node, [node], [], "global", _default_settings())
+        ob = _find_outbound(cfg, "node-1")
+        assert "address" not in ob["settings"]
+        assert ob["settings"]["vnext"][0]["address"] == "2001:db8::1"
 
     def test_hy2_outbound_has_mark_255(self):
         node = _make_node(protocol="hy2", password="secret")
@@ -261,19 +353,19 @@ class TestModes:
         catch-all to active node. This is the contract the new
         Routing-page banner (frontend 1.3.5) tells the user about."""
         node = _make_node(id=11)
-        # A user rule that would normally send vk.com direct
+        # A user rule that would normally send ru-site.example direct
         user_rule = RoutingRule(
             id=99, name="bypass vk", rule_type="domain",
-            match_value="vk.com", action="direct", order=0, enabled=True,
+            match_value="ru-site.example", action="direct", order=0, enabled=True,
         )
         cfg = generate_config(
             node, [node], [user_rule], "global", _default_settings(),
         )
-        # No rule mentions vk.com
+        # No rule mentions ru-site.example
         for r in cfg["routing"]["rules"]:
-            assert "vk.com" not in str(r), (
+            assert "ru-site.example" not in str(r), (
                 "global mode must NOT emit user RoutingRule rows; "
-                f"found one referencing vk.com: {r}"
+                f"found one referencing ru-site.example: {r}"
             )
 
 
@@ -427,15 +519,16 @@ class TestRoutingRuleConversion:
 # ============================================================================
 
 class TestChainTunnel:
-    def test_chain_node_proxy_settings(self):
+    def test_chain_node_dials_through_its_relay(self):
         chain_node = _make_node(id=2, name="chain", address="5.5.5.5")
         main_node = _make_node(id=1, name="main", chain_node_id=2)
         all_nodes = [main_node, chain_node]
         cfg = generate_config(main_node, all_nodes, [], "global", _default_settings())
         ob = _find_outbound(cfg, "node-1")
         assert ob is not None
-        assert "proxySettings" in ob, f"proxySettings missing: {json.dumps(ob, indent=2)}"
-        assert ob["proxySettings"]["tag"] == "node-2"
+        assert _dialer(ob) == "node-2", f"dialerProxy missing: {json.dumps(ob, indent=2)}"
+        assert "proxySettings" not in ob, "removed in xray 26.9 — a hard error"
+
 
     def test_chain_node_outbound_included(self):
         chain_node = _make_node(id=2, name="chain", address="5.5.5.5")
@@ -450,10 +543,10 @@ class TestChainTunnel:
         cfg = generate_config(node, [node], [], "global", _default_settings())
         ob = _find_outbound(cfg, "node-1")
         assert ob is not None
-        assert "proxySettings" not in ob
+        assert _dialer(ob) is None
 
     def test_three_hop_chain_fully_wired(self):
-        # exit(1) → mid(2) → entry(3). Every hop must carry proxySettings
+        # exit(1) → mid(2) → entry(3). Every hop must carry a dialerProxy
         # except the entry, which dials direct. (Regression: previously
         # only the first hop wired and node-2 silently dialed direct.)
         entry = _make_node(id=3, name="entry", address="3.3.3.3")
@@ -461,12 +554,11 @@ class TestChainTunnel:
         exit_ = _make_node(id=1, name="exit", address="1.1.1.1", chain_node_id=2)
         cfg = generate_config(exit_, [exit_, mid, entry], [], "global", _default_settings())
 
-        assert _find_outbound(cfg, "node-1")["proxySettings"]["tag"] == "node-2"
-        assert _find_outbound(cfg, "node-2")["proxySettings"]["tag"] == "node-3"
-        assert "proxySettings" not in _find_outbound(cfg, "node-3")
-        # transportLayer flag preserved on each hop (→ sockopt.dialerProxy)
-        assert _find_outbound(cfg, "node-1")["proxySettings"]["transportLayer"] is True
-        assert _find_outbound(cfg, "node-2")["proxySettings"]["transportLayer"] is True
+        assert _dialer(_find_outbound(cfg, "node-1")) == "node-2"
+        assert _dialer(_find_outbound(cfg, "node-2")) == "node-3"
+        assert _dialer(_find_outbound(cfg, "node-3")) is None
+        for tag in ("node-1", "node-2", "node-3"):
+            assert "proxySettings" not in _find_outbound(cfg, tag)
 
     def test_chain_through_wireguard_is_skipped(self):
         # xray can't tunnel THROUGH a WireGuard outbound (0 bytes at
@@ -477,7 +569,7 @@ class TestChainTunnel:
                               wg_local_address="10.0.0.2/32")
         exit_ = _make_node(id=1, protocol="vless", name="exit", address="1.1.1.1", chain_node_id=2)
         cfg = generate_config(exit_, [exit_, wg_relay], [], "global", _default_settings())
-        assert "proxySettings" not in _find_outbound(cfg, "node-1")
+        assert _dialer(_find_outbound(cfg, "node-1")) is None
 
     def test_wireguard_exit_over_stream_is_wired(self):
         # The valid direction: WireGuard as the EXIT hop, chaining through a
@@ -489,8 +581,8 @@ class TestChainTunnel:
         cfg = generate_config(wg_exit, [wg_exit, vless], [], "global", _default_settings())
         ob = _find_outbound(cfg, "node-1")
         assert ob["protocol"] == "wireguard"
-        assert ob["proxySettings"]["tag"] == "node-2"
-        assert "proxySettings" not in _find_outbound(cfg, "node-2")
+        assert _dialer(ob) == "node-2"
+        assert _dialer(_find_outbound(cfg, "node-2")) is None
 
     def test_chain_cycle_truncated(self):
         # 1 → 2 → 1 (cycle). Must terminate (no infinite recursion) and
@@ -499,8 +591,8 @@ class TestChainTunnel:
         n1 = _make_node(id=1, name="a", address="1.1.1.1", chain_node_id=2)
         n2 = _make_node(id=2, name="b", address="2.2.2.2", chain_node_id=1)
         cfg = generate_config(n1, [n1, n2], [], "global", _default_settings())
-        assert _find_outbound(cfg, "node-1")["proxySettings"]["tag"] == "node-2"
-        assert "proxySettings" not in _find_outbound(cfg, "node-2")
+        assert _dialer(_find_outbound(cfg, "node-1")) == "node-2"
+        assert _dialer(_find_outbound(cfg, "node-2")) is None
 
 
 # ============================================================================
@@ -564,7 +656,7 @@ class TestDNS:
     # ── DNS-upstream outboundTag pinning (since v1.3.5) ────────────────
     #
     # Pinning DNS servers to `outboundTag: direct` is the fix for the
-    # 192.168.1.4 burn-in lockup. The contract these tests pin: every
+    # DNS burn-in lockup. The contract these tests pin: every
     # DNS server entry must end up as a dict with outboundTag=direct,
     # regardless of whether the operator configured it as a bare
     # upstream, a per-domain object, or a fallback. The only exception
@@ -629,7 +721,7 @@ class TestDNS:
         outboundTag=direct without losing their existing fields."""
         from app.models import DNSRule
         rules = [DNSRule(
-            id=1, name="r", domain_match="vk.com",
+            id=1, name="r", domain_match="ru-site.example",
             dns_server="77.88.8.8", dns_type="plain",
             enabled=True, order=10,
         )]
@@ -644,7 +736,7 @@ class TestDNS:
         assert yandex is not None, cfg["dns"]["servers"]
         assert yandex["outboundTag"] == "direct"
         # Existing fields preserved
-        assert "vk.com" in yandex.get("domains", [])
+        assert "ru-site.example" in yandex.get("domains", [])
 
     def test_ru_bypass_dns_pinned(self):
         """`bypass_ru_dns=true` adds a Yandex-DNS server for RU domains.
@@ -717,24 +809,34 @@ class TestDNS:
                     f"must come BEFORE user rule (idx {user_rule_idx})"
                 )
 
-    def test_dns_out_outbound_pinned_to_direct(self):
-        """The `dns-out` outbound must carry `proxySettings.tag: direct`
-        so its upstream-DNS dial (the TCP/UDP connection to the actual
-        DNS server) bypasses the user's routing rules. Belt-and-
-        suspenders with the per-server `outboundTag: direct` — that one
-        wins for queries that go through xray's routing engine; this
-        one wins for the dial that the dns-out outbound itself makes.
-        Without this, a port-range catch-all routing rule tunnels DNS
-        through the broken VPN node (real-world breakage on 1.3.4)."""
+    def test_dns_out_outbound_has_no_removed_proxy_settings(self):
+        """`proxySettings` on an outbound is a hard error since xray 26.9, so
+        `dns-out` must not carry it; the upstream-DNS dial stays direct through
+        the `port 53 → direct` system rule and the per-server pin instead."""
         cfg = generate_config(None, [], [], "rules", _default_settings())
         dns_out = next(
             (o for o in cfg["outbounds"] if o.get("tag") == "dns-out"),
             None,
         )
         assert dns_out is not None
-        assert dns_out.get("proxySettings", {}).get("tag") == "direct", (
-            f"dns-out missing proxySettings.tag=direct: {dns_out!r}"
-        )
+        assert "proxySettings" not in dns_out, dns_out
+        first_rules = cfg["routing"]["rules"]
+        assert any(r.get("port") == "53" and r.get("outboundTag") == "direct" for r in first_rules)
+
+    def test_direct_outbound_keeps_its_ip_strategy_in_sockopt(self):
+        """`freedom.domainStrategy` is deprecated and slated for removal in
+        xray; the strategy lives in `sockopt` instead (works on 26.7 and 26.10)."""
+        cfg = generate_config(None, [], [], "rules", _default_settings())
+        direct = _find_outbound(cfg, "direct")
+        assert direct["streamSettings"]["sockopt"]["domainStrategy"] == "UseIP"
+        assert direct["streamSettings"]["sockopt"]["mark"] == 255
+        assert "domainStrategy" not in direct.get("settings", {})
+
+    def test_no_outbound_anywhere_uses_the_removed_proxy_settings(self):
+        chain_node = _make_node(id=2, name="chain", address="5.5.5.5")
+        main_node = _make_node(id=1, name="main", chain_node_id=2)
+        cfg = generate_config(main_node, [main_node, chain_node], [], "global", _default_settings())
+        assert all("proxySettings" not in o for o in cfg["outbounds"])
 
     def test_query_strategy_defaults_to_useipv4(self):
         """DNS section must default queryStrategy=UseIPv4 to close the

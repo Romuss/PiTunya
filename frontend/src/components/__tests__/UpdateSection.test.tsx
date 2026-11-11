@@ -40,6 +40,7 @@ function wrap(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  sessionStorage.clear()
   vi.mocked(updateApi.status).mockResolvedValue({ ...IDLE })
 })
 
@@ -194,4 +195,160 @@ describe('UpdateSection', () => {
     await screen.findByRole('button', { name: /update now/i })
     expect(screen.queryByText(/has no in-UI updater/i)).not.toBeInTheDocument()
   })
+})
+
+// The last run's result is kept on disk for good; the banner must not be.
+describe('UpdateSection result banner', () => {
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString()
+  const base = { pct: 100, step: 'done', message: '', ok: true, request_pending: false, from: '1.6.6', to: '1.7.1' }
+
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  it('shows a fresh success', async () => {
+    vi.mocked(updateApi.status).mockResolvedValue({ ...base, state: 'done', updated_at: ago(60_000) })
+    render(wrap(<UpdateSection />))
+    expect(await screen.findByText('1.7.1')).toBeInTheDocument()
+  })
+
+  it('hides an old success', async () => {
+    vi.mocked(updateApi.status).mockResolvedValue({ ...base, state: 'done', updated_at: ago(3 * 3600_000) })
+    render(wrap(<UpdateSection />))
+    await waitFor(() => expect(updateApi.status).toHaveBeenCalled())
+    expect(screen.queryByText('1.7.1')).not.toBeInTheDocument()
+  })
+
+  it('keeps a failure however old until it is closed, and keeps it closed', async () => {
+    vi.mocked(updateApi.status).mockResolvedValue({
+      ...base, state: 'failed', ok: false, message: 'Installer exited with code 1', updated_at: ago(3 * 3600_000),
+    })
+    const user = userEvent.setup()
+    const first = render(wrap(<UpdateSection />))
+    expect(await screen.findByText(/Installer exited with code 1/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Dismiss|Закрыть/ }))
+    expect(screen.queryByText(/Installer exited with code 1/)).not.toBeInTheDocument()
+    first.unmount()
+    render(wrap(<UpdateSection />))
+    await waitFor(() => expect(vi.mocked(updateApi.status).mock.calls.length).toBeGreaterThan(1))
+    expect(screen.queryByText(/Installer exited with code 1/)).not.toBeInTheDocument()
+  })
+})
+
+describe('UpdateSection right after "Update now"', () => {
+  it('keeps showing "starting" while the status file still holds the previous run', async () => {
+    const old = {
+      state: 'done' as const, pct: 100, step: 'done', message: 'Updated', ok: true,
+      from: '1.6.6', to: '1.7.1', updated_at: new Date(Date.now() - 3600_000).toISOString(),
+      request_pending: false,
+    }
+    vi.mocked(updateApi.status).mockResolvedValue(old)
+    vi.mocked(updateApi.check).mockResolvedValue({
+      current: '1.7.1', latest: 'v1.7.2', update_available: true,
+      network_path: 'direct', notes: null, error: null,
+    })
+    // The agent consumed the request but has not written anything yet: still the old run.
+    vi.mocked(updateApi.start).mockResolvedValue({ ...old })
+    render(wrap(<UpdateSection />))
+    await userEvent.click(screen.getByRole('button', { name: /check for updates/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /update now/i }))
+
+    expect(await screen.findByText(/Starting the update|Запуск обновления/)).toBeInTheDocument()
+    // Not offered again while it starts.
+    expect(screen.getByRole('button', { name: /update now/i })).toBeDisabled()
+  })
+})
+
+describe('UpdateSection launch edge cases', () => {
+  const OLD = {
+    state: 'done' as const, pct: 100, step: 'done', message: 'Updated', ok: true,
+    from: '1.6.6', to: '1.7.1', updated_at: new Date(Date.now() - 3600_000).toISOString(),
+    request_pending: false,
+  }
+  const CHECK = {
+    current: '1.7.1', latest: 'v1.7.2', update_available: true,
+    network_path: 'direct', notes: null, error: null,
+  }
+
+  it('pins the version the user was shown', async () => {
+    vi.mocked(updateApi.status).mockResolvedValue({ ...OLD })
+    vi.mocked(updateApi.check).mockResolvedValue({ ...CHECK })
+    vi.mocked(updateApi.start).mockResolvedValue({ ...OLD })
+    render(wrap(<UpdateSection />))
+    await userEvent.click(screen.getByRole('button', { name: /check for updates/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /update now/i }))
+    await waitFor(() => expect(updateApi.start).toHaveBeenCalledWith({ force: false, version: 'v1.7.2' }))
+  })
+
+  it('does not drop the progress box when the agent answers "nothing to do"', async () => {
+    vi.mocked(updateApi.status).mockResolvedValue({ ...OLD })
+    vi.mocked(updateApi.check).mockResolvedValue({ ...CHECK })
+    vi.mocked(updateApi.start).mockResolvedValue({ ...OLD })
+    render(wrap(<UpdateSection />))
+    await userEvent.click(screen.getByRole('button', { name: /check for updates/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /update now/i }))
+    expect(await screen.findByText(/Starting the update|Запуск обновления/)).toBeInTheDocument()
+    vi.mocked(updateApi.status).mockResolvedValue({
+      ...IDLE, state: 'idle', pct: 100, step: 'up-to-date', message: 'Already on 1.7.1',
+      updated_at: new Date().toISOString(),
+    })
+    // The answer is shown, not swallowed.
+    expect(await screen.findByText('Already on 1.7.1', {}, { timeout: 5000 })).toBeInTheDocument()
+  }, 10000)
+
+  it('still shows the update as running after a reload while the backend is down', async () => {
+    sessionStorage.setItem('pitun.update.launch', JSON.stringify({ since: Date.now(), stamp: OLD.updated_at }))
+    vi.mocked(updateApi.status).mockRejectedValue(new Error('Network Error'))
+    render(wrap(<UpdateSection />))
+    expect(await screen.findByText(/Restarting services|Перезапуск сервисов/)).toBeInTheDocument()
+  })
+
+  it('shows why the update could not be started', async () => {
+    vi.mocked(updateApi.check).mockResolvedValue({ ...CHECK })
+    vi.mocked(updateApi.start).mockRejectedValue(new Error('boom'))
+    render(wrap(<UpdateSection />))
+    await userEvent.click(screen.getByRole('button', { name: /check for updates/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /update now/i }))
+    expect(await screen.findByText(/boom|Could not start the update|Не удалось/)).toBeInTheDocument()
+  })
+})
+
+describe('UpdateSection with an unreadable status mid-update', () => {
+  const OLD = {
+    state: 'done' as const, pct: 100, step: 'done', message: 'Updated', ok: true,
+    from: '1.6.6', to: '1.7.1', updated_at: new Date(Date.now() - 3600_000).toISOString(),
+    request_pending: false,
+  }
+
+  it('keeps the last known step on screen instead of dropping the progress', async () => {
+    vi.mocked(updateApi.check).mockResolvedValue({
+      current: '1.7.1', latest: 'v1.7.2', update_available: true,
+      network_path: 'direct', notes: null, error: null,
+    })
+    vi.mocked(updateApi.start).mockResolvedValue({
+      ...OLD, state: 'queued', pct: 0, updated_at: new Date().toISOString(), request_pending: true,
+    })
+    vi.mocked(updateApi.status).mockResolvedValue({ ...OLD })
+    render(wrap(<UpdateSection />))
+    await userEvent.click(screen.getByRole('button', { name: /check for updates/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /update now/i }))
+    vi.mocked(updateApi.status).mockResolvedValue({
+      ...OLD, state: 'running', pct: 45, message: 'Preparing host', updated_at: new Date().toISOString(),
+    })
+    expect(await screen.findByText('Preparing host', {}, { timeout: 5000 })).toBeInTheDocument()
+
+    // The status file turns unreadable for a few seconds (this is what the colour codes did).
+    vi.mocked(updateApi.status).mockResolvedValue({
+      state: 'unknown', pct: 0, step: '', message: 'status file is not valid JSON',
+      ok: null, request_pending: false,
+    })
+    await new Promise((r) => setTimeout(r, 2600))
+    expect(screen.getByText('Preparing host')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /update now/i })).toBeDisabled()
+
+    vi.mocked(updateApi.status).mockResolvedValue({
+      ...OLD, state: 'done', to: '1.7.2', updated_at: new Date().toISOString(),
+    })
+    expect(await screen.findByText(/Updated to|Обновлено до/, {}, { timeout: 5000 })).toBeInTheDocument()
+  }, 20000)
 })

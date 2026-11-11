@@ -14,10 +14,10 @@
  *    tells the operator which route answered, and an unreachable check
  *    says so instead of quietly claiming the latest version.
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  ArrowUpCircle, CheckCircle2, Loader2, RefreshCw, AlertTriangle, Info,
+  ArrowUpCircle, CheckCircle2, Loader2, RefreshCw, AlertTriangle, Info, X,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 
@@ -28,11 +28,66 @@ import { useConfirm } from '@/components/ConfirmModal'
 
 const ACTIVE_STATES = ['queued', 'running']
 
+// The status file keeps the last run's result for good. A success is news for
+// half an hour; a failure stays until it is dismissed. Either can be closed,
+// and a closed one stays closed (keyed by the run it describes).
+const DONE_BANNER_MS = 30 * 60 * 1000
+const DISMISS_KEY = 'pitun.update.dismissed'
+
+// After "Update now" the host agent may need a few seconds before it writes its
+// first status (it consumes the request, then resolves the network path), and
+// for that moment the status file still shows the PREVIOUS run. Keep watching,
+// and keep showing "starting", until the file changes or this long has passed.
+const LAUNCH_GRACE_MS = 120_000
+const LAUNCH_MAX_MS = 10 * 60_000
+// The click is remembered for the tab's lifetime, so a reload or a remount in
+// the middle of the update (the page is often refreshed while the backend
+// restarts) still shows the update as running.
+const LAUNCH_KEY = 'pitun.update.launch'
+
+type Launch = { since: number; stamp: string }
+
+function readLaunch(): Launch | null {
+  try {
+    const raw = sessionStorage.getItem(LAUNCH_KEY)
+    if (!raw) return null
+    const v = JSON.parse(raw)
+    return typeof v?.since === 'number' && typeof v?.stamp === 'string' ? v : null
+  } catch { return null }
+}
+
+function writeLaunch(v: Launch | null) {
+  try {
+    if (v) sessionStorage.setItem(LAUNCH_KEY, JSON.stringify(v))
+    else sessionStorage.removeItem(LAUNCH_KEY)
+  } catch { /* private mode */ }
+}
+
+function readDismissed(): string {
+  try { return localStorage.getItem(DISMISS_KEY) ?? '' } catch { return '' }
+}
+
 export function UpdateSection() {
   const t = useT()
   const qc = useQueryClient()
   const confirm = useConfirm()
   const [checkError, setCheckError] = useState<string | null>(null)
+  const [dismissed, setDismissed] = useState(readDismissed)
+
+  // Set when an update is requested: when, and the status stamp it was requested over.
+  const launch = useRef<Launch | null>(readLaunch())
+  const [, tick] = useState(0)
+  // No status at all (the backend is down mid-restart) and an unreadable one
+  // ("unknown") both mean "cannot tell", not "nothing is running": keep the
+  // update on screen for as long as an update can plausibly take. Otherwise the
+  // launch holds until the status file shows something other than the old run.
+  const stillLaunching = (d: { state: string; updated_at?: string | null } | undefined) => {
+    const l = launch.current
+    if (l === null) return false
+    const age = Date.now() - l.since
+    if (d === undefined || d.state === 'unknown') return age < LAUNCH_MAX_MS
+    return age < LAUNCH_GRACE_MS && (d.updated_at ?? '') === l.stamp
+  }
 
   const status = useQuery({
     queryKey: ['system', 'update', 'status'],
@@ -40,16 +95,47 @@ export function UpdateSection() {
     // Poll only while something is in flight. A finished update leaves a
     // terminal state on disk, so there is nothing to watch afterwards.
     refetchInterval: (q) =>
-      ACTIVE_STATES.includes(q.state.data?.state ?? '') ? 2000 : false,
+      ACTIVE_STATES.includes(q.state.data?.state ?? '')
+        || q.state.data?.request_pending === true
+        || stillLaunching(q.state.data)
+        ? 2000
+        : false,
     // Mid-update the backend is down; keep the last known state rather
     // than blanking the panel, and don't count that as an error.
     retry: false,
   })
 
-  const busy = ACTIVE_STATES.includes(status.data?.state ?? '')
+  // A request the host agent has not picked up yet counts as in flight too:
+  // the status file still holds the previous run until it starts.
+  const launching = stillLaunching(status.data)
+  // An unreadable status mid-update keeps showing the last step we did see.
+  const lastActive = useRef<NonNullable<typeof status.data> | undefined>(undefined)
+  if (status.data && ACTIVE_STATES.includes(status.data.state)) lastActive.current = status.data
+  const view = status.data?.state === 'unknown' && lastActive.current ? lastActive.current : status.data
+  const busy =
+    ACTIVE_STATES.includes(status.data?.state ?? '')
+    || status.data?.request_pending === true
+    || launching
   // The backend goes away during its own restart. While busy, a failed
   // poll means "restarting", not "broken".
   const restarting = busy && status.isError
+
+  // The run answered with something that is not "in progress" (the agent found
+  // nothing to do, or it already finished): the launch is over. Say so instead
+  // of letting the progress box vanish without a word.
+  const [launchNote, setLaunchNote] = useState<string | null>(null)
+  useEffect(() => {
+    const l = launch.current
+    const d = status.data
+    if (!l || !d) return
+    const answered = (d.updated_at ?? '') !== l.stamp
+    const terminal = !ACTIVE_STATES.includes(d.state) && d.state !== 'unknown' && d.request_pending !== true
+    if (answered && terminal) {
+      launch.current = null
+      writeLaunch(null)
+      if (d.state === 'idle' || d.state === 'available') setLaunchNote(d.message || null)
+    }
+  }, [status.data])
 
   const check = useMutation({
     mutationFn: () => updateApi.check(),
@@ -58,9 +144,15 @@ export function UpdateSection() {
   })
 
   const start = useMutation({
-    mutationFn: (force: boolean) => updateApi.start({ force }),
+    // Pin the version the user was shown: the agent would otherwise look the
+    // latest release up again and could disagree with the check just made.
+    mutationFn: (force: boolean) => updateApi.start({ force, version: force ? undefined : check.data?.latest ?? undefined }),
     onSuccess: (data) => {
+      setLaunchNote(null)
+      launch.current = { since: Date.now(), stamp: data.updated_at ?? '' }
+      writeLaunch(launch.current)
       qc.setQueryData(['system', 'update', 'status'], data)
+      tick((n) => n + 1)
     },
   })
 
@@ -71,6 +163,17 @@ export function UpdateSection() {
       qc.invalidateQueries({ queryKey: ['system'] })
     }
   }, [status.data?.state, qc])
+
+  // Which finished run the banner would describe, and whether it is still news.
+  const runKey = `${status.data?.state}:${status.data?.to ?? ''}:${status.data?.updated_at ?? ''}`
+  const finishedAt = status.data?.updated_at ? Date.parse(status.data.updated_at) : NaN
+  const fresh = Number.isFinite(finishedAt) && Date.now() - finishedAt < DONE_BANNER_MS
+  const showDone = !busy && status.data?.state === 'done' && fresh && dismissed !== runKey
+  const showFailed = !busy && status.data?.state === 'failed' && dismissed !== runKey
+  const dismiss = () => {
+    setDismissed(runKey)
+    try { localStorage.setItem(DISMISS_KEY, runKey) } catch { /* private mode */ }
+  }
 
   const result = check.data
   const available = result?.update_available === true
@@ -123,59 +226,81 @@ ${base}` : base,
 
       {/* ── In-flight update ─────────────────────────────────────── */}
       {busy && (
-        <div className="rounded-lg border border-brand-800/50 bg-brand-950/30 p-3 space-y-2">
+        <div className="rounded-lg border border-brand-800/50 bg-brand-900/30 p-3 space-y-2">
           <div className="flex items-center gap-2 text-sm text-brand-700 dark:text-brand-200">
             <Loader2 className="h-4 w-4 animate-spin" />
             <span>
               {restarting
                 ? t('Restarting services…', 'Перезапуск сервисов…')
-                : (status.data?.message || t('Updating…', 'Обновление…'))}
+                : launching && !ACTIVE_STATES.includes(view?.state ?? '')
+                  ? t('Starting the update…', 'Запуск обновления…')
+                  : (view?.message || t('Updating…', 'Обновление…'))}
             </span>
             <span className="ml-auto font-mono text-xs text-brand-300">
-              {status.data?.pct ?? 0}%
+              {launching && !ACTIVE_STATES.includes(view?.state ?? '') ? 0 : (view?.pct ?? 0)}%
             </span>
           </div>
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-800">
             <div
               className="h-full rounded-full bg-brand-500 transition-all duration-500"
-              style={{ width: `${Math.min(100, Math.max(0, status.data?.pct ?? 0))}%` }}
+              style={{ width: `${launching && !ACTIVE_STATES.includes(view?.state ?? '') ? 0 : Math.min(100, Math.max(0, view?.pct ?? 0))}%` }}
             />
           </div>
-          {status.data?.request_pending && status.data?.state === 'queued' && (
+          {view?.request_pending && view?.state === 'queued' && (
             <p className="text-[11px] text-gray-400 flex items-start gap-1.5">
               <Info className="mt-0.5 h-3 w-3 shrink-0" />
               {t(
-                'Waiting for the host update agent. If this does not move, the agent is not installed — run scripts/pitun-update.sh --install-timer on the box.',
-                'Ожидание агента обновления на хосте. Если ничего не меняется, агент не установлен — запустите scripts/pitun-update.sh --install-timer на коробке.',
+                'Waiting for the host update agent. If this does not move, the agent is not installed — run scripts/pitun-update.sh --install-agent on the box.',
+                'Ожидание агента обновления на хосте. Если ничего не меняется, агент не установлен — запустите scripts/pitun-update.sh --install-agent на коробке.',
               )}
             </p>
           )}
         </div>
       )}
 
+      {!busy && launchNote && (
+        <div className="rounded-lg border border-gray-700 bg-gray-800/40 px-3 py-2 text-sm text-gray-300 flex items-start gap-2">
+          <Info className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{launchNote}</span>
+        </div>
+      )}
+
+      {start.isError && (
+        <div className="rounded-lg border border-red-800/50 bg-red-950/30 px-3 py-2 text-sm text-red-200 flex items-start gap-2">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{apiErrorText(start.error, t('Could not start the update', 'Не удалось запустить обновление'))}</span>
+        </div>
+      )}
+
       {/* ── Terminal state from the last run ─────────────────────── */}
-      {!busy && status.data?.state === 'done' && (
+      {showDone && (
         <div className="rounded-lg border border-green-200 dark:border-green-800/50 bg-green-50 dark:bg-green-950/30 px-3 py-2 text-sm text-green-800 dark:text-green-200 flex items-start gap-2">
           <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
             {t('Updated to ', 'Обновлено до ')}
-            <span className="font-mono">{status.data.to}</span>
-            {status.data.from ? ` (${t('was', 'было')} ${status.data.from})` : ''}
+            <span className="font-mono">{status.data?.to}</span>
+            {status.data?.from ? ` (${t('was', 'было')} ${status.data?.from})` : ''}
           </span>
+          <button type="button" onClick={dismiss} aria-label={t('Dismiss', 'Закрыть')} className="ml-auto text-green-700/70 hover:text-green-600 dark:text-green-300/70 dark:hover:text-green-200">
+            <X className="h-4 w-4" />
+          </button>
         </div>
       )}
-      {!busy && status.data?.state === 'failed' && (
+      {showFailed && (
         <div className="rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-sm text-red-800 dark:text-red-200 flex items-start gap-2">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
             {t('Update failed: ', 'Обновление не удалось: ')}
-            {status.data.message || t('see the agent log on the box', 'смотрите лог агента на коробке')}
+            {status.data?.message || t('see the agent log on the box', 'смотрите лог агента на коробке')}
             {' — '}
             {t(
               'the pre-update database snapshot is kept under /opt/pitun/data-backup-pre-*.db.',
               'снапшот базы, снятый перед обновлением, лежит в /opt/pitun/data-backup-pre-*.db.',
             )}
           </span>
+          <button type="button" onClick={dismiss} aria-label={t('Dismiss', 'Закрыть')} className="ml-auto shrink-0 text-red-700/70 hover:text-red-600 dark:text-red-300/70 dark:hover:text-red-200">
+            <X className="h-4 w-4" />
+          </button>
         </div>
       )}
 

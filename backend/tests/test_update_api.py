@@ -137,7 +137,7 @@ class TestStartEndpoint:
             "/api/system/update/start", json={"version": "v9.9.9"},
             headers=auth_headers,
         )
-        leftovers = list(data_dir.glob(".update-request.*"))
+        leftovers = list(data_dir.glob(".update-*"))
         assert leftovers == [], "temp file left behind"
 
 
@@ -181,6 +181,30 @@ class TestStatusEndpoint:
         (data_dir / "update-request.json").write_text("{}")
         body = client.get("/api/system/update/status", headers=auth_headers).json()
         assert body["request_pending"] is True
+
+
+    def test_a_queued_request_reads_as_in_flight_even_over_an_old_terminal_state(
+        self, client, admin_user, auth_headers, data_dir,
+    ):
+        """The status file keeps the PREVIOUS run (failed/done) until the agent
+        starts. A request that nobody picked up yet must read as queued, or the
+        UI sees idle, stops polling and offers the button again."""
+        import json
+        (data_dir / "update-status.json").write_text(json.dumps(
+            {"state": "failed", "pct": 90, "step": "install", "message": "old", "ok": False}))
+        (data_dir / "update-request.json").write_text("{}")
+        body = client.get("/api/system/update/status", headers=auth_headers).json()
+        assert body["state"] == "queued" and body["pct"] == 0 and body["request_pending"] is True
+
+    def test_a_running_update_is_reported_as_it_is(
+        self, client, admin_user, auth_headers, data_dir,
+    ):
+        import json
+        (data_dir / "update-status.json").write_text(json.dumps(
+            {"state": "running", "pct": 45, "step": "host", "message": "x", "ok": None}))
+        (data_dir / "update-request.json").write_text("{}")
+        body = client.get("/api/system/update/status", headers=auth_headers).json()
+        assert body["state"] == "running" and body["pct"] == 45
 
 
 class TestDowngradeWarning:
@@ -227,3 +251,45 @@ class TestDowngradeWarning:
         with self._patch_fetch(None):
             body = client.get("/api/system/update/check", headers=auth_headers).json()
         assert body["target_lacks_update_ui"] is False
+
+
+class TestStartSeed:
+    def test_the_seed_is_complete_json_and_nothing_is_left_behind(
+        self, client, admin_user, auth_headers, data_dir,
+    ):
+        client.post("/api/system/update/start", json={}, headers=auth_headers)
+        seed = json.loads((data_dir / "update-status.json").read_text())
+        assert seed["state"] == "queued"
+        assert list(data_dir.glob(".update-*")) == []
+
+    def test_a_failing_seed_write_does_not_block_the_request(
+        self, client, admin_user, auth_headers, data_dir, monkeypatch,
+    ):
+        from app.core import updater
+
+        real = updater.os.replace
+        def flaky(src, dst, *a, **k):
+            if str(dst).endswith("update-status.json"):
+                raise OSError("read-only")
+            return real(src, dst, *a, **k)
+        monkeypatch.setattr(updater.os, "replace", flaky)
+        resp = client.post("/api/system/update/start", json={}, headers=auth_headers)
+        assert resp.status_code == 202
+        assert (data_dir / "update-request.json").exists()
+
+
+class TestStatusWithControlBytes:
+    def test_a_colour_code_inside_the_message_does_not_make_the_status_unknown(
+        self, client, admin_user, auth_headers, data_dir,
+    ):
+        """An older agent wrote the installer's colour codes into `message`; the
+        raw ESC byte is invalid JSON, and the UI read that as "nothing running"."""
+        (data_dir / "update-status.json").write_text(
+            '{"state": "running", "pct": 45, "step": "host", '
+            '"message": "\x1b[0;34m[STEP]\x1b[0m  Preparing host", "ok": null, '
+            '"updated_at": "2026-11-04T12:58:38Z"}',
+            encoding="utf-8",
+        )
+        body = client.get("/api/system/update/status", headers=auth_headers).json()
+        assert body["state"] == "running"
+        assert body["pct"] == 45

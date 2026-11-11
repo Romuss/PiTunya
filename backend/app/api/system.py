@@ -1,14 +1,16 @@
 """System control: start/stop/status/mode/settings."""
+import asyncio
 import json
 import logging
 import subprocess
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.database import get_session
+from app.core.dataplane import dispatch_dataplane
+from app.database import get_async_engine, get_session
 from app.models import BalancerGroup, Device, DNSRule, Node, RoutingRule, RoutingSet, Settings as DBSettings
 from app.core.device_scanner import get_device_macs_for_mode
 from app.schemas import (
@@ -460,17 +462,25 @@ async def _apply_nftables(session: AsyncSession, settings_map: dict) -> str:
 
 
 @router.post("/start", status_code=204)
-async def start_proxy(session: AsyncSession = Depends(get_session)):
-    from app.core.xray import xray_manager
-
+async def start_proxy(
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
     await _regenerate_and_write(session)
     settings_map = await _load_settings_map(session)
-    inbound_mode = await _apply_nftables(session, settings_map)
 
-    if xray_manager.is_running:
-        await xray_manager.reload()
-    else:
-        await xray_manager.start()
+    # xray FIRST, nftables SECOND (same order as the routing-set path).
+    # Applying nftables first meant a failed start — busy lock, missing
+    # binary, bad config — left the whole LAN redirected into a TPROXY
+    # port nobody was listening on: total loss of internet from a state
+    # that was working a second earlier.
+    #
+    # Both run AFTER the response: starting xray drops every connection
+    # it carries, including the browser that issued this request when the
+    # UI is reached through the box. See core/dataplane.py.
+    await dispatch_dataplane(background_tasks, "start")
+
+    inbound_mode = settings_map.get("inbound_mode", "tproxy")
 
     if inbound_mode in ("tun", "both"):
         auto_route = settings_map.get("tun_auto_route", "true").lower() == "true"
@@ -488,31 +498,29 @@ async def start_proxy(session: AsyncSession = Depends(get_session)):
 
 
 @router.post("/stop", status_code=204)
-async def stop_proxy(session: AsyncSession = Depends(get_session)):
-    from app.core.xray import xray_manager
-    from app.core.nftables import nftables_manager
-
-    settings_map = await _load_settings_map(session)
-    kill_switch = settings_map.get("kill_switch", "false").lower() == "true"
-    if kill_switch:
-        vpn_ips = await _collect_vpn_server_ips(session)
-        await nftables_manager.apply_kill_switch(vpn_server_ips=vpn_ips)
-
-    await xray_manager.stop()
-
-    if not kill_switch:
-        await nftables_manager.flush()
+async def stop_proxy(
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    # Deferred for the same reason as the other lifecycle calls: stopping
+    # xray severs the operator's own session when the UI is reached
+    # through it, so the request would die before it could answer.
+    await dispatch_dataplane(background_tasks, "stop")
 
 
 @router.post("/restart", status_code=204)
-async def restart_proxy(session: AsyncSession = Depends(get_session)):
-    from app.core.xray import xray_manager
-
+async def restart_proxy(
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
     await _regenerate_and_write(session)
     settings_map = await _load_settings_map(session)
-    inbound_mode = await _apply_nftables(session, settings_map)
 
-    await xray_manager.restart()
+    # xray first, then nftables — see start_proxy — and both after the
+    # response, since a restart drops the caller's own connection.
+    await dispatch_dataplane(background_tasks, "restart")
+
+    inbound_mode = settings_map.get("inbound_mode", "tproxy")
 
     if inbound_mode in ("tun", "both"):
         auto_route = settings_map.get("tun_auto_route", "true").lower() == "true"
@@ -527,24 +535,47 @@ async def restart_proxy(session: AsyncSession = Depends(get_session)):
 
 
 @router.post("/reload-config", status_code=204)
-async def reload_config(session: AsyncSession = Depends(get_session)):
-    """Regenerate xray config, re-apply nftables, and hot-reload."""
-    from app.core.xray import xray_manager
+async def reload_config(
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    """Regenerate xray config, then re-apply the dataplane after answering.
 
+    The regeneration (and its `xray run -test` validation) stays inside the
+    request so a bad config still fails loudly; only the process restart is
+    deferred.
+    """
     await _regenerate_and_write(session)
-    settings_map = await _load_settings_map(session)
-    await _apply_nftables(session, settings_map)
-
-    if xray_manager.is_running:
-        await xray_manager.reload()
+    await dispatch_dataplane(background_tasks, "reload")
 
 
 # ── Mode ──────────────────────────────────────────────────────────────────────
 
 @router.post("/mode", status_code=204)
-async def set_mode(body: ModeUpdate, session: AsyncSession = Depends(get_session)):
+async def set_mode(
+    body: ModeUpdate,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    from app.core.xray import xray_manager
+
     await _set_setting(session, "mode", body.mode)
     await session.commit()
+
+    # The mode drives BOTH layers: `bypass` flushes nftables and makes
+    # config_gen emit a catch-all direct rule. Writing the setting alone
+    # left the dataplane on the previous mode while the UI (which reads
+    # the setting back) claimed the switch had happened — the two only
+    # converged later, as a side effect of some unrelated edit.
+    if xray_manager.is_running:
+        await _regenerate_and_write(session)
+        await dispatch_dataplane(background_tasks, "reload")
+
+
+# How long to wait for xray's gRPC API after a reload before giving up on
+# pinning a circle balancer. Config parse + geo .dat load on a Pi is
+# comfortably under this.
+_PIN_API_WAIT = 8.0
 
 
 async def _pin_circle_balancer(session: AsyncSession, node_id: int) -> None:
@@ -552,23 +583,67 @@ async def _pin_circle_balancer(session: AsyncSession, node_id: int) -> None:
     balancer to it via gRPC balancerOverride. The config routes circle proxy
     traffic at a balancer over all members (cold-start strategy = random), so
     after a (re)load we must override to the actually-selected node.
-    Best-effort — silently skipped if the API isn't up."""
+
+    `reload()` returns as soon as the process is spawned, but xray needs
+    a second or two to parse its config, load the geo `.dat` files and
+    open the gRPC port — so a single `is_api_available()` probe right
+    after a reload almost always missed, the override was skipped, and
+    the balancer stayed on its cold-start `random` strategy: every new
+    connection went to a random circle member (including ones a
+    failover had just rejected) while the UI showed one specific node.
+    Retry for a few seconds instead, and log a warning if it never
+    lands — a silent debug line hid this for a whole release.
+    """
+    log = logging.getLogger(__name__)
     try:
         from app.core import xray_api
         from app.core.config_gen import resolve_active_circle
         from app.models import NodeCircle
         circles = list((await session.exec(select(NodeCircle))).all())
         cid, member_ids = resolve_active_circle(circles, node_id)
-        if cid and node_id in (member_ids or []) and await xray_api.is_api_available():
-            await xray_api.override_balancer(f"circle-{cid}", [f"node-{node_id}"])
+        if not (cid and node_id in (member_ids or [])):
+            return
+
+        deadline = asyncio.get_event_loop().time() + _PIN_API_WAIT
+        delay = 0.2
+        while True:
+            if await xray_api.is_api_available():
+                await xray_api.override_balancer(f"circle-{cid}", [f"node-{node_id}"])
+                return
+            if asyncio.get_event_loop().time() >= deadline:
+                log.warning(
+                    "circle %s balancer not pinned to node %s: xray gRPC API "
+                    "did not come up within %.0fs — traffic will spread over "
+                    "all circle members until the next rotation",
+                    cid, node_id, _PIN_API_WAIT,
+                )
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 1.0)
     except Exception as exc:
-        logging.getLogger(__name__).debug("pin circle balancer skipped: %s", exc)
+        log.warning("pin circle balancer failed: %s", exc)
+
+
+async def _pin_circle_balancer_task(node_id: int) -> None:
+    """Background-task wrapper for `_pin_circle_balancer`.
+
+    Runs after the response, so the request's session is already closed —
+    open a fresh one. Queued after the reload task, which is the order
+    that matters: the override only sticks once the new xray is up.
+    """
+    try:
+        async with AsyncSession(get_async_engine()) as session:
+            await _pin_circle_balancer(session, node_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("deferred circle pin failed: %s", exc)
 
 
 @router.post("/active-node", status_code=204)
-async def set_active_node(body: ActiveNodeUpdate, session: AsyncSession = Depends(get_session)):
-    from app.core.xray import xray_manager
-
+async def set_active_node(
+    body: ActiveNodeUpdate,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
     node = await session.get(Node, body.node_id)
     if not node:
         raise HTTPException(404, "Node not found")
@@ -581,11 +656,12 @@ async def set_active_node(body: ActiveNodeUpdate, session: AsyncSession = Depend
     # activating a WireGuard chain left traffic exiting the old node and the
     # real exit IP never changed, even though the UI showed the new node.
     await _regenerate_and_write(session)
-    settings_map = await _load_settings_map(session)
-    await _apply_nftables(session, settings_map)
-    if xray_manager.is_running:
-        await xray_manager.reload()
-    await _pin_circle_balancer(session, body.node_id)
+    # Deferred: the reload restarts xray, and this very response travels
+    # through it whenever the operator reaches the UI via the box. Doing
+    # it inline made the browser show "Network Error" (nginx logged a 499)
+    # on a switch that had in fact applied.
+    await dispatch_dataplane(background_tasks, "reload")
+    background_tasks.add_task(_pin_circle_balancer_task, body.node_id)
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -615,11 +691,24 @@ async def get_settings(session: AsyncSession = Depends(get_session)):
         except (ValueError, TypeError):
             return default
 
-    # Auto-detect PiTun IP from interface; sync to DB so device_scanner sees it
-    iface = m.get("interface") or env_settings.interface
+    # Auto-detect PiTun IP from interface; sync to DB so device_scanner sees it.
+    #
+    # In router mode the LAN lives on `lan_interface`, and the legacy
+    # `interface` key still names whichever NIC the box was installed on —
+    # frequently the one now facing the ISP. Reading that here meant every
+    # panel poll committed the ISP-assigned WAN address as `gateway_ip`, which
+    # the device scanner and the UI both treat as "us on the LAN". The
+    # write-back is skipped entirely in router mode: the LAN address is
+    # operator-chosen there, not something to be inferred and overwritten.
+    router_mode_on = m.get("operating_mode", "gateway") == "router"
+    iface = (
+        (m.get("lan_interface") or m.get("interface") or env_settings.interface)
+        if router_mode_on
+        else (m.get("interface") or env_settings.interface)
+    )
     detected_ip = _detect_ip(iface)
     effective_ip = detected_ip or m.get("gateway_ip") or env_settings.gateway_ip
-    if detected_ip and m.get("gateway_ip") != detected_ip:
+    if detected_ip and m.get("gateway_ip") != detected_ip and not router_mode_on:
         row = await session.exec(select(DBSettings).where(DBSettings.key == "gateway_ip"))
         s = row.first()
         if s:
@@ -662,6 +751,10 @@ async def get_settings(session: AsyncSession = Depends(get_session)):
         fakedns_pool_size=_int("fakedns_pool_size", 65535),
         dns_sniffing=m.get("dns_sniffing", "true").lower() == "true",
         bypass_cn_dns=m.get("bypass_cn_dns", "false").lower() == "true",
+        xray_fragment_enabled=m.get("xray_fragment_enabled", "false").lower() == "true",
+        xray_fragment_packets=m.get("xray_fragment_packets", "tlshello"),
+        xray_fragment_length=m.get("xray_fragment_length", "100-200"),
+        xray_fragment_interval=m.get("xray_fragment_interval", "10-20"),
         bypass_ru_dns=m.get("bypass_ru_dns", "false").lower() == "true",
         bypass_private=m.get("bypass_private", "true").lower() == "true",
         log_level=m.get("log_level", "warning"),
@@ -683,6 +776,33 @@ async def get_settings(session: AsyncSession = Depends(get_session)):
         auto_restart_xray=m.get("auto_restart_xray", "true").lower() == "true",
         dns_query_log_enabled=m.get("dns_query_log_enabled", "false").lower() == "true",
         device_routing_mode=m.get("device_routing_mode", "all"),
+        operating_mode=m.get("operating_mode", "gateway"),
+        wan_interface=m.get("wan_interface", ""),
+        lan_interface=m.get("lan_interface", ""),
+        dhcp_enabled=(m.get("dhcp_enabled", "true").lower() == "true"),
+        dhcp_pool_start=m.get("dhcp_pool_start", ""),
+        dhcp_pool_end=m.get("dhcp_pool_end", ""),
+        dhcp_lease_hours=_safe_int(m, "dhcp_lease_hours", 12),
+        wifi_enabled=(m.get("wifi_enabled", "false").lower() == "true"),
+        lan_extra_interfaces=m.get("lan_extra_interfaces", ""),
+        wan_admin_access=m.get("wan_admin_access", "false").lower() == "true",
+        wan_ssh_access=m.get("wan_ssh_access", "false").lower() == "true",
+        wan_allow_tcp=m.get("wan_allow_tcp", ""),
+        wan_allow_udp=m.get("wan_allow_udp", ""),
+        wifi_ssid=m.get("wifi_ssid") or "PiTun",
+        wifi_country=m.get("wifi_country", ""),
+        wifi_band=m.get("wifi_band", "2.4"),
+        wifi_channel=_safe_int(m, "wifi_channel", 0),
+        wifi_security=m.get("wifi_security", "wpa2"),
+        wifi_hidden=(m.get("wifi_hidden", "false").lower() == "true"),
+        wan_mode=m.get("wan_mode", "dhcp"),
+        wan_vlan_id=_safe_int(m, "wan_vlan_id", 0),
+        wan_mac_clone=m.get("wan_mac_clone", ""),
+        wan_static_address=m.get("wan_static_address", ""),
+        wan_static_gateway=m.get("wan_static_gateway", ""),
+        wan_static_dns=m.get("wan_static_dns", ""),
+        wan_pppoe_user=m.get("wan_pppoe_user", ""),
+        wan_pppoe_service=m.get("wan_pppoe_service", ""),
         disable_ipv6=_detect_sysctl_bool("net.ipv6.conf.all.disable_ipv6", m.get("disable_ipv6", "false").lower() == "true"),
         dns_over_tcp=_detect_resolv_use_vc(m.get("dns_over_tcp", "false").lower() == "true"),
         health_interval=_int("health_interval", env_settings.health_interval),
@@ -701,9 +821,19 @@ async def get_settings(session: AsyncSession = Depends(get_session)):
         # the wire by design (LAN-intruder threat model).
         xui_panel_bypass=m.get("xui_panel_bypass", "false").lower() == "true",
         chain_drift_check=m.get("chain_drift_check", "true").lower() == "true",
+        circle_http_probe=m.get("circle_http_probe", "true").lower() == "true",
         lan_proxy_auth_enabled=m.get("lan_proxy_auth_enabled", "false").lower() == "true",
         lan_proxy_auth_user=m.get("lan_proxy_auth_user", ""),
         lan_proxy_auth_pass=m.get("lan_proxy_auth_pass", ""),
+        **{
+            key: _safe_int(m, key, default)
+            for key, default in (
+                ("xray_handshake", 10), ("xray_conn_idle", 3600),
+                ("xray_uplink_only", 0), ("xray_downlink_only", 0),
+                ("xray_tcp_keepalive_idle", 100),
+                ("xray_tcp_keepalive_interval", 15),
+            )
+        },
     )
 
 
@@ -784,6 +914,25 @@ async def get_system_metrics(
 async def update_settings(body: SettingsUpdate, session: AsyncSession = Depends(get_session)):
     patches = body.model_dump(exclude_unset=True)
 
+    # Xray policy bounds. These knobs are easy to get wrong and the
+    # symptom of a bad value (`connIdle: 30`) looks like a flaky network,
+    # not a misconfiguration — so reject out-of-range values at the API
+    # boundary with a message that says what the range is.
+    from app.core.xray_policy import BOUNDS as _POLICY_BOUNDS
+
+    for key, (low, high) in _POLICY_BOUNDS.items():
+        value = patches.get(key)
+        if value is None:
+            continue
+        if not (low <= int(value) <= high):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{key} must be between {low} and {high} seconds "
+                    f"(got {value})."
+                ),
+            )
+
     # LAN proxy auth invariant — when the user enables auth, both
     # username and password must be non-empty. Validate against the
     # *post-merge* state: if the patch flips `_enabled=true` but
@@ -820,6 +969,174 @@ async def update_settings(body: SettingsUpdate, session: AsyncSession = Depends(
     # but the runtime keeps the old mode. See backlog item 1 in
     # notes.md ("TUN/Both silently bricks proxy"). The snapshot is
     # cheap: a single Settings row read.
+    # Router mode needs a WAN and a LAN. Refuse it on hardware that has only
+    # one physical NIC — the UI hides the option there, but the API is the
+    # real gate: accepting it would leave a setting the dataplane can never
+    # honour, and (once phases 1-2 land) could take the box off the network.
+    if patches.get("operating_mode") == "router":
+        from app.core.network_config import list_interfaces
+        nics = list_interfaces()
+        if len(nics) < 2:
+            raise HTTPException(
+                400,
+                f"Router mode needs at least 2 physical network interfaces; "
+                f"this box has {len(nics)}"
+                + (f" ({', '.join(n['name'] for n in nics)})" if nics else "")
+                + ". Keep 'gateway' mode: devices point their gateway at PiTun "
+                  "and your existing router keeps doing DHCP and NAT.",
+            )
+    if patches.get("operating_mode") not in (None, "gateway", "router"):
+        raise HTTPException(400, "operating_mode must be 'gateway' or 'router'")
+
+    # Port roles. Validated whenever either role is being set, and again as a
+    # completeness check when router mode is switched on — a router with no
+    # WAN, or with one port doing both jobs, is not a configuration we should
+    # ever persist and then try to apply.
+    if any(k in patches for k in (
+        "wan_interface", "lan_interface", "lan_extra_interfaces",
+        "operating_mode", "wifi_enabled",
+    )):
+        from app.core.network_config import list_interfaces, wifi_capabilities
+
+        async def _current(key: str) -> str:
+            row = (await session.exec(
+                select(DBSettings).where(DBSettings.key == key)
+            )).first()
+            return row.value if row else ""
+
+        wan = patches.get("wan_interface")
+        lan = patches.get("lan_interface")
+        wan = await _current("wan_interface") if wan is None else wan
+        lan = await _current("lan_interface") if lan is None else lan
+        mode = patches.get("operating_mode")
+        if mode is None:
+            mode = await _current("operating_mode") or "gateway"
+
+        extras_raw = patches.get("lan_extra_interfaces")
+        if extras_raw is None:
+            extras_raw = await _current("lan_extra_interfaces")
+        extras = [p for p in (extras_raw or "").replace(",", " ").split() if p]
+        members = ([lan] if lan else []) + [p for p in extras if p != lan]
+
+        # Leaving router mode is never blocked. These checks describe what a
+        # working router needs; a box on its way back to gateway needs none of
+        # it, and refusing the request because the stored router config no
+        # longer validates is how an operator gets stranded — which is exactly
+        # what happened once the LAN ports were bridged and stopped looking
+        # like standalone role candidates. Gateway is the safe resting state
+        # and nothing may stand between the operator and it.
+        if patches.get("operating_mode") == "gateway":
+            pass
+        elif wan or lan:
+            names = {i["name"] for i in list_interfaces()}
+            for role, value in (("wan_interface", wan), ("lan_interface", lan)):
+                if value and value not in names:
+                    raise HTTPException(
+                        400,
+                        f"{role} '{value}' is not a physical interface on this box "
+                        f"({', '.join(sorted(names)) or 'none detected'})",
+                    )
+            if wan and lan and wan == lan:
+                raise HTTPException(
+                    400,
+                    f"WAN and LAN cannot be the same port ('{wan}') — router mode "
+                    "needs one port facing the ISP and another facing the network.",
+                )
+
+            # Extra LAN ports. They get bridged into one segment with the
+            # primary, so every one of them must be a real port on this box
+            # and none of them may be the uplink — bridging the WAN into the
+            # LAN would put the ISP and the home network on one wire.
+            for value in extras:
+                if value not in names:
+                    raise HTTPException(
+                        400,
+                        f"LAN port '{value}' is not a physical interface on this "
+                        f"box ({', '.join(sorted(names)) or 'none detected'})",
+                    )
+                if wan and value == wan:
+                    raise HTTPException(
+                        400,
+                        f"'{value}' is the uplink. Bridging it into the LAN would "
+                        f"put the ISP and your network on the same segment.",
+                    )
+            radios = [p for p in members if wifi_capabilities(p)["wireless"]]
+            if len(radios) > 1:
+                raise HTTPException(
+                    400,
+                    f"Only one radio can serve the LAN ({', '.join(radios)}). "
+                    f"A second access point needs its own SSID and channel, "
+                    f"which is not something this page configures.",
+                )
+            if len(members) > 1 and len(radios) == len(members):
+                raise HTTPException(
+                    400,
+                    "A LAN of several ports is built as a bridge, which needs "
+                    "at least one wired port to build on.",
+                )
+            # Serving the LAN over WiFi means running an access point, which
+            # only some radios can do. Catch it here rather than at hostapd
+            # start, which happens after the working setup is torn down.
+            # One radio cannot be an access point and a client at the same
+            # time. Different netdevs on the SAME phy look like separate
+            # interfaces but share the hardware, so comparing names isn't
+            # enough — compare the phy behind them.
+            if wan and lan:
+                from app.core.network_config import _phy_for
+                wan_phy, lan_phy = _phy_for(wan), _phy_for(lan)
+                if wan_phy and lan_phy and wan_phy == lan_phy:
+                    raise HTTPException(
+                        400,
+                        f"'{wan}' and '{lan}' are the same radio ({wan_phy}). One "
+                        "adapter cannot be an access point for the LAN and a "
+                        "client on the WAN at once — use separate hardware for "
+                        "the two roles.",
+                    )
+            if lan:
+                cap = wifi_capabilities(lan)
+                if cap["wireless"] and cap["ap_capable"] is False:
+                    raise HTTPException(
+                        400,
+                        f"'{lan}' is a client-only wireless adapter — it cannot serve "
+                        "the LAN. Use a wired port for LAN, or a WiFi adapter that "
+                        "supports AP mode.",
+                    )
+                if cap["wireless"] and cap["ap_capable"] is None:
+                    raise HTTPException(
+                        400,
+                        f"Cannot confirm '{lan}' supports AP mode: {cap['detail']}. "
+                        "Resolve that before assigning it as the LAN port.",
+                    )
+
+        # Enabling WiFi on a wired LAN port is refused here rather than by
+        # apply(): apply() checks it *inside* the block that rolls everything
+        # back, so the same mistake would drop NAT, DHCP and the uplink on a
+        # working router before returning the error.
+        wifi_on = patches.get("wifi_enabled")
+        if wifi_on is None:
+            wifi_on = (await _current("wifi_enabled")).lower() == "true"
+        if wifi_on and lan:
+            from app.core.network_config import is_wireless
+            # Any LAN member may be the radio, not just the primary. The
+            # natural multi-port setup is a wired port carrying the address
+            # with the radio bridged alongside it — refusing that would rule
+            # out the configuration this feature exists for.
+            if not any(is_wireless(p) for p in members):
+                raise HTTPException(
+                    400,
+                    f"WiFi is enabled but none of the LAN ports "
+                    f"({', '.join(members)}) is a wireless adapter. Add the "
+                    f"radio to the LAN, or turn WiFi off.",
+                )
+
+        if mode == "router" and (not wan or not lan):
+            missing = " and ".join(
+                r for r, v in (("a WAN port", wan), ("a LAN port", lan)) if not v
+            )
+            raise HTTPException(
+                400, f"Router mode needs {missing} assigned before it can be enabled.",
+            )
+
     inbound_mode_was = None
     if "inbound_mode" in patches and patches["inbound_mode"] is not None:
         existing_row = (await session.exec(
@@ -827,8 +1144,31 @@ async def update_settings(body: SettingsUpdate, session: AsyncSession = Depends(
         )).first()
         inbound_mode_was = existing_row.value if existing_row else "tproxy"
 
+    # Secrets the API never returns. The UI renders them as empty fields
+    # meaning "leave as-is", so an empty value here is the *absence* of an
+    # edit, not a request to clear one. Writing it through would destroy a
+    # working WPA key or ISP password with no way to recover it from the
+    # panel — and then fail the next apply on the blank value.
+    _WRITE_ONLY_SECRETS = {"wifi_passphrase", "wan_pppoe_password"}
+
+    # What the settings actually looked like before this request. Used below to
+    # tell a real change from a save that rewrites the same values: applying
+    # router mode tears the bridge down and rebuilds it, restarts hostapd and
+    # dnsmasq, and drops every client connection on the LAN. Doing that for a
+    # no-op is how a settings save kicked everyone off a working router — and
+    # re-armed the confirm window, so a box nobody thought to confirm again
+    # reverted three minutes later.
+    _before = {r.key: r.value for r in (await session.exec(select(DBSettings))).all()}
+
+    def _as_stored(value) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        return json.dumps(value) if isinstance(value, list) else str(value)
+
     for key, value in patches.items():
         if value is None:
+            continue
+        if key in _WRITE_ONLY_SECRETS and value == "":
             continue
         if key == "failover_node_ids":
             await _set_setting(session, key, json.dumps(value))
@@ -937,6 +1277,85 @@ async def update_settings(body: SettingsUpdate, session: AsyncSession = Depends(
                     f"invalid xray config — change reverted. "
                     f"Details: {diag}"
                 ),
+            )
+
+    # Reconcile router mode with the dataplane. Runs whenever anything it
+    # depends on moved — including a switch back to gateway, which has to tear
+    # the router rules down rather than leave them applied under a mode that
+    # says they aren't.
+    #
+    # A failure here reverts `operating_mode` to gateway before surfacing the
+    # error: the orchestrator has already rolled the dataplane back, so
+    # leaving the setting saying "router" would mean the UI claims a mode the
+    # box isn't in, and the next boot would retry a config we know fails.
+    # Every key router_mode.apply() reads. Omitting the wifi_*/wan_* ones meant
+    # a WiFi-only or WAN-only save persisted, returned 200 and regenerated
+    # nothing — an operator rotating a leaked WPA passphrase would believe the
+    # old one was dead while the AP kept serving it.
+    _ROUTER_KEYS = {
+        "operating_mode", "wan_interface", "lan_interface",
+        "dhcp_enabled", "dhcp_pool_start", "dhcp_pool_end", "dhcp_lease_hours",
+        "wifi_enabled", "wifi_ssid", "wifi_passphrase", "wifi_country",
+        "wifi_band", "wifi_channel", "wifi_security", "wifi_hidden",
+        "lan_extra_interfaces",
+        "wan_admin_access", "wan_ssh_access", "wan_allow_tcp", "wan_allow_udp",
+        "wan_mode", "wan_vlan_id", "wan_mac_clone",
+        "wan_static_address", "wan_static_gateway", "wan_static_dns",
+        "wan_pppoe_user", "wan_pppoe_password", "wan_pppoe_service",
+    }
+    # Only keys whose value actually moved. A save that rewrites what was
+    # already there must not touch the network: rebuilding the dataplane is
+    # indistinguishable, from a client's point of view, from the router going
+    # down and coming back.
+    _router_changed = {
+        k for k in _ROUTER_KEYS & set(patches)
+        if patches[k] is not None
+        and not (k in _WRITE_ONLY_SECRETS and patches[k] == "")
+        and _as_stored(patches[k]) != _before.get(k, "")
+    }
+    if _router_changed:
+        logger.info("Router settings changed: %s — reconciling dataplane",
+                    ", ".join(sorted(_router_changed)))
+        from app.core import router_mode, router_watchdog
+        going_router = (
+            patches.get("operating_mode") == "router"
+            or (patches.get("operating_mode") is None
+                and (await _get_setting(session, "operating_mode")) == "router")
+        )
+        # Armed BEFORE the apply, not after. The watchdog exists for applies
+        # that wedge the box — and those are exactly the ones that never reach
+        # a line after `apply()`. Arming afterwards meant the rescue timer was
+        # set only for applies that didn't need it, while a wedging one left
+        # nothing pending, so `recover_on_boot()` found nothing to undo and the
+        # boot reconcile re-applied the same broken config forever.
+        #
+        # Arming early is harmless if the apply then fails: teardown has
+        # already run, and the disarm below clears the window.
+        if going_router:
+            await router_watchdog.arm(session)
+        try:
+            result = await router_mode.apply(session)
+            # Switching back to gateway is the safe direction — no undo timer,
+            # and any window left over from a previous attempt is cleared so
+            # the banner doesn't keep counting down against a gateway box.
+            if result.get("mode") != "router":
+                await router_watchdog.confirm(session)
+        except router_mode.RouterModeError as exc:
+            # Unconditional: apply() has already torn the dataplane down, so
+            # the box IS in gateway mode. Gating this on "did this request set
+            # the mode" left a row saying "router" over a gateway dataplane
+            # whenever some other router key triggered the failure — and the
+            # boot reconcile then repeated the same failure forever.
+            await _set_setting(session, "operating_mode", "gateway")
+            # The dataplane is already back in gateway, so a pending window
+            # would only fire an alarming "reverted automatically" event
+            # against a box that is already safe.
+            await router_watchdog.confirm(session)
+            await session.commit()
+            raise HTTPException(
+                400,
+                f"Router mode could not be applied — the box stays in gateway "
+                f"mode and the network was left as it was. {exc}",
             )
 
     # Apply IPv6 toggle via bind-mounted host /proc/sys
@@ -1284,13 +1703,10 @@ async def _collect_naive_bypass_dsts(session: AsyncSession) -> List[str]:
     Domain names are resolved via ``socket.getaddrinfo`` (A records only).
 
     Resolution runs OFF the event loop thread (``asyncio.to_thread``)
-    and with a 2-second per-host budget. The earlier sync version
-    blocked the entire FastAPI event loop when /etc/resolv.conf was
-    misconfigured — observed in the wild on 192.168.1.4 during 1.3.3
-    burn-in: every API endpoint that touched ``_auto_reload_xray``
-    (routing-rule CRUD, ``/system/restart``) stalled forever because
-    the underlying ``getaddrinfo`` call wedged the loop while glibc
-    retried against zero nameservers.
+    and with a 2-second per-host budget. Resolving inline wedges the
+    whole event loop when /etc/resolv.conf is misconfigured: glibc
+    retries against zero nameservers and every endpoint touching
+    ``_auto_reload_xray`` stalls with it.
 
     DNS-broken or host-unreachable cases are absorbed silently
     (worst case: loop prevention doesn't apply until the host
@@ -1332,9 +1748,22 @@ async def update_status():
     """
     from app.core.updater import read_status, request_pending
 
+    return UpdateStatus(**_status_with_queue())
+
+
+def _status_with_queue() -> dict:
+    """The agent's status, except that a request nobody has picked up yet
+    reads as `queued`. Without this the file still holds the PREVIOUS run's
+    terminal state (done/failed) until the agent starts, so the UI saw "idle",
+    stopped polling and offered the button again."""
+    from app.core.updater import read_status, request_pending
+
     data = dict(read_status())
     data["request_pending"] = request_pending()
-    return UpdateStatus(**data)
+    if data["request_pending"] and data.get("state") not in ("queued", "running"):
+        data.update(state="queued", pct=0, step="queued", ok=None,
+                    message="Waiting for the host update agent")
+    return data
 
 
 @router.post("/update/start", status_code=202, response_model=UpdateStatus)
@@ -1368,6 +1797,4 @@ async def start_update(body: UpdateStartRequest):
             detail=f"Could not queue the update request: {exc}",
         )
 
-    data = dict(read_status())
-    data["request_pending"] = request_pending()
-    return UpdateStatus(**data)
+    return UpdateStatus(**_status_with_queue())

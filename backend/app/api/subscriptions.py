@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.ua_templates import build_subscription_headers
 from app.database import get_session, get_async_engine
 from app.models import Node, NodeCircle, RoutingRule, Settings as DBSettings, Subscription
 from app.schemas import SubscriptionCreate, SubscriptionRead, SubscriptionUpdate
@@ -16,89 +17,6 @@ from app.schemas import SubscriptionCreate, SubscriptionRead, SubscriptionUpdate
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
-
-# Happ client emulation — exposed as separate UA presets in the picker.
-#
-# Happ ships on iOS / Android / macOS / Windows. Stricter panels
-# (xtoolapp / marzban with per-OS rules) cross-validate the UA against
-# the `X-Device-Os` / `X-Ver-Os` / `X-Device-Model` headers — so all
-# four must describe the same device, otherwise the panel falls back to
-# a dummy "App not supported" placeholder.
-#
-# UA format that panels reliably accept: `Happ/<app_ver>/<os>/<os_ver>/<model>`.
-# OS segment is lowercased to mirror what real Happ sends; the
-# corresponding `X-Device-Os` header keeps the canonical case
-# (`iOS`, `Android`, `Windows`, `macOS`) — some panels look at both,
-# and a mismatch flips the fingerprint check.
-#
-# Each Happ flavour is its own UA key (`happ`, `happ-android`, …) so
-# the subscription-form dropdown lists them as discrete options. The
-# legacy `happ` key is an alias for the iOS profile to keep existing
-# subscriptions working without a migration.
-_HAPP_VERSION = "2.7.0"
-
-# happ-* ua key -> (X-Device-Os, X-Ver-Os, X-Device-Model)
-_HAPP_PROFILES: dict[str, tuple[str, str, str]] = {
-    "happ":         ("iOS",     "17.4",          "iPhone15,2"),
-    "happ-android": ("Android", "14",            "Pixel 8"),
-    "happ-windows": ("Windows", "11_10.0.26200", "DESKTOP-PiTun_x86_64"),
-    "happ-macos":   ("macOS",   "14.4",          "Mac15,7"),
-}
-
-
-def _happ_ua_for(ua_key: str) -> str:
-    """Build the User-Agent string for a Happ UA preset key."""
-    os_canonical, os_ver, model = _HAPP_PROFILES.get(ua_key, _HAPP_PROFILES["happ"])
-    return f"Happ/{_HAPP_VERSION}/{os_canonical.lower()}/{os_ver}/{model}"
-
-
-_UA_MAP = {
-    "v2ray": "v2rayN/6.60",
-    "clash": "clash.meta/1.18.0",
-    "sing-box": "sing-box/1.8.0",
-    "streisand": "Streisand/3.0",
-    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # All Happ presets resolved at module load.
-    **{k: _happ_ua_for(k) for k in _HAPP_PROFILES},
-}
-
-
-def _get_happ_headers(ua_key: str = "happ", *, rotate_hwid: bool = False) -> dict:
-    """Build the X-* header bundle that real Happ sends alongside its UA.
-
-    HWID is normally derived from `/etc/machine-id` (or a constant
-    fallback on non-Linux dev machines) and stable across refreshes —
-    most panels device-bind on first-seen HWID and rotating it would
-    silently break the subscription. We mix the profile into the seed
-    so different OS choices yield different HWIDs (real iOS vs Android
-    Happ instances would never share one).
-
-    When `rotate_hwid=True` (operator opt-in per subscription),
-    generate a fresh random UUID instead. Useful when a panel starts
-    HWID-throttling and returns degraded payloads to the stable
-    fingerprint — we've seen panels where the same HWID over time
-    starts getting placeholder 'proxy' dummies instead of real nodes.
-    """
-    import uuid, hashlib
-    if rotate_hwid:
-        hwid = str(uuid.uuid4())
-    else:
-        try:
-            with open("/etc/machine-id") as f:
-                seed = f.read().strip()
-        except FileNotFoundError:
-            seed = "pitun-default-seed"
-        hwid = str(uuid.UUID(hashlib.md5(f"pitun-happ-{seed}-{ua_key}".encode()).hexdigest()))
-    os_canonical, os_ver, model = _HAPP_PROFILES.get(ua_key, _HAPP_PROFILES["happ"])
-    return {
-        "X-App-Version": _HAPP_VERSION,
-        "X-Device-Locale": "RU",
-        "X-Device-Os": os_canonical,
-        "X-Device-Model": model,
-        "X-Hwid": hwid,
-        "X-Ver-Os": os_ver,
-    }
-
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
@@ -147,18 +65,47 @@ async def update_subscription(
 @router.delete("/{sub_id}", status_code=204)
 async def delete_subscription(
     sub_id: int,
+    background_tasks: BackgroundTasks,
     delete_nodes: bool = True,
     session: AsyncSession = Depends(get_session),
 ):
     sub = await session.get(Subscription, sub_id)
     if not sub:
         raise HTTPException(404, "Subscription not found")
+    deleted_ids: set = set()
     if delete_nodes:
         nodes = (await session.exec(select(Node).where(Node.subscription_id == sub_id))).all()
         for n in nodes:
+            deleted_ids.add(n.id)
             await session.delete(n)
     await session.delete(sub)
     await session.commit()
+
+    if deleted_ids:
+        # Nodes elsewhere may relay THROUGH one of these. Left dangling,
+        # the chained node silently stops working with nothing in the UI
+        # to say why — the exact failure reported in the wild.
+        from app.api.nodes import clear_chain_refs, _heal_active_node_after_delete
+        unchained = await clear_chain_refs(session, deleted_ids)
+        if unchained:
+            await session.commit()
+            logger.warning(
+                "Subscription %d delete: unchained node(s) %s — their relay was removed",
+                sub_id, unchained,
+            )
+            from app.core.events import record_event
+            await record_event(
+                category="node.unchained",
+                severity="warning",
+                title="Chained nodes lost their relay",
+                details=(
+                    f"Deleting subscription {sub_id} removed the relay node(s) that "
+                    f"node(s) {unchained} were chained through; the chain link was "
+                    f"cleared and they now connect directly."
+                ),
+            )
+        # The subscription may have carried the active node with it.
+        await _heal_active_node_after_delete(session, deleted_ids, background_tasks)
 
 
 @router.post("/{sub_id}/refresh", status_code=202)
@@ -170,18 +117,10 @@ async def refresh_subscription(
     sub = await session.get(Subscription, sub_id)
     if not sub:
         raise HTTPException(404, "Subscription not found")
-    # Per-subscription mutex — concurrent calls return 409 instead of
-    # spawning duplicate fetch tasks. Without this, two clicks within
-    # a few hundred ms (UI double-click, scheduler tick overlapping a
-    # manual refresh, two browser tabs etc.) used to fire two
-    # background `_fetch_subscription` runs against the same row.
-    # Each one would `delete all old nodes → insert new`, so the
-    # second one racing the first could observe a half-deleted state
-    # and import a partial node set, or both could land near-
-    # simultaneously and corrupt `active_node_id` via duplicate
-    # delete-then-create. Observed in the wild on 192.168.1.4 —
-    # logs show 4 refreshes within 60s with one returning 57 nodes
-    # instead of the canonical 1256.
+    # Per-subscription mutex. Two refreshes racing (double-click,
+    # scheduler tick overlapping a manual refresh, two tabs) could each
+    # observe a half-deleted node set and import a partial one, or
+    # corrupt `active_node_id`.
     if _is_refresh_active(sub_id):
         raise HTTPException(
             status_code=409,
@@ -251,6 +190,106 @@ def _node_row_fingerprint(node) -> str:
     ))
 
 
+async def _config_referenced_node_ids(session: AsyncSession) -> set:
+    """Node ids the CURRENT xray config actually depends on.
+
+    Anything else can change freely without touching the dataplane.
+    Covers: the active node, every circle/balancer member, `node:<id>`
+    rule targets, and any node reachable as a chain hop from those.
+    """
+    import json as _json
+
+    from app.models import BalancerGroup
+
+    ids: set = set()
+
+    active_row = (await session.exec(
+        select(DBSettings).where(DBSettings.key == "active_node_id")
+    )).first()
+    if active_row and active_row.value:
+        try:
+            ids.add(int(active_row.value))
+        except (TypeError, ValueError):
+            pass
+
+    for group in (await session.exec(select(NodeCircle))).all():
+        try:
+            members = (
+                _json.loads(group.node_ids)
+                if isinstance(group.node_ids, str) else (group.node_ids or [])
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        ids.update(i for i in members if isinstance(i, int))
+
+    for bal in (await session.exec(select(BalancerGroup))).all():
+        try:
+            members = (
+                _json.loads(bal.node_ids)
+                if isinstance(bal.node_ids, str) else (bal.node_ids or [])
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        ids.update(i for i in members if isinstance(i, int))
+
+    for rule in (await session.exec(select(RoutingRule))).all():
+        if rule.enabled and (rule.action or "").startswith("node:"):
+            try:
+                ids.add(int(rule.action.split(":", 1)[1]))
+            except (TypeError, ValueError):
+                pass
+
+    # Follow chain_node_id hops — a relay's parameters matter just as
+    # much as the exit's.
+    seen: set = set()
+    frontier = set(ids)
+    while frontier:
+        current = frontier.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        node = await session.get(Node, current)
+        if node and node.chain_node_id:
+            ids.add(node.chain_node_id)
+            frontier.add(node.chain_node_id)
+
+    return ids
+
+
+async def _reload_if_config_nodes_touched(
+    session: AsyncSession, *, touched_ids: set, force: bool = False,
+) -> None:
+    """Re-apply the dataplane when a refresh changed a node the config uses.
+
+    A panel rotating a Reality key or an SNI updates the row in place —
+    the fingerprint still matches, so nothing else notices — while the
+    running xray keeps dialling with the old crypto. Health checks don't
+    catch it either: they TCP-connect to the address from the FRESH row.
+    Result: the whole LAN loses internet while the UI stays green.
+    """
+    if not touched_ids and not force:
+        return
+    try:
+        from app.core.xray import xray_manager
+        if not xray_manager.is_running:
+            return
+        if not force:
+            relevant = await _config_referenced_node_ids(session)
+            if not (touched_ids & relevant):
+                return
+        from app.api.system import (
+            _apply_nftables, _load_settings_map, _regenerate_and_write,
+        )
+        await _regenerate_and_write(session)
+        await xray_manager.reload()
+        settings_map = await _load_settings_map(session)
+        await _apply_nftables(session, settings_map)
+        logger.info("Subscription refresh changed live nodes — dataplane reloaded")
+    except Exception as exc:  # noqa: BLE001
+        # Never fail a refresh over this: the DB is already consistent.
+        logger.warning("Reload after subscription refresh failed: %s", exc)
+
+
 async def _fetch_subscription(sub_id: int) -> None:
     """Download subscription URL and import nodes. Runs in background."""
     from app.core.uri_parser import parse_uri_list
@@ -285,44 +324,7 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         if not sub:
             return
 
-        # Pick UA: explicit per-subscription override > preset map > v2ray fallback.
-        # Override is for panels that gate on a fingerprint we don't ship
-        # a preset for — paste the UA the panel docs specify.
-        custom = (sub.custom_ua or "").strip()
-        # Defense-in-depth CRLF guard (CWE-93, upstream v1.4.7): even though
-        # the schema validator rejects control characters, a row that was
-        # written by an older code version (pre-fix) could still contain
-        # CR/LF. Strip them here so the httpx request never smuggles a header.
-        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in custom):
-            logger.warning(
-                "Subscription %d custom_ua contains control chars — stripping",
-                sub_id,
-            )
-            custom = "".join(c for c in custom if ord(c) >= 0x20 and ord(c) != 0x7F)
-        ua = custom or _UA_MAP.get(sub.ua, _UA_MAP["v2ray"])
-        headers = {
-            "User-Agent": ua,
-            "Accept": "*/*",
-            "Accept-Language": "ru-RU,en,*",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        # Happ-based panels gate on UA + a bundle of X-* headers. Attach
-        # them whenever:
-        #   - the subscription's preset is a `happ-*` profile, OR
-        #   - the custom UA starts with "Happ/" (likely a Happ-targeted panel
-        #     even if the user pasted a unique UA string).
-        # The profile key drives which OS the X-* describe so UA + headers
-        # stay consistent.
-        ua_lc = ua.lower()
-        # `rotate_hwid` is opt-in per subscription. When set, every
-        # refresh generates a fresh UUID for X-Hwid instead of the
-        # stable machine-id-derived one — for panels that throttle
-        # the same HWID over time.
-        rotate = bool(getattr(sub, "rotate_hwid", False))
-        if sub.ua in _HAPP_PROFILES:
-            headers.update(_get_happ_headers(sub.ua, rotate_hwid=rotate))
-        elif ua_lc.startswith("happ/"):
-            headers.update(_get_happ_headers("happ", rotate_hwid=rotate))
+        headers = await build_subscription_headers(session, sub)
 
         content: str = ""
         err_msg: str = ""
@@ -338,7 +340,9 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=30,
-                verify=not getattr(sub, "allow_insecure", False),
+                # Self-hosted panels often use self-signed certificates; that is
+                # a per-subscription opt-in rather than the default.
+                verify=not sub.allow_insecure_tls,
             ) as client:
                 resp = await client.get(sub.url, headers=headers)
                 resp.raise_for_status()
@@ -478,6 +482,9 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
             deduped[fp] = n  # last-wins
         parsed_dedup_skipped = len(parsed) - len(deduped)
         parsed = list(deduped.values())
+        # Optional country-flag prefix (no-op unless a GeoLite2 DB exists).
+        from app.core.geoip_lookup import enrich_parsed_nodes
+        enrich_parsed_nodes(parsed)
         if parsed_dedup_skipped > 0:
             logger.info(
                 "Subscription %d: collapsed %d duplicate parsed entries "
@@ -653,19 +660,25 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         _MUTABLE_FIELDS = (
             "name", "protocol", "address", "port", "uuid", "password",
             "transport", "tls", "sni", "fingerprint", "alpn",
-            "allow_insecure", "flow",
+            "allow_insecure", "pinned_cert_sha256", "flow",
             "ws_path", "ws_host", "grpc_service", "grpc_mode",
             "grpc_authority", "http_path", "http_host",
             "kcp_seed", "kcp_header",
             "reality_pbk", "reality_sid", "reality_spx",
             "wg_private_key", "wg_public_key", "wg_preshared_key",
             "wg_endpoint", "wg_mtu", "wg_reserved", "wg_local_address",
-            "hy2_obfs", "hy2_obfs_password",
+            "hy2_obfs", "hy2_obfs_password", "hy2_hop_ports", "hy2_hop_interval",
             "group", "note",
         )
 
         imported = 0
         seen_fps: set[str] = set()
+        # Node ids whose wire parameters actually CHANGED value. The
+        # fingerprint only covers protocol/address/port/uuid, so a panel
+        # rotating a Reality key or an SNI updates the row in place and
+        # leaves the running xray dialling with stale crypto. We reload
+        # the dataplane below when a changed node is one the config uses.
+        changed_ids: set[int] = set()
         for node_dict in parsed:
             node_dict["subscription_id"] = sub_id
             fp = _node_fingerprint(node_dict)
@@ -676,6 +689,11 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
                     # UPDATE in place — preserves id, order, health.
                     for k in _MUTABLE_FIELDS:
                         if k in node_dict:
+                            # `or None` folds the ""/None/0 spread the
+                            # parsers produce for absent values — only a
+                            # real value change counts as a change.
+                            if (getattr(existing, k, None) or None) != (node_dict[k] or None):
+                                changed_ids.add(existing.id)
                             setattr(existing, k, node_dict[k])
                     session.add(existing)
                 else:
@@ -714,6 +732,7 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         # the circle enabled lets it spring back to life automatically
         # if the operator re-adds nodes to the panel.
         circles_pruned: list[int] = []
+        pruned_summary: list[str] = []  # "'name' (-N)" per affected circle
         if removed_ids:
             import json as _json
             all_circles = (await session.exec(select(NodeCircle))).all()
@@ -739,11 +758,101 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
                 circle.node_ids = _json.dumps(surviving_ids)
                 session.add(circle)
                 circles_pruned.append(circle.id)
+                pruned_summary.append(f"'{circle.name}' (-{len(ids) - len(surviving_ids)})")
             if circles_pruned:
                 logger.warning(
                     "Subscription %d refresh: pruned dangling refs from "
                     "%d NodeCircle(s) (%s)",
                     sub_id, len(circles_pruned), circles_pruned,
+                )
+
+        # ── Auto-sync circles LINKED to this subscription ────────────
+        #
+        # Opt-in counterpart to the pruning above. A circle with
+        # `subscription_id == sub_id` tracks the subscription: nodes it
+        # still serves are kept/added (so a node that came back under a
+        # NEW id — the "provider moved it" case the prune can't fix —
+        # rejoins automatically), dropped ones leave.
+        #
+        # Members that did NOT come from this subscription (added by
+        # hand, or belonging to another sub) are preserved: we only take
+        # ownership of our own rows. That distinction is what makes this
+        # a merge rather than the "rebuild from scratch" that would
+        # silently delete an operator's manual additions.
+        #
+        # Circles with subscription_id = NULL are untouched here — they
+        # keep the pruning + "check members" event, which stays the right
+        # behaviour when nobody opted into automatic management.
+        synced_summary: list[str] = []
+        # An ENABLED circle whose membership moved changes the generated
+        # balancer, and the new members are freshly-imported ids that are in
+        # neither `changed_ids` (updated-in-place rows only) nor the config's
+        # current node set — so the reload heuristic below would miss it.
+        # Track it explicitly and force the re-apply.
+        synced_live_circle = False
+        from app.core import circle_filters as _cf0
+        linked_circles = [
+            c for c in (await session.exec(select(NodeCircle))).all()
+            if sub_id in _cf0.parse_ids(c.subscription_ids) or c.subscription_id == sub_id
+        ]
+        if linked_circles:
+            import json as _json
+            # Post-upsert membership of this subscription, fastest first so
+            # sequential rotation naturally starts on the better nodes.
+            from app.core import circle_filters as _cf
+            sub_rows = (await session.exec(
+                select(Node.id, Node.name, Node.country, Node.enabled)
+                .where(Node.subscription_id == sub_id)
+                .order_by(Node.latency_ms.asc().nulls_last(), Node.id)  # type: ignore[union-attr]
+            )).all()
+            fresh_ids = [r[0] for r in sub_rows if r[0] is not None and r[3]]
+            fresh_set = set(fresh_ids)
+            for circle in linked_circles:
+                try:
+                    ids = (
+                        _json.loads(circle.node_ids)
+                        if isinstance(circle.node_ids, str)
+                        else (circle.node_ids or [])
+                    )
+                except Exception:
+                    continue
+                # What this circle refuses: nodes unticked by hand and whole
+                # countries. Applies to the subscription's own nodes only.
+                ex_ids = _cf.parse_ids(circle.excluded_node_ids)
+                ex_countries = set(_cf.parse_list(circle.excluded_countries))
+                refused = {
+                    r[0] for r in sub_rows
+                    if _cf.excluded_here(r[0], r[2], r[1], ex_ids, ex_countries)
+                }
+                circle_fresh = [i for i in fresh_ids if i not in refused]
+                # Keep foreign/manual members (minus anything just deleted or
+                # refused), then append this subscription's current set.
+                manual_ids = [
+                    i for i in ids
+                    if i not in fresh_set and i not in removed_ids and i not in refused
+                ]
+                merged = manual_ids + circle_fresh
+                if merged == ids:
+                    continue  # already in sync
+                added = len(set(circle_fresh) - set(ids))
+                dropped = len([i for i in ids if i in removed_ids])
+                if circle.current_index >= len(merged):
+                    circle.current_index = 0
+                circle.node_ids = _json.dumps(merged)
+                session.add(circle)
+                if circle.enabled:
+                    synced_live_circle = True
+                # A linked circle is managed automatically — don't also nag
+                # about it in the "check members" warning below.
+                if circle.id in circles_pruned:
+                    idx = circles_pruned.index(circle.id)
+                    circles_pruned.pop(idx)
+                    pruned_summary.pop(idx)
+                synced_summary.append(f"'{circle.name}' (+{added}/-{dropped})")
+            if synced_summary:
+                logger.info(
+                    "Subscription %d refresh: auto-synced %d linked NodeCircle(s): %s",
+                    sub_id, len(synced_summary), ", ".join(synced_summary),
                 )
 
         # Heal active_node_id if it pointed at a now-removed row.
@@ -777,86 +886,6 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
         sub.last_error = None  # clear error on success
         session.add(sub)
 
-        # ── Auto-sync NodeCircles linked to this subscription (v1.4.8) ──
-        # Any NodeCircle whose `subscription_id == sub_id` gets its
-        # node_ids automatically rebuilt from the fresh set of enabled
-        # nodes in this subscription. The operator "links" a circle to
-        # a sub once (POST/PATCH with subscription_id), and from then
-        # on every refresh keeps the circle in sync — new nodes appended
-        # (sorted by latency → fastest first), removed ones dropped —
-        # without any manual editing.
-        # The 80ms latency cap from the circle's own validation does NOT
-        # apply here (auto-sync bypasses the POST/PATCH validator); we
-        # include all nodes and let the circle_scheduler's smart
-        # rotation pick the best one at each tick.
-        try:
-            import json as _json
-            linked_circles = (await session.exec(
-                select(NodeCircle).where(NodeCircle.subscription_id == sub_id)
-            )).all()
-            if linked_circles:
-                # Build the fresh node list from the DB (post-upsert),
-                # sorted by latency ascending so the circle's rotation
-                # order naturally prefers faster nodes. We fetch id + country
-                # so per-circle `excluded_countries` filtering can exclude
-                # nodes whose exit country is on the block-list.
-                fresh_rows = (await session.exec(
-                    select(Node.id, Node.country).where(
-                        Node.subscription_id == sub_id,
-                        Node.enabled == True,  # noqa: E712
-                    ).order_by(Node.latency_ms.asc().nulls_last(), Node.id)
-                )).all()
-                # Normalize rows to (id, country) tuples — .exec() on a
-                # multi-column select returns Row objects without .id attr.
-                fresh_pairs: list[tuple[int, Optional[str]]] = []
-                for row in fresh_rows:
-                    if hasattr(row, "id"):
-                        fresh_pairs.append((row.id, row.country))
-                    else:
-                        fresh_pairs.append((row[0], row[1]))
-                fresh_ids = [nid for nid, _ in fresh_pairs]
-                fresh_id_set = set(fresh_ids)
-                for circle in linked_circles:
-                    old_ids = _json.loads(circle.node_ids) if isinstance(circle.node_ids, str) else (circle.node_ids or [])
-                    # v1.7.0 — exclude nodes whose exit country is in the
-                    # circle's `excluded_countries` from auto-sync. This
-                    # prevents data-limited LTE proxies (e.g. 30GB/month
-                    # in DE) from being added to the circle's rotation
-                    # pool. Nodes without a known `country` (never speed-
-                    # tested) are always included — they'll be filtered
-                    # at rotation time if the exit turns out to be blocked.
-                    excluded_raw = getattr(circle, "excluded_countries", "") or ""
-                    excluded_set: set[str] = {
-                        cc.strip().upper()
-                        for cc in excluded_raw.split(",")
-                        if cc.strip() and len(cc.strip()) == 2 and cc.strip().isalpha()
-                    }
-                    if excluded_set:
-                        sub_ids = [
-                            nid for nid, ctry in fresh_pairs
-                            if not (ctry and ctry.upper() in excluded_set)
-                        ]
-                    else:
-                        sub_ids = fresh_ids
-                    # MERGE semantics (v1.5.2 fix): keep manually-added nodes
-                    # (from other subscriptions or standalone) that are NOT
-                    # part of the linked subscription. Only the subscription's
-                    # own nodes are synced (new ones added, removed ones dropped);
-                    # manually-added nodes are preserved.
-                    manual_ids = [i for i in old_ids if i not in fresh_id_set and i not in removed_ids]
-                    merged_ids = manual_ids + sub_ids
-                    circle.node_ids = _json.dumps(merged_ids)
-                    # Reset current_index if it points past the new list
-                    if circle.current_index >= len(merged_ids):
-                        circle.current_index = 0
-                    session.add(circle)
-                logger.info(
-                    "Subscription %d: auto-synced %d NodeCircle(s) — "
-                    "node_ids updated (%d nodes, was %d)",
-                    sub_id, len(linked_circles), len(fresh_ids), len(old_ids) if old_ids else 0,
-                )
-        except Exception as exc:
-            logger.warning("Subscription %d: NodeCircle auto-sync failed: %s", sub_id, exc)
 
         await session.commit()
         logger.info(
@@ -867,4 +896,66 @@ async def _fetch_subscription_unlocked(sub_id: int) -> None:
             len(removed_ids),
             f", active_node healed: {active_id_before}→{healed_active}"
             if healed_active is not None else "",
+        )
+
+        # Same dangling-relay problem as the delete path: a node that
+        # vanished from the panel may have been someone's relay.
+        from app.api.nodes import clear_chain_refs
+        unchained = await clear_chain_refs(session, removed_ids)
+        if unchained:
+            await session.commit()
+            logger.warning(
+                "Subscription %d refresh: unchained node(s) %s — their relay vanished "
+                "from the panel", sub_id, unchained,
+            )
+            from app.core.events import record_event
+            await record_event(
+                category="node.unchained",
+                severity="warning",
+                title="Chained nodes lost their relay",
+                details=(
+                    f"Subscription {sub_id} no longer serves the relay node(s) that "
+                    f"node(s) {unchained} were chained through; the chain link was "
+                    f"cleared and they now connect directly."
+                ),
+            )
+
+        # Surface pruned circles in the Recent Events feed so the operator
+        # notices a circle that shrank — especially the "provider moved a node
+        # to a new address" case, where the node returns as a NEW id and is
+        # not auto-re-added to the circle.
+        if pruned_summary:
+            from app.core.events import record_event
+            await record_event(
+                category="circle.pruned",
+                severity="warning",
+                title="NodeCircle membership changed by refresh",
+                details=(
+                    f"Subscription {sub_id} refresh removed node(s) from circle(s): "
+                    f"{', '.join(pruned_summary)}. A node removed from the panel — or "
+                    f"moved to a new address, which returns as a new id — is not "
+                    f"auto-re-added; check the circle membership."
+                ),
+            )
+
+        # Linked circles resynced themselves — informational, not a warning:
+        # nothing needs the operator's attention, but the membership DID
+        # change, so it belongs in the feed.
+        if synced_summary:
+            from app.core.events import record_event
+            await record_event(
+                category="circle.synced",
+                severity="info",
+                title="NodeCircle auto-synced from subscription",
+                details=(
+                    f"Subscription {sub_id} refresh updated linked circle(s): "
+                    f"{', '.join(synced_summary)}. Members added by hand or from "
+                    f"another subscription were kept."
+                ),
+            )
+
+        await _reload_if_config_nodes_touched(
+            session,
+            touched_ids=changed_ids | removed_ids,
+            force=healed_active is not None or synced_live_circle,
         )

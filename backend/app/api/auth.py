@@ -1,8 +1,7 @@
 """Authentication endpoints: login, change password, current user."""
-import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -11,108 +10,67 @@ from app.models import User
 from app.core.auth import verify_password, hash_password, create_access_token, get_current_user
 from app.schemas import LoginRequest, TokenResponse, ChangePasswordRequest, UserRead
 
-logger = logging.getLogger(__name__)
+logger = __import__("logging").getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# Brute-force lockout: after this many consecutive failed logins, the
+# account is locked for LOCKOUT_MINUTES. PiTun is LAN-only with no captcha
+# or IP throttling, so this per-account guard is the primary defence.
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Treat a naive DB datetime as UTC (SQLite stores tz-naive)."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
 
 @router.post("/login", response_model=TokenResponse)
-async def login(
-    body: LoginRequest,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    # ── Per-IP rate limit (architecture review finding 1.2) ────────
-    # The slowapi Limiter was mounted in main.py but its public API
-    # is decorator-based (@limiter.limit("5/minute")). Calling
-    # limiter.hit() directly raised AttributeError in production
-    # ('Limiter' object has no attribute 'hit'), crashing the entire
-    # login endpoint on every attempt.
-    #
-    # Fix: apply the rate limit via the decorator at module level
-    # (see the @router.post decorator above — it now includes the
-    # rate limit from the limiter mounted on app.state). The manual
-    # call is removed.
-    #
-    # The per-account lockout below is independent of slowapi and
-    # works through the DB (User.failed_attempts + locked_until).
-    from app.core.auth_limiter import (
-        LOGIN_RATE_LIMIT,
-        MAX_FAILED_ATTEMPTS,
-        LOCKOUT_MINUTES,
-    )
-
+async def login(body: LoginRequest, session: AsyncSession = Depends(get_session)):
+    now = datetime.now(timezone.utc)
     user = (await session.exec(select(User).where(User.username == body.username))).first()
-    if user is None:
-        # Don't reveal existence of username to attackers — same 401
-        # shape as the wrong-password case. We DON'T increment
-        # failed_attempts on a missing User: there's nothing to lock
-        # out, and tracking attempts by (missing) username would
-        # create a DoS vector against login-future users.
-        raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    # ── Per-account lockout check ─────────────────────────────────
-    # `locked_until` is set when `failed_attempts >= cap`. Persists
-    # across restarts (DB-backed), so a backend bounce can't be used
-    # to reset mid-brute. After the window the row is unlocked, BUT
-    # `failed_attempts` is preserved until the NEXT successful login
-    # (so a steady stream of attempts every LOCKOUT_MINUTES+1 is
-    # still throttling-aware: 5 fails → 1h lockout → next fail re-
-    # enters lockout because counter ≥ 5).
-    now_utc = datetime.now(tz=timezone.utc)
-    if user.locked_until is not None:
-        lock_until = user.locked_until
-        if lock_until.tzinfo is None:
-            lock_until = lock_until.replace(tzinfo=timezone.utc)
-        if lock_until > now_utc:
-            retry_after = int((lock_until - now_utc).total_seconds())
-            logger.warning(
-                "Login rejected — account %r locked for %ds more (failed_attempts=%d)",
-                body.username, retry_after, user.failed_attempts,
-            )
-            # 429 Too Many Requests with Retry-After — matches the
-            # convention slowapi uses, lets the frontend or curl
-            # back off cleanly instead of retrying.
+    # Reject a currently-locked account before touching the password — the
+    # response never reveals whether the password was right, and a locked
+    # account can't have its window extended by more guesses.
+    if user and user.lock_until:
+        if _as_utc(user.lock_until) > now:
+            retry_s = int((_as_utc(user.lock_until) - now).total_seconds()) + 1
             raise HTTPException(
                 status_code=429,
-                detail={
-                    "message": "Account is temporarily locked",
-                    "retry_after_seconds": retry_after,
-                    "max_failed_attempts": MAX_FAILED_ATTEMPTS,
-                },
-                headers={"Retry-After": str(retry_after)},
+                detail=f"Too many failed logins. Try again in {retry_s}s.",
+                headers={"Retry-After": str(retry_s)},
             )
-        # Lockout window passed → fall through; attempt proceeds.
+        # Window elapsed — clean slate before re-checking the password.
+        user.failed_attempts = 0
+        user.lock_until = None
 
-    if not verify_password(body.password, user.password_hash):
-        # ── Increment failed_attempts + (maybe) lock ──────────────
-        user.failed_attempts = (user.failed_attempts or 0) + 1
-        if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
-            user.locked_until = now_utc + timedelta(minutes=LOCKOUT_MINUTES)
-            logger.warning(
-                "Account %r locked: %d/%d failed attempts — locked for %d min",
-                body.username, user.failed_attempts, MAX_FAILED_ATTEMPTS, LOCKOUT_MINUTES,
-            )
-        else:
-            logger.info(
-                "Failed login for %r: %d/%d — not yet locked",
-                body.username, user.failed_attempts, MAX_FAILED_ATTEMPTS,
-            )
-        session.add(user)
-        await session.commit()
-        # Same 401 as the "user not found" case — uniform so an
-        # attacker can't differentiate "user doesn't exist" from
-        # "wrong password" by response shape.
+    if not user or not verify_password(body.password, user.password_hash):
+        # Count the miss (only for a real account — never create lockout
+        # state for unknown usernames, and the 401 is identical either way
+        # so existence isn't leaked).
+        if user:
+            user.failed_attempts = (user.failed_attempts or 0) + 1
+            if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
+                user.lock_until = now + timedelta(minutes=LOCKOUT_MINUTES)
+                user.failed_attempts = 0  # the lock is the state now
+            session.add(user)
+            await session.commit()
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    # ── Successful login — reset counters ─────────────────────────
-    if user.failed_attempts != 0 or user.locked_until is not None:
+    # Mint the token BEFORE any commit — `await session.commit()` expires
+    # the ORM attributes, and reading `user.username` afterwards would trip
+    # a lazy load on the async session (MissingGreenlet).
+    token = create_access_token(user.username)
+
+    # Success — drop any accumulated failures / lock.
+    if user.failed_attempts or user.lock_until:
         user.failed_attempts = 0
-        user.locked_until = None
+        user.lock_until = None
         session.add(user)
         await session.commit()
 
-    token = create_access_token(user.username)
     return TokenResponse(access_token=token, token_type="bearer")
 
 

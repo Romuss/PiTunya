@@ -53,6 +53,16 @@ class TestNodeCircleCreate:
         )
         assert resp.status_code == 422
 
+    def test_interval_min_must_be_five_minutes_or_more(self, client, admin_user, auth_headers, sample_node):
+        """A best-mode rotation may speed-test nodes, so rotating every minute is refused."""
+        def post(minutes):
+            return client.post("/api/nodecircle", json={
+                "name": f"I{minutes}", "node_ids": [sample_node.id],
+                "interval_min": minutes, "interval_max": 30,
+            }, headers=auth_headers)
+        assert post(4).status_code == 422
+        assert post(5).status_code == 201
+
     def test_create_interval_min_too_low(self, client, admin_user, auth_headers, sample_node):
         resp = client.post(
             "/api/nodecircle",
@@ -298,6 +308,15 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 
+@pytest.fixture(autouse=True)
+def _http_probe_off_by_default():
+    """The HTTP stage of the pre-ping spawns xray; the older tests here are about
+    TCP selection, so it is off unless a test turns it on."""
+    with patch("app.core.circle_scheduler.CircleScheduler._http_probe_enabled",
+               new=AsyncMock(return_value=False)):
+        yield
+
+
 def _mk_node(session, **overrides):
     """Make a Node row directly in the DB for circle rotation tests."""
     from app.models import Node
@@ -465,6 +484,282 @@ class TestRotatePrePing:
             from app.core.circle_scheduler import circle_scheduler
             result = await circle_scheduler.rotate_circle(circle.id)
         assert result is True
+
+
+class TestRotateHttpProbe:
+    """TCP says alive, HTTP says whether the node really reaches the internet."""
+
+    @staticmethod
+    def _setup(session, protocols=("vless", "vless", "vless")):
+        nodes = [
+            _mk_node(session, name=f"N{i}", address=f"10.0.1.{i}", protocol=proto)
+            for i, proto in enumerate(protocols)
+        ]
+        circle = _mk_circle(session, [n.id for n in nodes], mode="sequential", current_index=0)
+        return nodes, circle
+
+    @staticmethod
+    async def _rotate(circle_id, http_results, events=None, enabled=True):
+        async def tcp_alive(addr, port, udp, **kw):
+            return {"is_online": True, "latency_ms": 10}
+
+        async def fake_http(self, node_id):
+            return http_results[node_id]
+
+        from app.core.circle_scheduler import circle_scheduler
+        ev = AsyncMock()
+        with (
+            patch("app.core.healthcheck.health_checker._probe_node", side_effect=tcp_alive),
+            patch("app.core.circle_scheduler.CircleScheduler._seamless_rotate", new_callable=AsyncMock),
+            patch("app.core.circle_scheduler.CircleScheduler._http_probe_enabled",
+                  new=AsyncMock(return_value=enabled)),
+            patch("app.core.circle_scheduler.CircleScheduler._http_probe", new=fake_http),
+            patch("app.core.events.record_event", ev),
+        ):
+            await circle_scheduler.rotate_circle(circle_id)
+        return ev
+
+    @staticmethod
+    def _index(session, circle_id):
+        from app.models import NodeCircle
+        session.expire_all()
+        return session.get(NodeCircle, circle_id).current_index
+
+    @pytest.mark.asyncio
+    async def test_skips_a_node_whose_port_answers_but_has_no_internet(
+        self, client, admin_user, auth_headers, session
+    ):
+        nodes, circle = self._setup(session)
+        results = {nodes[1].id: (False, "timed out"), nodes[2].id: (True, "")}
+        ev = await self._rotate(circle.id, results)
+        assert self._index(session, circle.id) == 2
+        cats = [c.kwargs.get("category") for c in ev.await_args_list]
+        assert "circle.candidate_failed" in cats
+        assert "circle.http_probe_fallback" not in cats
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_tcp_result_when_every_node_fails_http(
+        self, client, admin_user, auth_headers, session
+    ):
+        nodes, circle = self._setup(session)
+        results = {nodes[1].id: (False, "x"), nodes[2].id: (False, "y")}
+        ev = await self._rotate(circle.id, results)
+        assert self._index(session, circle.id) == 1, "first TCP-alive candidate is kept"
+        cats = [c.kwargs.get("category") for c in ev.await_args_list]
+        assert "circle.http_probe_fallback" in cats
+
+    @pytest.mark.asyncio
+    async def test_wireguard_is_not_http_probed(
+        self, client, admin_user, auth_headers, session
+    ):
+        nodes, circle = self._setup(session, protocols=("vless", "wireguard", "vless"))
+        # No entry for the WG node: reaching it would raise KeyError.
+        ev = await self._rotate(circle.id, {})
+        assert self._index(session, circle.id) == 1
+        assert not any(c.kwargs.get("category") == "circle.http_probe_fallback"
+                       for c in ev.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_disabled_setting_skips_the_http_stage(
+        self, client, admin_user, auth_headers, session
+    ):
+        nodes, circle = self._setup(session)
+        # Would fail HTTP if it were consulted.
+        results = {nodes[1].id: (False, "x"), nodes[2].id: (False, "y")}
+        await self._rotate(circle.id, results, enabled=False)
+        assert self._index(session, circle.id) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_probe_fault_does_not_exclude_the_node(
+        self, client, admin_user, auth_headers, session
+    ):
+        from app.core.circle_scheduler import CircleScheduler
+        nodes, _ = self._setup(session)
+        with patch("app.core.speedtest.reachability_check",
+                   new=AsyncMock(side_effect=RuntimeError("boom"))), \
+             patch("app.core.error_log.record"):
+            ok, _ = await CircleScheduler()._http_probe(nodes[1].id)
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_probe_that_hangs_is_cut_off_and_fails(
+        self, client, admin_user, auth_headers, session
+    ):
+        from app.core.circle_scheduler import CircleScheduler
+
+        async def hang(node):
+            await asyncio.sleep(30)
+
+        nodes, _ = self._setup(session)
+        sched = CircleScheduler()
+        sched._HTTP_PROBE_BUDGET_S = 0.05
+        with patch("app.core.speedtest.reachability_check", new=hang):
+            ok, detail = await sched._http_probe(nodes[1].id)
+        assert ok is False and detail == "timed out"
+
+
+def _set_active(session, node_id: int):
+    from app.models import Settings as DBSettings
+    session.add(DBSettings(key="active_node_id", value=str(node_id)))
+    session.commit()
+
+
+def _set_circle_filters(session, circle, **fields):
+    for k, v in fields.items():
+        setattr(circle, k, v)
+    session.add(circle)
+    session.commit()
+
+
+class TestRotateQualityFilters:
+    """max_latency_ms / min_speed_mbps candidate filters + best mode +
+    smart-skip. All opt-in — with the filters at 0 the behaviour above is
+    unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_max_latency_filters_slow_candidate(self, client, admin_user, auth_headers, session):
+        n0 = _mk_node(session, name="N0", address="10.0.0.0")
+        n1 = _mk_node(session, name="N1-slow", address="10.0.0.1", latency_ms=200)
+        n2 = _mk_node(session, name="N2-fast", address="10.0.0.2", latency_ms=30)
+        circle = _mk_circle(session, [n0.id, n1.id, n2.id], mode="sequential")
+        _set_circle_filters(session, circle, max_latency_ms=100)
+
+        probed: list[str] = []
+        async def probe(addr, port, udp, **kw):
+            probed.append(addr)
+            return {"is_online": True, "latency_ms": 10}
+
+        with (
+            patch("app.core.healthcheck.health_checker._probe_node", side_effect=probe),
+            patch("app.core.circle_scheduler.CircleScheduler._seamless_rotate", new_callable=AsyncMock),
+        ):
+            from app.core.circle_scheduler import circle_scheduler
+            await circle_scheduler.rotate_circle(circle.id)
+
+        assert "10.0.0.1" not in probed          # over budget → never probed
+        session.expire_all()
+        from app.models import NodeCircle
+        assert session.get(NodeCircle, circle.id).current_index == 2
+
+    @pytest.mark.asyncio
+    async def test_min_speed_filters_slow_but_keeps_untested(self, client, admin_user, auth_headers, session):
+        n0 = _mk_node(session, name="N0", address="10.0.0.0")
+        n1 = _mk_node(session, name="N1-slow", address="10.0.0.1", speed_mbps=5.0)
+        n2 = _mk_node(session, name="N2-untested", address="10.0.0.2", speed_mbps=None)
+        circle = _mk_circle(session, [n0.id, n1.id, n2.id], mode="sequential")
+        _set_circle_filters(session, circle, min_speed_mbps=50.0)
+
+        probed: list[str] = []
+        async def probe(addr, port, udp, **kw):
+            probed.append(addr)
+            return {"is_online": True, "latency_ms": 10}
+
+        with (
+            patch("app.core.healthcheck.health_checker._probe_node", side_effect=probe),
+            patch("app.core.circle_scheduler.CircleScheduler._seamless_rotate", new_callable=AsyncMock),
+        ):
+            from app.core.circle_scheduler import circle_scheduler
+            await circle_scheduler.rotate_circle(circle.id)
+
+        assert "10.0.0.1" not in probed          # below floor → filtered
+        assert "10.0.0.2" in probed              # untested → benefit of the doubt
+        session.expire_all()
+        from app.models import NodeCircle
+        assert session.get(NodeCircle, circle.id).current_index == 2
+
+    @pytest.mark.asyncio
+    async def test_best_mode_probes_lowest_latency_first(self, client, admin_user, auth_headers, session):
+        # Sequential order would try n1 first; best must try n2 (lower latency).
+        n0 = _mk_node(session, name="N0", address="10.0.0.0")
+        n1 = _mk_node(session, name="N1", address="10.0.0.1", latency_ms=80)
+        n2 = _mk_node(session, name="N2", address="10.0.0.2", latency_ms=20)
+        circle = _mk_circle(session, [n0.id, n1.id, n2.id], mode="best")
+
+        probed: list[str] = []
+        async def probe(addr, port, udp, **kw):
+            probed.append(addr)
+            return {"is_online": True, "latency_ms": 10}
+
+        with (
+            patch("app.core.healthcheck.health_checker._probe_node", side_effect=probe),
+            patch("app.core.circle_scheduler.CircleScheduler._seamless_rotate", new_callable=AsyncMock),
+        ):
+            from app.core.circle_scheduler import circle_scheduler
+            await circle_scheduler.rotate_circle(circle.id)
+
+        assert probed[0] == "10.0.0.2"           # lowest-latency probed first
+        session.expire_all()
+        from app.models import NodeCircle
+        assert session.get(NodeCircle, circle.id).current_index == 2
+
+    @pytest.mark.asyncio
+    async def test_smart_skip_healthy_active_on_scheduled_tick(self, client, admin_user, auth_headers, session):
+        n0 = _mk_node(session, name="N0-active", address="10.0.0.0", is_online=True, latency_ms=30)
+        n1 = _mk_node(session, name="N1", address="10.0.0.1")
+        circle = _mk_circle(session, [n0.id, n1.id], current_index=0)
+        _set_circle_filters(session, circle, max_latency_ms=100)
+        _set_active(session, n0.id)
+
+        probed: list[str] = []
+        async def probe(addr, port, udp, **kw):
+            probed.append(addr)
+            return {"is_online": True, "latency_ms": 10}
+
+        with (
+            patch("app.core.healthcheck.health_checker._probe_node", side_effect=probe),
+            patch("app.core.circle_scheduler.CircleScheduler._seamless_rotate", new_callable=AsyncMock),
+        ):
+            from app.core.circle_scheduler import circle_scheduler
+            result = await circle_scheduler.rotate_circle(circle.id, from_scheduler=True)
+
+        assert result is False                   # healthy active → skip
+        assert probed == []                      # nothing even probed
+        session.expire_all()
+        from app.models import NodeCircle
+        assert session.get(NodeCircle, circle.id).current_index == 0
+
+    @pytest.mark.asyncio
+    async def test_manual_rotate_ignores_smart_skip(self, client, admin_user, auth_headers, session):
+        n0 = _mk_node(session, name="N0-active", address="10.0.0.0", is_online=True, latency_ms=30)
+        n1 = _mk_node(session, name="N1", address="10.0.0.1")
+        circle = _mk_circle(session, [n0.id, n1.id], current_index=0)
+        _set_circle_filters(session, circle, max_latency_ms=100)
+        _set_active(session, n0.id)
+
+        async def probe(addr, port, udp, **kw):
+            return {"is_online": True, "latency_ms": 10}
+
+        with (
+            patch("app.core.healthcheck.health_checker._probe_node", side_effect=probe),
+            patch("app.core.circle_scheduler.CircleScheduler._seamless_rotate", new_callable=AsyncMock),
+        ):
+            from app.core.circle_scheduler import circle_scheduler
+            result = await circle_scheduler.rotate_circle(circle.id)  # from_scheduler=False
+
+        assert result is True                    # manual rotate ignores smart-skip
+        session.expire_all()
+        from app.models import NodeCircle
+        assert session.get(NodeCircle, circle.id).current_index == 1
+
+
+class TestSpeedPersistence:
+    @pytest.mark.asyncio
+    async def test_speedtest_persists_on_node(self, client, admin_user, auth_headers, session):
+        n = _mk_node(session, name="SpeedNode", address="10.9.9.9")
+
+        async def fake_speedtest(node):
+            return {"node_id": node.id, "node_name": node.name,
+                    "download_mbps": 87.5, "error": None}
+
+        with patch("app.core.speedtest.speedtest_node", side_effect=fake_speedtest):
+            resp = client.post(f"/api/nodes/{n.id}/speedtest", headers=auth_headers)
+
+        assert resp.status_code == 200
+        session.expire_all()
+        from app.models import Node
+        node = session.get(Node, n.id)
+        assert node.speed_mbps == 87.5
+        assert node.speed_tested_at is not None
 
     @pytest.mark.asyncio
     async def test_returns_false_when_all_dead(self, client, admin_user, auth_headers, session):

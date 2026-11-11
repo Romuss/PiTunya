@@ -21,7 +21,9 @@ import {
   X,
   Monitor,
   Activity,
+  Router as RouterIcon,
   Settings2,
+  ListChecks,
   Sun,
   Moon,
   Cloud,
@@ -33,6 +35,8 @@ import { useSystemStatus } from '@/hooks/useSystem'
 import { useEscapeKey } from '@/hooks/useEscapeKey'
 import { authApi } from '@/api/client'
 import { VersionPopover } from '@/components/VersionPopover'
+import PanelUnreachableBanner from '@/components/PanelUnreachableBanner'
+import RouterConfirmBanner from '@/components/RouterConfirmBanner'
 
 function getUsername(): string {
   try {
@@ -45,28 +49,30 @@ function getUsername(): string {
   }
 }
 
-const NAV = [
+const NAV: { to: string; icon: typeof Scale; label: string; experimental?: boolean }[] = [
   { to: '/',             icon: LayoutDashboard, label: 'Dashboard'     },
   { to: '/routing',      icon: GitBranch,       label: 'Routing'       },
   { to: '/nodes',        icon: Server,          label: 'Nodes'         },
   { to: '/circles',      icon: Circle,          label: 'NodeCircle'    },
-  { to: '/balancers',    icon: Scale,           label: 'Balancers'     },
+  { to: '/balancers',    icon: Scale,           label: 'Balancers', experimental: true },
   { to: '/subscriptions',icon: Rss,             label: 'Subscriptions' },
   { to: '/servers',      icon: Cloud,           label: 'Servers'       },
   { to: '/xui',          icon: Layers,          label: 'X-ui'          },
   { to: '/chains',       icon: GitBranch,       label: 'Chains'        },
   { to: '/dns',          icon: Network,         label: 'DNS'           },
+  { to: '/domains',      icon: ListChecks,      label: 'Domains'       },
   { to: '/geodata',      icon: Globe,           label: 'GeoData'       },
   { to: '/connections',  icon: Activity,        label: 'Connections'   },
   { to: '/devices',      icon: Monitor,         label: 'Devices'       },
   { to: '/logs',         icon: ScrollText,      label: 'Logs'          },
   { to: '/diagnostics',  icon: Activity,        label: 'Diagnostics'   },
+  { to: '/router',       icon: RouterIcon,      label: 'Router'        },
   { to: '/settings',     icon: Settings2,       label: 'Settings'      },
   { to: '/kb',           icon: BookOpen,        label: 'Knowledge Base'},
 ]
 
 // Routes after which a thin separator line groups the nav visually.
-const DIVIDE_AFTER = new Set(['/routing', '/subscriptions', '/chains', '/devices', '/settings'])
+const DIVIDE_AFTER = new Set(['/routing', '/subscriptions', '/chains', '/devices', '/router', '/settings'])
 
 export function Layout() {
   const {
@@ -249,7 +255,7 @@ export function Layout() {
 
         {/* Nav */}
         <nav className="flex-1 min-h-0 overflow-y-auto px-2 py-3 space-y-0.5">
-          {NAV.map(({ to, icon: Icon, label }) => (
+          {NAV.map(({ to, icon: Icon, label, experimental }) => (
             <Fragment key={to}>
             <NavLink
               to={to}
@@ -280,6 +286,17 @@ export function Layout() {
                   desktop sidebar is collapsed; mobile drawer always
                   shows labels. */}
               <span className={clsx(sidebarCollapsed && 'md:hidden')}>{label}</span>
+              {experimental && (
+                <span
+                  className={clsx(
+                    'rounded-sm border border-amber-700/50 bg-amber-950/30 px-1 text-[9px] uppercase tracking-wide text-amber-400',
+                    sidebarCollapsed && 'md:hidden',
+                  )}
+                  title="Experimental"
+                >
+                  exp
+                </span>
+              )}
             </NavLink>
             {DIVIDE_AFTER.has(to) && (
               <div className="my-1.5 mx-2 border-t border-gray-800/60" aria-hidden="true" />
@@ -440,6 +457,10 @@ export function Layout() {
           width and child overflows are contained by the explicit
           `overflow-x-hidden` below. */}
       <main className="flex-1 min-w-0 overflow-x-hidden overflow-y-auto pb-20 md:pb-0 bg-gray-900 dark:bg-surface">
+        {/* Whoever must confirm may have reloaded onto any page — the undo
+           timer can't live inside one settings section. */}
+        <PanelUnreachableBanner />
+        <RouterConfirmBanner />
         {/* Validation-error banner — shown at the top of every page when
             the most recent xray config write failed validation. The hint
             string is composed by `config_gen._explain_xray_stderr()` and

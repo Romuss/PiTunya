@@ -3,7 +3,7 @@
 # bump the digest in PR form when a new patch lands. Override at build
 # time via --build-arg PYTHON_IMAGE=... if you need a different base.
 ARG PYTHON_IMAGE=python:3.11-slim@sha256:6d85378d88a19cd4d76079817532d62232be95757cb45945a99fec8e8084b9c2
-ARG XRAY_VERSION=26.3.27
+ARG XRAY_VERSION=26.10.31
 
 # ── 1. xray fetcher stage ─────────────────────────────────────────────────────
 # Downloads the official XTLS/Xray-core release matching the build platform
@@ -35,9 +35,9 @@ ARG TARGETARCH
 #     curl -sL https://github.com/XTLS/Xray-core/releases/download/v${VER}/Xray-linux-$a.zip \
 #       | bsdtar -xOf- xray | sha256sum | awk -v a=$a '{print a, $1}'
 #   done
-ARG XRAY_SHA256_AMD64=8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed
-ARG XRAY_SHA256_ARM64=c2d20a7045250497083afea0d79db0672f6c89a25aaaf37c92de034d6b764b04
-ARG XRAY_SHA256_ARM=b7ea2a82185f0f7a59510b01b24a93cc3c45529dabbf3c97970ad66c49c6b882
+ARG XRAY_SHA256_AMD64=cc4b84d3069569f297a61f04b914f2bb37e9d202fd7b84cb50def1fc30fd40e1
+ARG XRAY_SHA256_ARM64=5939649960deaf535bcd5f7ce0467a2b1d63b72a2758a6f42eade714ae8d5328
+ARG XRAY_SHA256_ARM=2a893d5b5f7cf5a33168c102f01771ed69a674abeab0b8fb085b1ddf098cf52c
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl unzip; \

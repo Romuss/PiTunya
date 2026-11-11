@@ -92,7 +92,7 @@ class InboundPreset:
     description: str
     needs_domain: bool
     supports_reality: bool
-    protocol: str           # vless | trojan | shadowsocks | socks
+    protocol: str           # vless | trojan | shadowsocks | socks | hysteria
     fields: List[PresetField]
     build_payload: Callable[..., Dict[str, Any]] = field(repr=False)
 
@@ -486,6 +486,71 @@ def _build_socks5(values: Dict[str, Any], **_: Any) -> Dict[str, Any]:
     }
 
 
+# ── Preset 7: Hysteria2 (QUIC / UDP) ─────────────────────────────────────────
+
+
+def _build_hysteria2(
+    values: Dict[str, Any],
+    *,
+    cert_file: str,
+    key_file: str,
+    sni: str,
+    masquerade: Optional[Dict[str, Any]] = None,
+    obfs_password: Optional[str] = None,
+    **_: Any,
+) -> Dict[str, Any]:
+    """Hysteria2 inbound on xray's `hysteria` transport.
+
+    Needs a certificate (QUIC has no Reality): `create_inbound` resolves one on
+    the VPS first — the Let's Encrypt cert of the panel's domain, or a
+    self-signed one for a bare panel. The bootstrap client carries an `auth`
+    token instead of a UUID.
+    """
+    port = int(values["port"])
+    remark = values.get("remark") or "hysteria2"
+    settings = {
+        "version": 2,
+        "clients": [
+            {
+                "auth": secrets.token_urlsafe(16),
+                "email": _client_email_label(),
+                "limitIp": 0, "totalGB": 0, "expiryTime": 0,
+                "enable": True, "tgId": "", "subId": "", "comment": "", "reset": 0,
+            },
+        ],
+    }
+    stream = {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+            "serverName": sni,
+            "alpn": ["h3"],
+            "certificates": [
+                {"certificateFile": cert_file, "keyFile": key_file},
+            ],
+        },
+        "hysteriaSettings": {"version": 2, "auth": "", "udpIdleTimeout": 60},
+    }
+    # How the port looks to a probe: an HTTP/3 website (masquerade) or random
+    # noise (salamander). The two exclude each other; neither is the default for
+    # an address nobody else reaches, so `create_inbound` picks one.
+    if masquerade:
+        stream["hysteriaSettings"]["masquerade"] = masquerade
+    if obfs_password:
+        stream["finalmask"] = {
+            "udp": [{"type": "salamander", "settings": {"password": obfs_password}}],
+        }
+    return {
+        "up": 0, "down": 0, "total": 0,
+        "remark": remark, "enable": True, "expiryTime": 0,
+        "listen": "", "port": port,
+        "protocol": "hysteria",
+        "settings": settings,
+        "streamSettings": stream,
+        "sniffing": _sniff(),
+    }
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 
@@ -686,6 +751,67 @@ PRESETS: Dict[str, InboundPreset] = {
             ),
         ],
         build_payload=_build_socks5,
+    ),
+
+    "hysteria2": InboundPreset(
+        id="hysteria2",
+        label="Hysteria2 (QUIC, UDP)",
+        description=(
+            "Hysteria2 over QUIC on a UDP port — fast on lossy links and a "
+            "different shape on the wire than the TCP presets. Needs the UDP "
+            "port reachable and a TLS certificate: an x-ui-pro panel reuses "
+            "its Let's Encrypt certificate, a bare panel gets a self-signed "
+            "one that the exported node pins."
+        ),
+        needs_domain=False,
+        supports_reality=False,
+        protocol="hysteria",
+        fields=[
+            PresetField(
+                name="port", label="UDP port", type="int", default="443",
+                help="Must be free for UDP. 443/udp is usual and does not "
+                     "clash with nginx on 443/tcp.",
+            ),
+            PresetField(
+                name="sni", label="SNI", type="sni", required=False,
+                placeholder="the panel domain, or leave empty",
+                help="Name the certificate is issued for. Empty = the panel "
+                     "domain (x-ui-pro) or a generic name (bare, pinned).",
+            ),
+            PresetField(
+                name="mask", label="How the port looks", type="select",
+                required=False, default="auto",
+                choices=["auto", "site", "noise", "none"],
+                help="auto: x-ui-pro answers like an HTTP/3 website (its fake "
+                     "site), a bare panel looks like random noise. site: a "
+                     "probe gets a web page. noise: salamander obfuscation, no "
+                     "readable QUIC header. none: plain Hysteria2. site and "
+                     "noise exclude each other.",
+            ),
+            PresetField(
+                name="hop", label="Port hopping", type="select",
+                required=False, default="off", choices=["off", "on"],
+                help="The client moves across a UDP port range; the server "
+                     "redirects the range to this port (an nftables rule on "
+                     "the VPS). Helps against per-port throttling.",
+            ),
+            PresetField(
+                name="hop_ports", label="Hop range (UDP)", type="string",
+                required=False, default="20000-32000",
+                help="Used when port hopping is on. Keep it below 32768 and "
+                     "free of other UDP services.",
+            ),
+            PresetField(
+                name="hop_interval", label="Hop interval (seconds)", type="string",
+                required=False, default="10-30",
+                help="Used when port hopping is on, e.g. 10-30.",
+            ),
+            PresetField(
+                name="remark", label="Remark (optional)", type="string",
+                required=False,
+            ),
+        ],
+        build_payload=_build_hysteria2,
     ),
 }
 

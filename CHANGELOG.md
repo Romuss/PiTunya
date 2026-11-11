@@ -4,7 +4,248 @@ All notable user-facing changes to PiTun. Full per-release detail lives in the
 [GitHub Releases](https://github.com/DaveBugg/PiTun/releases); this file is the
 committed summary.
 
-## v2.4.0 — 2026-08-27
+## v1.7.8 — 2026-11-09
+
+**Installing an x-ui-pro server works on VPS images without `sudo`.**
+
+### Fixed
+
+- The x-ui server installer now installs `sudo` first. On a minimal image the upstream x-ui-pro installer died with "sudo: command not found" and then reported a misleading SSL / rate-limit failure.
+
+## v1.7.7 — 2026-11-08
+
+**A node circle can follow several subscriptions, and nodes show which subscription they came from.**
+
+### Added
+
+- A circle's "Sync from subscription" is now a multi-select: tick as many subscriptions as you like and the circle stays in sync with each of them on every refresh. Hand-picked members are kept; unticked nodes and excluded countries still apply.
+- Each node shows its subscription as a badge on the Nodes page, and in the circle editor's node list (left of the node number).
+
+## v1.7.6 — 2026-11-04
+
+**Hysteria2 nodes are health-checked over UDP.**
+
+### Fixed
+
+- A Hysteria2 node showed "Offline" on the health check although it carried traffic: the check opened a TCP connection to a UDP port and was refused. Hysteria2 nodes (stored as `hy2`) are now probed over UDP, as WireGuard ones already were (a best-effort probe: it reports offline on a hard network error, and cannot see a server that silently drops packets). v1.7.5 carried this change under the wrong protocol name, so it had no effect.
+
+## v1.7.5 — 2026-11-04
+
+**The update progress now stays visible to the end.**
+
+### Fixed
+
+- The progress bar vanished partway through every update. The installer's coloured step lines were copied into the update status file as they were, and the colour escape bytes made that JSON unreadable, so the page saw "nothing running" from the host-preparation step on. The installer no longer colours piped output, the update agent strips such bytes, the backend tolerates them, and the page keeps showing the last known step while the status is unreadable.
+- The page itself is no longer cached by the browser: after an update it could keep running the old interface (and its old fixes) until a hard reload. The installer now restarts the frontend container so a changed web-server config is picked up.
+
+## v1.7.4 — 2026-11-04
+
+**The update window stays on screen while an update runs.**
+
+### Fixed
+
+- The update progress no longer disappears after "Update now": a page reload or a restarting backend in the middle of an update still shows "Restarting services…", and the 401 redirect to the login page is skipped for the status poll.
+- When the agent finds nothing to do, the page says so ("Already on …") instead of dropping the progress box without a word.
+- "Update now" installs the version the check showed, instead of letting the agent look the latest release up again and possibly disagree.
+- A failed start is shown in the update block.
+- The queued status is written atomically and before the request, so a fast agent's "running" is not overwritten; the daily check no longer writes over a requested update.
+
+## v1.7.3 — 2026-11-04
+
+**Hysteria2 that hides its port and hops across ports, and an update page that shows its progress.**
+
+### Added
+
+- **Hysteria2 can hide its port and hop across ports** (X-ui → Add inbound →
+  Hysteria2). "How the port looks" has three modes:
+  - *site* — a probe that speaks HTTP/3 to the UDP port gets the panel's own web
+    site (relayed from the same name over TCP, so both answers are identical).
+    The default on x-ui-pro, where the certificate is a real one;
+  - *noise* — salamander obfuscation: no readable QUIC header, so neither the SNI
+    nor the self-signed certificate of a bare panel is visible. The default on
+    bare;
+  - *none* — plain Hysteria2.
+  The password of the obfuscation travels with the exported node and the share
+  link (`obfs=salamander&obfs-password=…`).
+- **Port hopping** (optional). The client moves across a UDP range (20000-32000
+  by default) every 10-30 s; the VPS redirects the range to the inbound's port
+  with an nftables rule in its own table, loaded at boot and removed with the
+  inbound. Only the first packet of a flow is redirected, so the VPS's own
+  traffic (DNS replies and the like) is never touched; a range that contains a
+  UDP port something already listens on is refused. Node form: "Port hopping
+  range" and "Hop interval"; share links carry `mport=`.
+
+### Fixed
+
+- **The update progress bar vanished right after "Update now".** The host agent
+  consumes the request before it writes its first status, and for those seconds
+  the status file still held the previous run, so the page saw nothing in flight
+  and stopped looking. The agent now writes "running" first, and the page keeps
+  watching (and says "Starting the update…") until the status changes.
+
+## v1.7.2 — 2026-11-03
+
+**Circles check the speed before switching; smaller fixes around them.**
+
+### Changed
+
+- **"Best" circles check the speed before switching.** Nodes are taken in ping
+  order and the first one that really reaches the speed target wins; a slow one
+  is passed over for the next by ping. The target is the circle's "Min speed"
+  (50 Mbit/s by default; 0 turns the check off). Cost stays bounded whatever the
+  intervals: a recent measurement is reused (about one interval), a slow verdict
+  is remembered much longer, a rotation tests a few nodes at most, and on average
+  no more than two per rotation. If nobody reaches the target the circle still
+  moves, to an untested node first, otherwise the fastest measured one.
+- **A circle's minimum interval is 5 minutes** (was 1); existing circles below it
+  are raised to 5. Migration 031 also gives "best" circles without a target 50.
+- **Choosing a country** for a circle opens a searchable list (the one Wi-Fi
+  settings use) instead of a bare code box; circles show what they exclude as
+  badges in the list.
+- **Balancers are marked experimental**, in the menu and on the page, with a note on
+  how they differ from NodeCircle and what they lack today (no subscription sync,
+  no filters, no ping source for "Least ping").
+- The update result banner is news for 30 minutes and can be closed; a failure
+  stays until closed.
+- The dashboard's process table has a Description column; the host-memory line is
+  gone (the gauges above show it).
+
+### Fixed
+
+- A server whose panel arrived by `xui://` or a servers import now reads as
+  "x-ui configured" and offers the panel's uninstall, like one PiTun installed.
+  Panels registered earlier are marked on start-up.
+- Importing a panel without a port no longer fails the whole server row.
+
+## v1.7.1 — 2026-11-03
+
+**Fixes the in-app update to 1.7.0, which stopped on a checksum.**
+
+### Fixed
+
+- **Updating to 1.7.0 failed on every device.** The installer checks the xray
+  binary inside the new backend image against a pinned sha256, and `install.sh`
+  still held the values of the previous xray, so the check failed three times and
+  the update ended with "Installer exited with code 1". Nothing was applied (the
+  database snapshot is the only leftover). The values now match the image, and a
+  test keeps `install.sh` and the Dockerfile in step.
+- The installer's failure message crashed with "attempt: unbound variable"
+  instead of explaining; it now prints the advice on checking the storage.
+- **The update progress was invisible.** After "Update now" the status file still
+  held the previous run, so the page saw nothing in flight, stopped polling and
+  offered the button again. A request waiting for the host agent now shows as
+  queued with its progress bar, and the buttons stay locked.
+- The ArgoSBX cleanup also stops and removes the `sb.service` unit the stack
+  runs under (only when it launches something from the agsbx directory).
+
+### Upgrading
+
+- Devices that tried 1.7.0 and failed are untouched: update again, to 1.7.1.
+
+## v1.7.0 — 2026-11-02
+
+**Hysteria2 servers, a Domains page, a view of what PiTun costs the box with
+optional limits, xray 26.10, and x-ui 3.11.**
+
+### Added
+
+- **Hysteria2 inbound preset** (X-ui → Add inbound). QUIC over a UDP port,
+  created on the panel like the other presets: the bootstrap client carries an
+  `auth` token, the UDP port is opened in `ufw`, and the client exports to a
+  PiTun node (`hysteria2://` link and QR included). An x-ui-pro panel reuses its
+  Let's Encrypt certificate; a bare panel gets a self-signed one on the VPS and
+  the exported node pins it.
+- **Pin a server's certificate** (node form → "Pinned certificate"). xray
+  removed `allowInsecure`, so a self-signed server is now trusted by the SHA-256
+  of its certificate. "Take from server" reads it from a TCP/TLS server; links
+  with `pcs=` / `pinSHA256=` carry it in and out. Migration 028.
+- **Update xray inside a panel** from PiTun (X-ui → a panel's xray card): shows
+  the core and panel versions, lists what the panel can install, installs after
+  a confirmation and checks that the new core is running; a failed install
+  offers a roll-back. Panels older than 3.8.0 are not offered xray 26.9 or newer
+  (they would not migrate their stored templates).
+- **Update the panel itself** from PiTun (X-ui → a panel, next to the xray card;
+  shown only when the panel is older than the release PiTun has tested, 3.11.0).
+  Done over SSH with upstream's `update.sh` taken at the release's commit and
+  checked against a sha256, so the panel never fetches an unpinned updater or
+  jumps to a newer release whose API PiTun has not been tested against. PiTun
+  copies `/etc/x-ui/x-ui.db` on the VPS first and does not start the update if
+  the copy cannot be made; the copy's path is shown afterwards. The update also
+  replaces the panel's xray with the one bundled in that release.
+- **Domains page** (opt-in). Which domains xray resolved, how often, when, and
+  the addresses they resolved to — searchable and sortable, with a one-click way
+  to turn a selection into a routing rule (a new one, or added to an existing
+  domain / IP rule). Capped by rows and age, with a manual clean-up (by age, top
+  N, size, or everything). Off by default; needs xray's log level at `info`.
+  Migration 029.
+- **What PiTun is using.** A table of xray, the backend and each PiTun
+  container with CPU, memory and any limit, on the Dashboard and the
+  Diagnostics page.
+- **Resource limits** (Settings, off by default). Optional memory and CPU
+  ceilings for the backend, web UI, nginx and NaiveProxy sidecars, plus a soft
+  memory cap for xray. Applied to the running containers and put back after a
+  restart.
+- **Copy a panel's `xui://` address** from its card, to import it on another
+  PiTun box.
+- **Circles check the internet through a node before switching to it.** The old
+  pre-ping only opened the node's port, so a server whose port answered but whose
+  upstream was dead kept being picked. The check fetches a small page through the
+  candidate (at most three candidates, 8 s each per rotation); if every node
+  fails it, the port check is used instead and the Events feed says so.
+- **Subscriptions verify the server's certificate**; a per-subscription
+  "Allow self-signed certificate" box keeps the old behaviour where it is needed.
+  Subscriptions that already exist keep it ticked. Migration 027.
+
+### Changed
+
+- **xray 26.10.31** is bundled (backend image and install scripts). xray 26.9
+  made an outbound's `proxySettings` a hard error, so chained nodes, the DNS
+  outbound and the speed-test instance now use `sockopt.dialerProxy`; the
+  `direct` outbound's IP strategy moved into `sockopt` as well.
+- **x-ui 3.11.0** is what new panels install (pinned installer). An upgrade runs
+  the panel's database migrations once and cannot be undone — back up
+  `/etc/x-ui/x-ui.db` before upgrading an existing panel.
+- **x-ui-pro installs no longer keep the ArgoSBX / sing-box stack** that the
+  wrapper adds (hysteria2, tuic, anytls and shadowsocks listeners, a subscription
+  file in the web root, a cron entry). It runs unpinned code as root and PiTun
+  uses none of it, so the installer removes it afterwards — in bare mode too, if
+  it finds a leftover one; `KEEP_ARGOSBX=yes`
+  keeps it.
+- Importing servers onto a box that already lists one of them now adds that
+  server's panel registration instead of skipping it.
+- **Server import never deletes anything.** "Replace" used to wipe every server
+  on the box first (and, through foreign keys, their panels, clients and node
+  links). It now overwrites only the servers the file duplicates
+  (name+host+port), in place, and leaves the rest alone; a file without secrets
+  keeps the passwords already stored.
+- Speed-test failures show a short reason ("timed out", "name resolution
+  failed") instead of raw exception text; the detail goes to `errors.log`.
+- Dependencies: `asyncssh` 2.24.0, `pydantic-settings` 2.14.2, `axios` 1.20,
+  `react-router-dom` 7.18.4 and the development tooling; the unused `aiohttp`
+  requirement is gone.
+
+### Fixed
+
+- **The NaiveProxy sidecar image builds again.** The release it was pinned to
+  lost its downloads upstream; it now builds on v154.0.8037.49-5.
+- **A circle synced with a subscription no longer takes back what you removed.**
+  Every refresh re-added all of the subscription's nodes, so nodes unticked in
+  the circle's editor came back. Unticking is now remembered, and a new
+  "Never include countries" setting keeps whole countries (say RU) out of the
+  circle whatever the subscription serves. Nodes added by hand are never
+  touched. Migration 030.
+- **Hysteria2 nodes never worked.** The outbound used a shape xray rejects
+  ("not hysteria transport"), and salamander obfuscation was silently ignored.
+- **A node marked "allow insecure" stopped xray from loading its config at all**
+  (xray treats the removed field as an error). The field is no longer emitted and
+  the node can be pinned instead.
+
+### Upgrading
+
+- Migrations 027, 028, 029 and 030 run on first start; there are no breaking changes.
+- xray 26.10 needs the `dialerProxy` form that this release writes — configs
+  generated by older versions are regenerated on the first start.
+- Panels older than 3.8.0 keep their current xray; update the panel first.
 
 ## v1.6.8 — 2026-10-14
 
@@ -46,7 +287,6 @@ a crash, and a round of small robustness fixes.**
   not only when they are over an hour old.
 - Removed the device vendor lookup fallback that was never populated.
 
-
 ## v1.6.7 — 2026-10-01
 
 **Pick a free port before you pick it for an inbound, and dialogs that no
@@ -72,85 +312,554 @@ longer eat your input.**
 
 ## v1.6.6 — 2026-08-15
 
-Fixes broken country-flag enrichment on subscription import and adds a
-per-circle country exclusion feature.
+**Country flags now come from where the traffic actually comes out.** Nodes
+addressed by hostname never got one, and a chained node showed the wrong one.
 
 ### Fixed
 
-- **Country flags not applied to subscription nodes.** The subscription
-  refresh path imported `enrich_node_name` from `geoip_lookup.py`, but that
-  function did not exist — only `enrich_name` did. The `ImportError` was
-  silently swallowed by a bare `except`, so no country flags were ever
-  prefixed to imported node names. The function is now implemented: generic
-  placeholder names (`proxy`, `proxy-1`, `node-N`, blank) are enriched to
-  `<protocol>-<flag>-<addr>:<port>` using the GeoLite2 mmdb, while curated
-  names (`Tokyo-1`, `Frankfurt`, …) are left untouched.
-
-- **NodeCircle only rotated between 2 nodes.** Two issues conspired to
-  keep the circle stuck on the same pair of nodes:
-  1. The smart rotation guard skipped rotation whenever the active node
-     was healthy (online + latency ≤ 80ms), even with `min_speed_mbps=0`
-     (default). This defeated the anti-DPI purpose — the circle never
-     rotated away from a healthy node. Now smart-skip only activates when
-     `min_speed_mbps > 0` (operator explicitly opted in); with the default
-     0, the circle rotates on schedule regardless of health.
-  2. In "best" mode, candidates were probed in strict quality order, so
-     the same top-2 nodes (current excluded, next-best picked) were always
-     reached first. Nodes 3+ were never probed. Now both "best" and
-     "random" modes shuffle within the top-3 healthy candidates, providing
-     real exit-point variety. The shuffle threshold also dropped from >3
-     to >2 candidates, so circles with exactly 3 nodes get variety too.
+- **The write hook stripped the flag the moment it was applied.** Enrichment
+  runs on every node write, where DNS is deliberately skipped (a stalled
+  resolver would hold up the database flush) — so for a hostname address it
+  found no country and removed the prefix. Including the one
+  `/apply-country-flags` had just resolved and set: the button reported
+  renaming nodes that then showed no flag. It now leaves a name alone when it
+  cannot determine the country, and only replaces a prefix when it can.
 
 ### Added
 
-- **Per-circle country exclusion.** NodeCircle now has an `excluded_countries`
-  field — a comma-separated list of ISO-3166-1 alpha-2 codes (e.g. `DE,NL`).
-  Rotation candidates whose exit country matches any code here are skipped,
-  and auto-synced nodes from excluded countries are not added to the circle.
-  Use case: an operator with a data-limited LTE proxy (e.g. 30GB/month in DE)
-  can exclude that country so the circle doesn't burn through the quota. The
-  field is editable in the NodeCircles UI and shown with flag badges on the
-  circle card.
+- **The speed test reads the exit address back through the tunnel.** One
+  small request to a host the reachability gate already contacts returns both
+  the address the internet saw and its country, so the flag reflects where
+  traffic surfaces — for a chained node that is the last hop, not the entry
+  whose address is stored. It needs no GeoLite2 database on the box, and it
+  answers for a hostname that never resolved locally.
 
-### Notes
+- Every check that opens a tunnel now records it: the manual speed test,
+  "speed all", the live streaming test, the internet check and the background
+  auto-check sweep. A node whose exit moves country is re-flagged by the next
+  sweep without anyone pressing anything.
 
-- Schema migration: alembic head moves from `032` → `033`.
+- `country`, `exit_ip` and `exit_checked_at` on the node (migration 026). The
+  country badge prefers the observed country over anything inferred from the
+  address, and its tooltip names the country and the exit address.
 
-## v2.2.0 — 2026-08-13
+## v1.6.5 — 2026-08-15
 
-Fixes the fatal xray startup crash (`core: not all dependencies are resolved`)
-and removes the AdBlock feature entirely.
+**The pre-upgrade database snapshot wasn't being taken — and the installer
+said it was.** Found upgrading a second box.
 
 ### Fixed
 
-- **Xray crash: "not all dependencies are resolved".** When `dns_route_via` was
-  set to `"proxy"`, the config generator emitted `outboundTag: "proxy"` in both
-  the DNS server entries and the port-53 routing rule — but no outbound with
-  that tag exists in the generated config (outbounds are `direct`, `block`,
-  `dns-out`, `node-<id>`). Xray's dependency resolver rejected the config on
-  startup, killing the entire proxy. The `"proxy"` value now resolves to the
-  concrete `node-<active_node_id>` tag (or `direct` when no active node is
-  selected). A validation hint for this error class has also been added so
-  future occurrences surface a human-readable message.
+- **No backup was made on affected hosts.** The snapshot was pulled out of
+  the container with `docker cp`, which on Docker 29 fails with
+  `mkdirat var/run: file exists` while the snapshot inside the container
+  succeeds. The data directory is a bind mount — the same disk from both
+  sides — so the copy that failed was never needed. The snapshot is now
+  written straight there.
 
-### Removed
+- **The summary named a rollback file that did not exist.** `BACKUP_PATH` was
+  assigned before the attempt, so the `${BACKUP_PATH:-no snapshot}` fallback
+  could never fire: every upgrade printed a path, and the post-upgrade advice
+  told you to restore from it. Text read at the exact moment it matters, when
+  an upgrade has just gone wrong. It is now set only once the file is on disk
+  and non-empty, and says plainly when no snapshot was taken.
 
-- **AdBlock feature removed.** The entire DNS-level ad/tracker blocking
-  subsystem has been deleted: backend models (`AdBlockRule`, `AdBlockList`),
-  API router, core module, config_gen integration, DNS logger hooks, frontend
-  page, dashboard widget, sidebar link, and API client — all gone. A migration
-  (`031`) drops the orphaned DB tables and cleans up auto-generated routing
-  rules (`name LIKE 'adblock:%'`). The feature was heavyweight, rarely used,
-  and its integration with xray config generation was a recurring source of
-  complexity and breakage.
+## v1.6.4 — 2026-08-15
+
+### Fixed
+
+- **The installer warned that xray was blocking xray's own DNS port.** The
+  check exists to catch something squatting on UDP/5353, which PiTun's DNS
+  needs. On an upgrade the process holding it is xray — it *is* that DNS — so
+  every operator of a healthy box was told their DNS would not start, with
+  the pid of the process already serving it offered as evidence. It now
+  ignores xray and still reports anything else, including something listening
+  alongside it.
+
+## v1.6.3 — 2026-08-14
+
+**Country flags on nodes actually appear now** — and look the same on every
+platform.
+
+### Fixed
+
+- **Flags reached two of the nine ways a node is created.** The GeoLite2
+  lookup was never broken; enrichment was simply called at the two import
+  paths while nodes are created in nine places, so a node from a server
+  deploy or an x-ui panel never got one, and existing nodes were never
+  revisited. It is now applied at the model — every path goes through that by
+  construction, including the tenth one somebody adds later. DNS is skipped
+  there deliberately, since it runs inside the database write; the import
+  paths still resolve hostnames as before.
+
+  For nodes that predate all this: `POST /api/nodes/apply-country-flags`,
+  which does resolve, and is idempotent.
+
+- **Windows drew the flags as bare letters.** It ships no flag glyphs, so
+  `🇨🇭 vless-…` rendered as `CH vless-…`, flush against the name. PiTun now
+  carries the glyphs itself — [Twemoji Country Flags](https://github.com/talkjs/country-flag-emoji-polyfill),
+  self-hosted, flags only, 78 KB — so a flag looks the same everywhere. The
+  country is also lifted out of the name into its own badge, rather than
+  reading as the first word of it.
+
+## v1.6.2 — 2026-08-14
+
+**The Update button in the panel now works.** It never could.
+
+### Fixed
+
+- **The panel's Update button waited for an agent nobody installed.** The
+  button writes a request file, and a host-side systemd path unit is what
+  carries it out — but `install.sh` never installed that unit, on any box it
+  ever produced. The button reported "waiting for the update agent" and sat at
+  0% forever.
+
+  The hint shown underneath made it worse: it named `--install-timer`, which is
+  the separate daily scheduled check and does not service the button at all, so
+  an operator who followed the message installed a timer and watched the same
+  0%.
+
+  The installer now sets the agent up. This does **not** enable unattended
+  updates — the agent acts only on a request you made from the panel, and the
+  scheduled timer stays opt-in. The hint and the knowledge base name the right
+  flag and say plainly that the two are different things.
+
+  Existing boxes need the agent once, by hand:
+  `bash /opt/pitun/scripts/pitun-update.sh --install-agent`
+
+## v1.6.1 — 2026-08-14
+
+**A panel PiTun didn't install can now be connected to it.** Everything here
+came from using 1.6.0 on real boxes.
+
+### Added
+
+- **Connect an existing x-ui panel.** The X-ui page shows registered panels,
+  and a panel only became one by being deployed through PiTun — its install
+  script ends by registering it. Import a server that already runs x-ui and
+  the page stayed empty, with nothing on it suggesting another route, so
+  reinstalling over a working panel looked like the only option. There is now
+  a button, taking either the `xui://` line from the install or, if that is
+  long gone, the login you use for the panel yourself.
+
+  **The API token is no longer asked for.** It is what every call needs and
+  what nobody has lying around — the install script obtains it by logging in
+  and reading, or creating, a token named `pitun`. PiTun now does the same, so
+  you supply only the port, the base path and your panel login. An existing
+  token is reused rather than a new one minted per attempt, which keeps any
+  `xui://` handed out earlier valid.
+
+- **The panel travels with its server.** Exporting a server with secrets and
+  restoring it elsewhere left the panel behind — it lives in its own table —
+  so the server arrived with x-ui plainly installed and the X-ui page empty.
+  The bundle (envelope v3) now nests it. Its shape travels either way, so a
+  secret-stripped file still says a panel was here; the token and password
+  follow the same opt-in as the SSH credentials. Older bundles import exactly
+  as before.
+
+### Fixed
+
+- **Upgrading from a beta to its own release was refused as a downgrade.**
+  `sort -V` is not semver aware: it reads `1.6.0-beta.3` as `1.6.0` plus extra
+  characters and sorts it *after* the finished release, so the guard against
+  an accidental rollback fired on the single most common upgrade there is.
+  Hit while updating the test box to 1.6.0.
+- A client that has no API token yet — the one that logs in precisely to fetch
+  one — sent a bare `Bearer `, which the HTTP layer refuses to encode: the
+  request failed before reaching the panel, reporting a header problem rather
+  than a missing token. The underlying failure was unreadable too, printing
+  "transport error: " and stopping; it now names what went wrong and the URL
+  it could not reach, which is the error you get when the port or base path is
+  wrong.
+
+## v1.6.0 — 2026-08-14
+
+**PiTun can be the router.** On a box with two or more physical ports it takes
+the ISP uplink, hands out addresses, does NAT, and can serve the WiFi itself.
+Gateway mode is untouched and remains the default: nothing changes for an
+existing install unless the mode is switched on deliberately.
+
+Three betas of hardware testing went into this. Everything below was run on a
+real box, not reasoned about — the reboot alone found three faults that no
+amount of reading would have.
+
+### Router mode
+
+**Where:** Settings → Router. Offered only when the box actually has two or
+more physical NICs, and never switched on automatically.
+
+- **DHCP for the LAN**, with pool, lease time and per-device reserved
+  addresses assigned from the Devices page. PiTun advertises itself as the
+  resolver, so routing rules and the DNS query log cover devices that never
+  opted in to anything.
+- **A LAN of several ports.** Sockets and the radio are bridged into one
+  segment — same subnet, one DHCP scope, clients on either side see each
+  other.
+- **WAN in the shapes an ISP link comes in**: DHCP (what providers call IPoE),
+  static, **PPPoE**, VLAN tagging, MAC cloning. With PPPoE or a VLAN the
+  traffic leaves on a different interface than the port the cable is in, and
+  NAT, the firewall and the counters follow it.
+- **WiFi access point**, gated on a capability probe: plenty of adapters can
+  only join networks, not create them, and discovering that when hostapd
+  refuses to start means the working setup is already dismantled.
+- **Commit-confirm watchdog.** Router mode has no fallback — PiTun *is* the
+  router — so an apply that breaks the network would leave nobody able to undo
+  it. The box reverts to gateway unless a human confirms, and an unconfirmed
+  apply never survives a reboot.
+- **The uplink accepts nothing new from the internet.** One blanket rule
+  rather than a list of ports to close. The panel, SSH and xray's inbounds all
+  bind `0.0.0.0` — they stay reachable over the LAN and invisible from
+  outside. Two exceptions keep the link working: DHCP replies, which arrive as
+  NEW rather than RELATED, and the ICMP that PMTU discovery needs.
+- **Optional access from the uplink**, off by default, for a PiTun that sits
+  behind another router — that "WAN" is your own network. Refused outright if
+  the uplink address turns out to be public.
+- **Uplink diagnosis** built on nftables counters, because the rules a WAN
+  depends on fail silently.
+
+### Also in this release
+
+- **Connection-lifetime policy for Xray**, for the box's own instance and every
+  registered panel. Xray's `connIdle` of 300 s kills an idle *pooled*
+  connection, so the next request on that socket hangs — the "works, then it
+  doesn't" that SDK and agent clients hit — and the half-close timers cut long
+  streaming answers. Nothing set any of it before. Panels are patched, never
+  overwritten, and **Apply to all panels** pushes a change to the fleet.
+- **The installer produced a box with no panel at all.** `nginx.conf` has
+  carried an unconditional `listen 443 ssl` since v1.5.2 while `install.sh`
+  generated no certificate, so nginx aborted — taking port 80 with it, since
+  it is the only service publishing either. Every one-liner install since
+  v1.5.2 landed that way.
+- **A network card present but unusable is now named as such** — "no adapters
+  found" is the wrong thing to say about hardware sitting on the PCI bus.
+- Searchable country picker for the WiFi regulatory domain, with flags and
+  localised names.
+
+### Upgrading
+
+Standard update path, verified from v1.6.0-beta.2 through to this release: the
+database is backed up first, migrations run, and a box in router mode brings
+itself back without help. Ships migrations **023–025**, all additive. Nothing
+about router mode activates until you choose it.
+
+**Secrets:** the WiFi passphrase and the PPPoE password are write-only — set
+but never returned, and redacted from configuration backups unless secrets are
+explicitly included.
+
+**Full diff:** https://github.com/DaveBugg/PiTun/compare/v1.5.3...v1.6.0
+
+## v1.6.0-beta.3 — 2026-08-14
+
+**Beta — what a reboot found.** beta.2 had run on hardware but had never been
+switched off and on again. It did not survive: the box came back claiming to
+be a router while behaving as a gateway. That, and publishing the panel on the
+uplink turning out to work for SSH and not for the panel, are what this fixes.
+
+### Fixed
+
+- **A reboot left the box claiming router and behaving as gateway.** Three
+  causes, all of them about boot differing from an operator pressing Save.
+  The reconcile ran before the hardware had finished arriving — a wifi adapter
+  appears only once its firmware has loaded, and the backend is up in seconds —
+  so it asked, got "port is not present", and gave up. It gave up *without
+  cleaning up*, leaving both sidecars resurrected by Docker's own restart
+  policy: dnsmasq serving DHCP for a bridge that no longer existed, hostapd
+  crash-looping on a missing radio. And it was a single attempt, so a LAN cable
+  plugged in a minute later changed nothing. Boot now waits for the configured
+  ports, tears the dataplane down if it cannot restore it, and the watchdog
+  retries once a minute while the settings say router and the dataplane is
+  absent.
+- **Publishing the panel on the uplink only opened half the path.** With both
+  toggles on, SSH answered from the WAN and the panel did not: SSH is a host
+  service and reaches INPUT, while the panel is a container with published
+  ports, so the request is DNAT'd and *forwarded* — a chain whose policy is
+  drop. Worse than a missing feature, because the operator turns that toggle on
+  precisely so they can confirm after the switch, and could not, so the
+  watchdog reverted a working router.
+- **The LAN address ended up on both the bridge and the member.** The port
+  needs a persistent address — without one there is nothing for the next apply
+  to read after a reboot — and NetworkManager puts that address straight back
+  the moment the bridge takes it. Members are now taken out of its hands while
+  enslaved and handed back on teardown.
+- **TCP MSS is clamped to the route MTU**, without which a PPPoE uplink hangs
+  on large transfers while small requests work.
+- The ICMP counter is read before conntrack, where it can actually see the
+  PMTU messages it exists to detect, and zero is no longer reported as a
+  warning on an uplink that has an address.
+- Diagnosis reports when traffic is leaving by a port that isn't the uplink —
+  NAT and a firewall on a link nothing uses, with every other check healthy.
+
+### Added
+
+- **A network card present but unusable is now named as such.** "No wireless
+  adapters found" is the wrong thing to say about a card sitting on the PCI
+  bus. The inventory reports controllers that produced no interface and
+  separates the two readings — nothing bound the device, or a driver is bound
+  and produced no interface anyway, which in practice means firmware it could
+  not load. Found the hard way: a purged firmware package cost an evening.
 
 ### Notes
 
-- Schema migration: alembic head moves from `030` → `031`.
-- Breaking change: `GET /api/adblock/*` endpoints no longer exist. The
-  frontend AdBlock page and dashboard widget are removed.
+- No new migrations; head remains 025.
+- Verified on hardware: reboot with a LAN cable restores router mode
+  unattended; a client on the LAN resolves DNS, pings out and pulls 1 MB
+  through NAT; the update path preserves the database and brings the router
+  back by itself.
+- 5 commits. Tests: 188 router-mode, 96 frontend.
 
-**Full Changelog:** https://github.com/DaveBugg/PiTun/compare/v2.1.1...v2.2.0
+## v1.6.0-beta.2 — 2026-08-14
+
+**Beta — router mode, first hardware run.** beta.1 had never been switched on
+outside tests. This is what a two-port mini PC found: a clean install that left
+the panel unreachable, an access point that broadcast nothing while reporting
+success, and a router you could not switch back off. Everything below was
+observed on real hardware, not reasoned about.
+
+Upgrading from beta.1 is worthwhile even if you never enable router mode — the
+installer and X-ui fixes apply to every box.
+
+### Fixed — install
+
+- **The one-liner install left the panel unreachable on both 80 and 443.**
+  `nginx.conf` has carried an unconditional `listen 443 ssl` since v1.5.2, but
+  `install.sh` never generated a certificate — the word does not appear in it.
+  nginx aborts outright when the files are missing, and since it is the only
+  service publishing either port, the panel was gone from *both* while the
+  container crash-looped. Every one-liner install since v1.5.2 landed this way;
+  it went unnoticed because our own boxes were provisioned through
+  `03-deploy.sh`, which does generate the cert.
+- **The sidecar build shipped inert.** `build-sidecars.sh` referenced `$DOCKER`
+  while declaring `DOCKER_CMD`; under `set -u` that aborts on the first loop
+  iteration, so the dnsmasq and hostapd images were never built by any caller —
+  the exact failure the script had just been extracted to fix.
+- **avahi came back within seconds** of being disabled and kept UDP/5353, which
+  xray needs for DNS. Only the service was masked, not the socket unit that
+  re-activates it, and masking never kills a running process.
+- The installer no longer claims success without looking: `compose up -d`
+  returns 0 for a container that starts and immediately dies, so it printed
+  "PiTun is up" over a dead stack.
+
+### Fixed — router mode
+
+- **"Auto" WiFi channel put nothing on the air.** `channel=0` runs hostapd's
+  ACS, which needs noise-floor figures the driver may not report — mt7921
+  doesn't — and hostapd then loops over every channel forever *without
+  exiting*. The container looked healthy while no SSID existed. Auto now
+  resolves to a fixed channel, and the start path asks the radio whether it
+  actually entered AP mode rather than trusting that the process survived.
+- **Bridging the LAN stranded the operator in router mode.** Enslaved ports
+  were dropped from the inventory, so the moment the bridge came up the
+  assigned ports vanished, the panel reported one port on a three-port box, and
+  validation rejected the stored configuration — including the request to turn
+  router mode *off*. Leaving router mode is no longer validated at all: gateway
+  is the resting state and the escape hatch.
+- **A save that changed nothing rebuilt the network.** Any patch touching a
+  router key tore the bridge down and back up and restarted hostapd and
+  dnsmasq — indistinguishable, from a client, from the router rebooting — and
+  re-armed the confirm window on an already-confirmed router, which then
+  reverted itself three minutes later.
+- **No TCP MSS clamping.** A PPPoE uplink carries 1492 bytes; LAN clients
+  announce MSS for their own 1500. Without clamping the router depends on ICMP
+  "fragmentation needed" reaching the sender, which the public internet drops
+  often enough that it is not a plan. DNS resolves, ping works, small pages
+  load, large transfers hang forever.
+- **The ICMP counter could not see what it counted.** It sat after
+  `ct state established,related accept`, and the packets it exists to observe
+  are exactly what conntrack marks RELATED — so it read zero on a healthy link
+  and could never have detected the path-MTU black hole it was added for.
+- The LAN address is found on whichever member holds it, the radio may be any
+  LAN member rather than only the primary, and the confirm countdown is driven
+  by the box's own `seconds_left` — a box whose clock is hours off used to
+  promise three hours where three minutes were left.
+
+### Added
+
+- **A LAN can be several ports.** `br-lan` bridges them into one segment —
+  same subnet, one DHCP pool, wired and wireless clients seeing each other.
+  The radio is joined by hostapd itself rather than from both ends, which
+  races.
+- **The uplink can publish the panel and SSH** (both off by default). Useful
+  when PiTun sits behind another router, where that "WAN" is your own network.
+  Refused outright if the uplink address is public. Turn it on *before*
+  switching, not after.
+- **A dedicated Router page** between Diagnostics and Settings, naming the two
+  deployments — behind an existing router, or first in line facing the ISP —
+  so it is clear which fields apply.
+- **Country picker with names and flags** for the WiFi regulatory domain,
+  searchable, no new dependency.
+- **A banner when the panel stops answering at this address**, pointing at the
+  LAN one — the switch to router mode is made from a page served by the port
+  that is about to stop serving it.
+- **`scripts/pppoe-test-rig.sh`** — a local PPPoE concentrator on a veth pair.
+  PPPoE frames don't route, so it cannot be tested remotely and was shipping
+  unexercised. The rig proved the path works and found the MSS and default-route
+  faults above.
+- Diagnosis now reports when traffic is leaving by a port that isn't the
+  uplink: NAT and firewall on a link nothing uses, while every other check
+  reads healthy.
+
+### Notes
+
+- No new migrations; head remains 025.
+- The default WiFi network name is now `PiTun`. Broadcasting stays **off**
+  until switched on.
+- 13 commits. Tests: 1299 backend, 96 frontend.
+
+## v1.6.0-beta.1 — 2026-08-13
+
+**Beta — router mode.** PiTun can now *be* the router instead of sitting beside
+one: it takes the ISP uplink, hands out addresses on the LAN, does NAT, and
+optionally serves the WiFi itself. Gateway mode is untouched and remains the
+default; nothing changes for existing installs unless the mode is switched on
+deliberately. Ships DB migrations 023-025.
+
+**This has never been enabled on real hardware.** Treat the first switch-on as
+an experiment: do it with physical access to the box, not over SSH from the
+LAN it is about to reconfigure.
+
+### Added
+
+- **Router mode.** Offered only on hardware with two or more physical NICs, and
+  never switched on automatically. One port faces the ISP, the other the home
+  network; the choice is explicit in **Settings → Network**.
+- **DHCP server** for the LAN (dnsmasq sidecar), with pool, lease time and
+  per-device reserved addresses assigned from the Devices page. PiTun
+  advertises itself as the resolver, so routing rules and the DNS query log
+  apply to devices that never opted in to anything.
+- **WAN acquisition**: DHCP, static, **PPPoE**, VLAN tagging and MAC cloning —
+  the shapes an ISP link actually comes in. With PPPoE or a VLAN the traffic
+  leaves on a different interface than the port the cable is in, and NAT, the
+  firewall and the counters follow it.
+- **WiFi access point** (hostapd), gated on a capability probe: many adapters
+  can only join networks, not create them, and finding that out when hostapd
+  refuses to start means the working setup is already dismantled. An
+  undetermined answer says so rather than blaming the hardware.
+- **Commit-confirm watchdog.** Router mode has no fallback — PiTun *is* the
+  router — so an apply that breaks the network would otherwise leave nobody
+  able to undo it. The box reverts to gateway unless a human confirms the
+  network still works, and an unconfirmed apply never survives a reboot.
+- **Uplink diagnosis** built on nftables counters, because the two rules the
+  WAN depends on fail silently: no DHCP replies at all, versus no ICMP coming
+  back — the path-MTU black hole where large transfers hang while DNS and ping
+  look fine.
+- **Connection-lifetime policy** (X-ui page), for the box's own xray and every
+  panel at once. Xray's defaults are tuned for short browser sessions: an idle
+  *pooled* connection dies after five minutes and the next request on that
+  socket hangs, and the half-close timers cut a streaming answer after 2–5
+  seconds — the "works, then it doesn't" that SDK and agent clients hit.
+  Nothing in PiTun set any of it before. Panels are patched rather than
+  overwritten, so outbounds, routing and stats flags survive; applied
+  automatically on deploy and on registration, and **Apply to all panels**
+  pushes a change to the fleet. Inbound TCP keep-alive comes with it — with an
+  hour-long idle timeout, a client that vanished without a FIN would otherwise
+  hold its slot the whole hour.
+
+### Changed
+
+- **The uplink accepts nothing new from the internet.** One blanket rule rather
+  than a list of ports to close, because a list has to be maintained and a
+  forgotten port is an exposed service. The panel, SSH and xray's DNS / SOCKS /
+  HTTP inbounds — all of which bind 0.0.0.0 — are reachable over the LAN and
+  invisible from outside. Two exceptions keep the link working: DHCP replies
+  arrive as NEW rather than RELATED, and PMTU discovery needs its ICMP back.
+- **Install paths now build the router-mode sidecars.** dnsmasq and hostapd are
+  not compose services (the backend starts them on demand), so `compose up`
+  never built them and boxes installed through the one-liner had no images at
+  all. Extracted into `scripts/build-sidecars.sh`, called from every path.
+
+### Fixed
+
+- The offline deploy shipped neither `nginx.conf` nor `frontend/nginx-spa.conf`,
+  both mounted as files — Docker created the missing sources as empty
+  directories and the stack could not come up. It also generated no TLS
+  certificate, as did `setup-vm.sh`; nginx aborts on `listen 443 ssl` without
+  one, and since it is the only service publishing 80 and 443, that took the
+  panel down on both ports rather than just HTTPS.
+- Four assignments aborted their install script under `set -euo pipefail`, each
+  taking the fallback written directly below it with them — including one in
+  `01-first-boot.sh` that died after restarting sshd but before setting the
+  static IP, forwarding and hostname.
+- A failed port probe in the panel reported "this box has 0 physical ports",
+  which is a claim about the hardware that was never established. It now says
+  the probe failed, and names a 404 as an out-of-date backend.
+
+### Notes
+
+- Migrations 023-025: `nodecircle.subscription_id`, `device.dhcp_reserved_ip`,
+  and a unique index on the latter. All additive; gateway-mode behaviour is
+  unchanged.
+- The WiFi passphrase and the PPPoE password are write-only — set but never
+  returned, and redacted from backups unless secrets are explicitly included.
+- 30 commits, reviewed adversarially in four passes before release.
+
+## v1.5.3 — 2026-08-11
+
+Two ways to stop hand-maintaining state: a NodeCircle can now track a
+subscription automatically, and the whole configuration can be exported to (and
+restored from) a single file. Ships DB migration 023.
+
+### Added
+
+- **NodeCircle auto-sync from a subscription.** Link a circle to a subscription
+  and every refresh keeps its membership current: nodes the panel still serves
+  are kept or **added** — including one that came back under a new address, which
+  arrives as a new id and previously had to be re-added by hand — while nodes the
+  panel dropped leave. Members you picked yourself, or that came from another
+  subscription, are always preserved. Unlinked circles behave exactly as before
+  (dangling ids pruned, "check members" badge), so nothing changes unless you opt
+  in. Membership changes are reported in Recent Events as `circle.synced`.
+- **Whole-box configuration backup.** **Settings → Backup & Restore** exports
+  settings, subscriptions, nodes, routing sets and rules, DNS rules, balancer
+  groups, node circles, devices and UA templates as one JSON file, and restores
+  it onto a fresh box.
+  - **Secrets are opt-in** (`include_secrets`, off by default), so the file you
+    share for debugging carries no node credentials or subscription URLs — and
+    restoring such a file never blanks the credentials already on the box.
+  - **Restore previews before it writes**: per-section add / update / delete
+    counts plus warnings, then an explicit confirm. `merge` adds and updates;
+    `replace` additionally deletes rows the backup doesn't contain.
+  - The dataplane is regenerated and xray reloaded afterwards, so restored
+    routing and DNS take effect immediately.
+  - Endpoints: `GET /api/system/backup`, `POST /api/system/backup/preview`,
+    `POST /api/system/backup/restore`.
+
+## v1.5.2 — 2026-08-06
+
+Adds HTTPS for the panel (per-install cert + downloadable local CA), disables
+host IPv6 by default on clean installs, and surfaces NodeCircles that a
+subscription refresh shrank.
+
+### Added
+
+- **HTTPS for the panel.** The reverse proxy now serves the UI over TLS on
+  **443** alongside plain HTTP on 80, so a cert issue can't lock you out. A
+  per-install certificate is signed by a local **PiTun CA**, generated before
+  nginx starts (`scripts/gen-cert.sh`), with the box's LAN IP + `pitun` /
+  `pitun.local` in the SAN. **Settings → HTTPS** offers the root CA for
+  download — trust it once to drop the browser warning. WebSocket / log
+  streams upgrade to `wss://` automatically. Existing boxes pick it up on the
+  next deploy.
+- **NodeCircle "shrank by refresh" highlight.** When a subscription refresh
+  removes a node that belonged to a circle, PiTun records a `circle.pruned`
+  event (Recent Events) naming the affected circle(s), and the NodeCircles
+  page flags any circle with a missing member or fewer than 2 nodes with a
+  **check members** badge. Covers the case where a provider moves a node to a
+  new address — it comes back as a new id and isn't auto-re-added.
+
+### Changed
+
+- **Host IPv6 is disabled by default on a CLEAN install** (`disable_ipv6=true`
+  seeded for fresh DBs only). PiTun's TPROXY is IPv4-only, so this avoids a
+  class of IPv6-path surprises; existing installs keep whatever they had
+  (`INSERT OR IGNORE` — an upgrade never flips it). Client-side IPv6 leaks
+  were already closed by `dns_query_strategy=UseIPv4`.
+- **Dark-theme polish.** Blue type/mode pills (rules / vmess / src_ip) use a
+  desaturated grey-blue in dark mode instead of the saturated blue-900 wash.
+
+### Housekeeping
+
+- Sanitized example identifiers in a few source comments and test fixtures
+  (no behaviour change).
 
 ## v1.5.1 — 2026-08-06
 

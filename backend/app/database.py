@@ -230,16 +230,67 @@ async def init_default_settings():
         # Health check
         "health_interval": str(settings.health_interval),
         "health_timeout": str(settings.health_timeout),
-        # v1.4.7 — finding 3.2: disable IPv6 by default on NEW installs.
-        # PiTun's TPROXY pipeline is IPv4-only (no ip6 nft rules). With
-        # IPv6 enabled at the kernel level, LAN clients keep their RA-
-        # advertised v6 default route and AAAA-cached domains escape
-        # through the home router → past PiTun → straight to the
-        # internet (bypassing all routing rules). Defaulting to "true"
-        # closes the leak for the common case.
-        # Existing installs keep their prior choice (init_default_
-        # settings only seeds if the row is missing). Operators who
-        # actually need IPv6 can flip this back via Settings.
+        # Disabled by default on a CLEAN install: PiTun's TPROXY pipeline is
+        # IPv4-only, so turning host IPv6 off avoids a whole class of
+        # IPv6-path surprises (the DNS engine already returns IPv4-only to
+        # clients via dns_query_strategy=UseIPv4). INSERT OR IGNORE means
+        # existing boxes keep whatever they already have — only a fresh DB
+        # picks up this default, so upgrades never flip it silently.
+        # How the box operates on the network (router mode, phase 0):
+        #   "gateway" — today's model: PiTun sits beside the router, devices
+        #               point their gateway at it. Only option on 1-NIC boxes.
+        #   "router"  — PiTun owns the WAN uplink, serves DHCP and NATs.
+        # Never switched automatically; the UI only offers "router" when the
+        # box actually has two or more physical NICs.
+        "operating_mode": "gateway",
+        # Port roles for router mode (empty until the operator assigns them).
+        # wan_interface faces the ISP, lan_interface faces the home network.
+        "wan_interface": "",
+        "lan_interface": "",
+        # DHCP for router mode. Empty pool bounds mean "choose a sane range
+        # from the LAN subnet on apply" — see dhcp.default_pool_for, which
+        # also guarantees the gateway's own address stays outside it.
+        "dhcp_enabled": "true",
+        "dhcp_pool_start": "",
+        "dhcp_pool_end": "",
+        "dhcp_lease_hours": "12",
+        # WiFi access point (router mode, only on an AP-capable radio).
+        # No default SSID/passphrase: an access point that comes up with a
+        # guessable name and password is worse than one that doesn't come up.
+        # Uplink exposure. Empty and off by default: the WAN accepts nothing
+        # new. Meant for a PiTun that sits behind another router, where the
+        # "WAN" is the home network; apply() refuses to open a public address.
+        # Additional LAN ports, bridged with lan_interface into one
+        # segment. Empty = a single-port LAN, which needs no bridge.
+        "lan_extra_interfaces": "",
+        "wan_admin_access": "false",
+        "wan_ssh_access": "false",
+        "wan_allow_tcp": "",
+        "wan_allow_udp": "",
+        "wifi_enabled": "false",
+        "wifi_ssid": "PiTun",
+        "wifi_passphrase": "",
+        "wifi_country": "",
+        "wifi_band": "2.4",
+        "wifi_channel": "0",
+        "wifi_security": "wpa2",
+        "wifi_hidden": "false",
+        # WAN acquisition. "dhcp" covers most ISPs; the others exist because
+        # a line that needs PPPoE, a VLAN tag or a cloned MAC looks exactly
+        # like a dead line until it is configured.
+        "wan_mode": "dhcp",
+        "wan_vlan_id": "0",
+        "wan_mac_clone": "",
+        "wan_static_address": "",
+        "wan_static_gateway": "",
+        "wan_static_dns": "",
+        "wan_pppoe_user": "",
+        "wan_pppoe_password": "",
+        "wan_pppoe_service": "",
+        # Commit-confirm watchdog: ISO deadline of an unconfirmed router-mode
+        # apply, empty when nothing is pending. Persisted rather than held in
+        # memory so an apply that wedges the box does not survive a reboot.
+        "router_mode_confirm_deadline": "",
         "disable_ipv6": "true",
         "dns_over_tcp": "false",
         # LAN proxy authentication (since v1.3.0-beta.6). Applies to
@@ -253,6 +304,23 @@ async def init_default_settings():
         "lan_proxy_auth_enabled": "false",
         "lan_proxy_auth_user": "",
         "lan_proxy_auth_pass": "",
+
+        # Xray connection-lifetime policy. Defaults are the recommended
+        # values from core/xray_policy.py — xray's own defaults kill idle
+        # pooled connections after 5 min and cut half-closed streams after
+        # 2–5 s, which is what makes long-lived clients drop. Surfaced in
+        # the UI because the right numbers depend on the workload; they
+        # feed BOTH PiTun's own xray and the panels' templates.
+        "xray_handshake": "10",
+        "xray_conn_idle": "3600",
+        "xray_uplink_only": "0",
+        "xray_downlink_only": "0",
+        # TCP keep-alive for INBOUND sockets only. Xray already keeps
+        # outbounds alive at Chrome's 45/45; inbound is off by default, so
+        # with connIdle at an hour a vanished client (slept laptop, dropped
+        # NAT mapping) would be held that whole hour. 0 = leave it off.
+        "xray_tcp_keepalive_idle": "100",
+        "xray_tcp_keepalive_interval": "15",
     }
 
     # Race-safe upsert: INSERT OR IGNORE on (key). Avoids the TOCTOU gap
@@ -290,3 +358,17 @@ async def init_default_settings():
             admin = User(username="admin", password_hash=hash_password("password"))
             session.add(admin)
             await session.commit()
+
+    # Normally the migration seeds these. This covers the `create_all()`
+    # fallback in `run_migrations()`, which builds the table but seeds
+    # nothing. No-op unless the table is empty, so a deleted template
+    # stays deleted.
+    from app.core.ua_templates import ensure_default_ua_templates
+
+    async with AsyncSession(get_async_engine()) as session:
+        try:
+            await ensure_default_ua_templates(session)
+        except Exception as exc:
+            # An empty table degrades to the fallback UA map, so this is
+            # never worth aborting startup over.
+            logger.warning("Could not seed default UA templates: %s", exc)

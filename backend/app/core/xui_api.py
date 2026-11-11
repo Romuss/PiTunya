@@ -65,10 +65,12 @@ who put their own cert chain in front of the panel can override.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+from app.core.net import direct_active as _direct_active
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,7 @@ logger = logging.getLogger(__name__)
 # templates) get a longer ceiling.
 _DEFAULT_TIMEOUT = 10.0
 _LARGE_PAYLOAD_TIMEOUT = 30.0
+_XRAY_INSTALL_TIMEOUT = 180.0
 
 
 class XuiAPIError(Exception):
@@ -127,6 +130,13 @@ class XuiClient:
     # and flipped to False only when the operator explicitly chooses so.
     verify_tls: bool = True
     timeout: float = _DEFAULT_TIMEOUT
+    # When True, panel HTTP goes DIRECT (SO_MARK bypass), off the active
+    # node's tunnel — the operator's "Direct connection" toggle. Defaults
+    # to the request-scoped flag (`net.read_direct` dependency), so an
+    # endpoint that doesn't pass `direct` still honours `?direct=`. Outside
+    # a request (schedulers, background jobs) the factory returns False =
+    # through the active node.
+    direct: bool = field(default_factory=lambda: _direct_active())
     # Cookie+CSRF credentials. Optional because the vast majority of
     # call sites only need Bearer (inbounds/clients/server-utils). The
     # chain orchestrator's relay client passes them so it can update
@@ -135,6 +145,10 @@ class XuiClient:
     panel_pass: Optional[str] = None
     _http: Optional[httpx.AsyncClient] = None
     _csrf_token: Optional[str] = None
+    # UI-internal controller mount point. v3.6.0 moved /panel/xray/* and
+    # /panel/setting/* under /panel/api/; older panels only serve the old
+    # mount. Probed lazily by _admin_request, cached per instance.
+    _admin_prefix: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Hard scheme allowlist — `base_url` comes from a XuiServer DB
@@ -175,14 +189,22 @@ class XuiClient:
             # api/inbounds/list` collapses to `https://h:port/panel/...`,
             # missing the basepath and getting a 307 redirect back from
             # the panel. Building full URLs in `_request` instead.
-            self._http = httpx.AsyncClient(
-                headers={
-                    "Authorization": f"Bearer {self.api_token}",
-                    # The panel responds JSON either way, but being
-                    # explicit avoids any future content-negotiation
-                    # surprises if upstream adds an HTML fallback.
-                    "Accept": "application/json",
-                },
+            headers: Dict[str, str] = {
+                # The panel responds JSON either way, but being explicit
+                # avoids any future content-negotiation surprises if
+                # upstream adds an HTML fallback.
+                "Accept": "application/json",
+            }
+            # Only when there is one. A client that has yet to obtain a token
+            # — the bootstrap that logs in to fetch it — would otherwise send
+            # a bare `Bearer `, which httpx refuses to encode at all: the
+            # request fails as an illegal header before it reaches the panel,
+            # and the error says nothing about the missing token.
+            if self.api_token:
+                headers["Authorization"] = f"Bearer {self.api_token}"
+
+            client_kwargs: Dict[str, Any] = dict(
+                headers=headers,
                 verify=self.verify_tls,
                 timeout=self.timeout,
                 # Follow 307/308 redirects belt-and-suspenders — if a
@@ -194,6 +216,14 @@ class XuiClient:
                 # is wasted on a one-shot RPC client.
                 http2=False,
             )
+            if self.direct:
+                # SO_MARK bypass — dial the panel off the active node's
+                # tunnel. `transport` carries verify itself, so drop the
+                # top-level verify to avoid httpx's "both set" error.
+                from app.core.net import httpx_direct_transport
+                client_kwargs.pop("verify", None)
+                client_kwargs["transport"] = httpx_direct_transport()
+            self._http = httpx.AsyncClient(**client_kwargs)
         return self._http
 
     async def _request(
@@ -303,8 +333,14 @@ class XuiClient:
         try:
             r = await client.get(url, headers={"X-Requested-With": "XMLHttpRequest"})
         except httpx.HTTPError as exc:
+            # httpx leaves `str(exc)` empty on a plain connect failure, and
+            # "transport error: " with nothing after it tells the operator
+            # nothing — this is the error they hit when the port or the base
+            # path is wrong, which is most of the time.
             raise XuiAPIError(
-                f"csrf-token transport error: {exc}", kind="transport",
+                f"csrf-token transport error: "
+                f"{str(exc) or type(exc).__name__} ({url})",
+                kind="transport",
             ) from exc
         if not r.is_success:
             raise XuiAPIError(
@@ -361,11 +397,14 @@ class XuiClient:
         path: str,
         *,
         form: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Issue a UI-internal request authenticated by session cookie
-        + CSRF header. Body is sent form-encoded (the only shape the
-        UI endpoints accept). One auto-retry on 401/403 after refresh.
+        + CSRF header. Body is form-encoded by default — the shape most
+        UI endpoints accept — but `json_body` switches it, because a few
+        (`apiTokens/create` among them) take JSON and silently reject a
+        form. One auto-retry on 401/403 after refresh.
         """
         client = self._ensure_client()
         url = f"{self.base_url}{path}"
@@ -374,12 +413,18 @@ class XuiClient:
             headers = {
                 "X-CSRF-Token": csrf,
                 "X-Requested-With": "XMLHttpRequest",
-                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Type": ("application/json" if json_body is not None
+                                 else "application/x-www-form-urlencoded"),
             }
             try:
+                kwargs: Dict[str, Any] = (
+                    {"json": json_body} if json_body is not None
+                    else {"data": form or {}}
+                )
                 resp = await client.request(
-                    method, url, data=form or {}, headers=headers,
+                    method, url, headers=headers,
                     timeout=timeout if timeout is not None else self.timeout,
+                    **kwargs,
                 )
             except httpx.TimeoutException as exc:
                 raise XuiAPIError(
@@ -416,6 +461,43 @@ class XuiClient:
             return body
         # unreachable — loop either returns or raises on second iter
         raise XuiAPIError(f"unreachable cookie retry exhausted on {path}", kind="api")
+
+    async def _admin_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        form: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Cookie request against a UI-internal controller, tolerant of
+        the mount-point move: `path` is relative to the controller root
+        (e.g. `/xray/update`). Tries `/panel/api` first (v3.6.0+); a 404
+        or an HTML (SPA-shell) response means an older panel, retry at
+        `/panel`. The winning prefix is cached for the client's lifetime.
+        """
+        if self._admin_prefix is not None:
+            return await self._cookie_request(
+                method, self._admin_prefix + path, form=form, timeout=timeout,
+            )
+        try:
+            body = await self._cookie_request(
+                method, "/panel/api" + path, form=form, timeout=timeout,
+            )
+        except XuiAPIError as exc:
+            wrong_mount = (
+                (exc.kind == "http" and exc.status == 404)
+                or exc.kind == "format"
+            )
+            if not wrong_mount:
+                raise
+            body = await self._cookie_request(
+                method, "/panel" + path, form=form, timeout=timeout,
+            )
+            self._admin_prefix = "/panel"
+            return body
+        self._admin_prefix = "/panel/api"
+        return body
 
     # ── High-level API ─────────────────────────────────────────────────
     async def probe(self) -> None:
@@ -455,7 +537,7 @@ class XuiClient:
         these dicts from a higher-level pick + user input."""
         body = await self._request(
             "POST", "/panel/api/inbounds/add",
-            json=payload,
+            json=_coerce_inbound_payload(payload),
             timeout=_LARGE_PAYLOAD_TIMEOUT,
         )
         obj = body.get("obj")
@@ -466,7 +548,7 @@ class XuiClient:
     ) -> Dict[str, Any]:
         body = await self._request(
             "POST", f"/panel/api/inbounds/update/{inbound_id}",
-            json=payload,
+            json=_coerce_inbound_payload(payload),
             timeout=_LARGE_PAYLOAD_TIMEOUT,
         )
         obj = body.get("obj")
@@ -591,14 +673,24 @@ class XuiClient:
         )
         obj = body.get("obj") or {}
         settings = parse_inbound_field(obj.get("settings"))
+        # `client_uuid` is really a natural id: vless/vmess clients are
+        # keyed by `id`, but trojan/shadowsocks/socks clients have no
+        # `id` at all — their identity is `password` (or `user`), and
+        # that's what the UI sends. Matching on `id` alone made every
+        # delete/update of a non-vless client fail with a 502.
+        needle = (client_uuid or "").lower()
         for client in (settings.get("clients") or []):
-            if str(client.get("id") or "").lower() == client_uuid.lower():
+            candidates = (
+                client.get("id"), client.get("email"),
+                client.get("password"), client.get("auth"), client.get("user"),
+            )
+            if any(str(c or "").lower() == needle for c in candidates):
                 email = client.get("email")
                 if email:
                     return str(email)
                 break
         raise XuiAPIError(
-            f"client uuid={client_uuid!r} not found in inbound "
+            f"client id={client_uuid!r} not found in inbound "
             f"{inbound_id} (cannot resolve email for v3.1.0 endpoint)",
             kind="not_found",
         )
@@ -641,6 +733,29 @@ class XuiClient:
             )
         return priv, pub
 
+    async def get_server_status(self) -> Dict[str, Any]:
+        """GET /panel/api/server/status — carries `xray.{state,version,errorMsg}`
+        and `panelVersion`. Same shape on v3.6.0 and v3.11.0."""
+        body = await self._request("GET", "/panel/api/server/status")
+        obj = body.get("obj")
+        return obj if isinstance(obj, dict) else {}
+
+    async def list_xray_versions(self) -> List[str]:
+        """GET /panel/api/server/getXrayVersion — the xray releases the panel
+        will install (newest first, as tags like `v26.10.31`)."""
+        body = await self._request("GET", "/panel/api/server/getXrayVersion")
+        obj = body.get("obj")
+        return [str(v) for v in obj] if isinstance(obj, list) else []
+
+    async def install_xray(self, version: str) -> None:
+        """POST /panel/api/server/installXray/<version>: the panel stops xray,
+        downloads that release, swaps the binary and restarts. Slow (a ~16 MB
+        download), hence the long timeout."""
+        await self._request(
+            "POST", f"/panel/api/server/installXray/{version}",
+            timeout=_XRAY_INSTALL_TIMEOUT,
+        )
+
     async def restart_xray(self) -> None:
         """POST /panel/api/server/restartXrayService. Bearer-authed —
         documented under the Server API section of the panel docs.
@@ -650,17 +765,72 @@ class XuiClient:
             timeout=_LARGE_PAYLOAD_TIMEOUT,
         )
 
+    async def ensure_api_token(self, name: str = "pitun") -> str:
+        """Find or create the panel's own API token, using the login.
+
+        Every Bearer call needs this token, and until now the only thing
+        that produced one was our install script — so a panel installed by
+        hand, or one whose `xui://` line was lost, could not be registered
+        at all. The operator has the credentials they log in with; this
+        turns those into the token, exactly as the script does.
+
+        Reuses a token already named `name` rather than minting one per
+        attempt: a panel accumulating a token per import is a mess, and any
+        `xui://` handed out earlier keeps working.
+
+        Both controller mounts are tried — v3.6.0 moved the settings
+        controllers under `/panel/api/`, and older panels only serve the
+        old path.
+        """
+        if not (self.panel_user and self.panel_pass):
+            raise XuiAPIError(
+                "Panel login is required to obtain an API token",
+                kind="auth",
+            )
+
+        last: Optional[str] = None
+        for mount in ("/panel/api/setting", "/panel/setting"):
+            try:
+                listing = await self._cookie_request("GET", f"{mount}/apiTokens")
+            except XuiAPIError as exc:
+                # The wrong mount answers with the SPA shell or a 404; that
+                # is not a failure, it is the probe doing its job.
+                last = str(exc)
+                continue
+            if not isinstance(listing, dict) or listing.get("success") is not True:
+                last = f"{mount}/apiTokens did not answer as the tokens controller"
+                continue
+
+            for item in listing.get("obj") or []:
+                if (isinstance(item, dict) and item.get("name") == name
+                        and item.get("token")):
+                    logger.info("Reusing existing panel API token %r", name)
+                    return str(item["token"])
+
+            created = await self._cookie_request(
+                "POST", f"{mount}/apiTokens/create", json_body={"name": name},
+            )
+            token = ((created or {}).get("obj") or {}).get("token")
+            if token:
+                logger.info("Created panel API token %r", name)
+                return str(token)
+            last = f"{mount}/apiTokens/create returned no token"
+
+        raise XuiAPIError(
+            f"Could not obtain an API token from the panel ({last or 'no mount answered'})",
+            kind="api",
+        )
+
     async def get_xray_setting(self) -> Dict[str, Any]:
         """Fetch the panel's current xray template + metadata.
 
         Returns the parsed `obj` dict — keys typically include
         `xraySetting` (the full xray config dict), `outboundTestUrl`,
-        `inboundTags`, `clientReverseTags`. Cookie+CSRF auth: the
-        `/panel/xray/*` namespace is the v3.0.1 XraySettingController
-        (separate from `/panel/setting/*` which has no xray bits).
+        `inboundTags`, `clientReverseTags`. Cookie+CSRF auth against
+        the XraySettingController (mount handled by _admin_request).
         """
-        body = await self._cookie_request(
-            "POST", "/panel/xray/", timeout=_LARGE_PAYLOAD_TIMEOUT,
+        body = await self._admin_request(
+            "POST", "/xray/", timeout=_LARGE_PAYLOAD_TIMEOUT,
         )
         obj = body.get("obj")
         # The panel double-encodes: `obj` is a JSON STRING. Parse once.
@@ -707,8 +877,8 @@ class XuiClient:
             form["allOutbounds"] = _json.dumps(
                 all_outbounds, separators=(",", ":"),
             )
-        body = await self._cookie_request(
-            "POST", "/panel/xray/testOutbound",
+        body = await self._admin_request(
+            "POST", "/xray/testOutbound",
             form=form, timeout=_LARGE_PAYLOAD_TIMEOUT,
         )
         obj = body.get("obj")
@@ -735,8 +905,8 @@ class XuiClient:
                 or "https://www.google.com/generate_204"
             ),
         }
-        await self._cookie_request(
-            "POST", "/panel/xray/update",
+        await self._admin_request(
+            "POST", "/xray/update",
             form=form, timeout=_LARGE_PAYLOAD_TIMEOUT,
         )
 
@@ -811,6 +981,70 @@ def parse_inbound_field(value: Any) -> Dict[str, Any]:
     return {}
 
 
+# Fields whose Go type is int64 / bool on model.Client and ClientRecord.
+# Legacy PiTun payloads ship empty-string defaults ("tgId": "") which the
+# strict Go json decoder rejects; coerce before any write to the panel.
+_NUMERIC_CLIENT_FIELDS = ("limitIp", "totalGB", "expiryTime", "tgId", "reset")
+_BOOL_CLIENT_FIELDS = ("enable",)
+
+
+def _coerce_int(v: Any) -> int:
+    if v is None or v == "":
+        return 0
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.lower() in ("true", "1", "yes", "y", "on")
+    return False
+
+
+def _coerce_inbound_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise clients embedded in an add/update-inbound payload.
+
+    v3.1.0 only type-checked clients on the /panel/api/clients/* writes;
+    v3.6.0 also parses `settings.clients[]` into model.Client structs on
+    inbounds/add|update, so the legacy `""` defaults reject the whole
+    inbound. Handles `settings` as dict or JSON string and preserves
+    whichever shape the caller built.
+    """
+    import json as _json
+    settings = payload.get("settings")
+    parsed = parse_inbound_field(settings)
+    clients = parsed.get("clients")
+    if not isinstance(clients, list) or not clients:
+        return payload
+    coerced = []
+    for cl in clients:
+        if isinstance(cl, dict):
+            cl = dict(cl)
+            for k in _NUMERIC_CLIENT_FIELDS:
+                if k in cl:
+                    cl[k] = _coerce_int(cl[k])
+            for k in _BOOL_CLIENT_FIELDS:
+                if k in cl:
+                    cl[k] = _coerce_bool(cl[k])
+        coerced.append(cl)
+    parsed = {**parsed, "clients": coerced}
+    out = dict(payload)
+    out["settings"] = (
+        _json.dumps(parsed) if isinstance(settings, str) else parsed
+    )
+    return out
+
+
 def _to_client_record(settings: Dict[str, Any]) -> Dict[str, Any]:
     """Translate a v3.0.x-style client dict into a v3.1.0 ClientRecord.
 
@@ -828,33 +1062,6 @@ def _to_client_record(settings: Dict[str, Any]) -> Dict[str, Any]:
     Unknown keys are dropped silently so callers that include legacy
     fields (e.g. `subscription_url`) don't poison the request body.
     """
-    # Fields the v3.1.0 ClientRecord declares as numeric. Coerce
-    # empty-string / None / stringified-int to a real int(0) so the
-    # Go json decoder doesn't reject the body.
-    _NUMERIC_FIELDS = ("limitIp", "totalGB", "expiryTime", "tgId", "reset")
-    _BOOL_FIELDS = ("enable",)
-
-    def _coerce_int(v: Any) -> int:
-        if v is None or v == "":
-            return 0
-        if isinstance(v, bool):
-            return int(v)
-        if isinstance(v, int):
-            return v
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return 0
-
-    def _coerce_bool(v: Any) -> bool:
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            return bool(v)
-        if isinstance(v, str):
-            return v.lower() in ("true", "1", "yes", "y", "on")
-        return False
-
     out: Dict[str, Any] = {}
     # Both legacy v3.0.x payloads and the v3.1.0 model.Client JSON shape
     # use `id` for the UUID. If a caller hand-shipped `uuid` (because
@@ -869,9 +1076,9 @@ def _to_client_record(settings: Dict[str, Any]) -> Dict[str, Any]:
         if k not in settings:
             continue
         v = settings[k]
-        if k in _NUMERIC_FIELDS:
+        if k in _NUMERIC_CLIENT_FIELDS:
             out[k] = _coerce_int(v)
-        elif k in _BOOL_FIELDS:
+        elif k in _BOOL_CLIENT_FIELDS:
             out[k] = _coerce_bool(v)
         else:
             out[k] = v

@@ -13,7 +13,60 @@ _tun_active: bool = False
 
 logger = logging.getLogger(__name__)
 
+# Legacy single queue. Kept for backwards compatibility with anything
+# still reading it directly; the WS endpoint now uses `subscribe_logs()`.
 log_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+
+# One queue PER log-stream subscriber.
+#
+# With a single shared queue, every connected viewer competed for the
+# same items (`Queue.get()` hands a line to exactly ONE waiter), so two
+# open Logs tabs each saw a random half of the stream — and a tab left
+# open in the background (the page connects even while paused) quietly
+# ate lines the foreground tab never saw. Fan-out gives each subscriber
+# the full stream; a slow consumer drops its own oldest lines and can't
+# stall the producer. Same shape as JobManager's per-subscriber queues.
+_log_subscribers: "set[asyncio.Queue]" = set()
+
+
+def subscribe_logs(maxsize: int = 2000) -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+    _log_subscribers.add(q)
+    return q
+
+
+def unsubscribe_logs(q: asyncio.Queue) -> None:
+    _log_subscribers.discard(q)
+
+
+class _RestartBackoff:
+    """Delay before relaunching a crashed xray: quick at first, then slower
+    while it keeps dying, so a broken config doesn't restart every few seconds.
+    A run that stays up for `stable_after` seconds starts the schedule over."""
+
+    SCHEDULE = (3.0, 60.0, 300.0)
+
+    def __init__(self, stable_after: float = 600.0, clock=time.monotonic) -> None:
+        self._stable_after = stable_after
+        self._clock = clock
+        self._streak = 0
+        self._last: Optional[float] = None
+
+    def next_delay(self) -> float:
+        now = self._clock()
+        if self._last is not None and now - self._last > self._stable_after:
+            self._streak = 0
+        self._last = now
+        delay = self.SCHEDULE[min(self._streak, len(self.SCHEDULE) - 1)]
+        self._streak += 1
+        return delay
+
+    def reset(self) -> None:
+        self._streak = 0
+        self._last = None
+
+
+crash_backoff = _RestartBackoff()
 
 
 class _RestartBackoff:
@@ -53,13 +106,11 @@ class XrayManager:
     # worst case) but short enough that one stuck reload doesn't wedge
     # every API endpoint that touches xray forever.
     #
-    # Observed in the wild on 192.168.1.4 during the 1.3.3 burn-in:
-    # a broken /etc/resolv.conf caused a sync getaddrinfo() inside
-    # _apply_nftables to hang while holding the lock; subsequent
-    # routing-rule POSTs and /system/restart calls then queued
-    # indefinitely. This timeout ensures the queue drains as 503
-    # within a bounded window so the operator gets a clear error
-    # instead of a frozen UI.
+    # Without it, one stuck holder (e.g. a sync getaddrinfo() inside
+    # _apply_nftables hanging on a broken /etc/resolv.conf) queues every
+    # subsequent routing-rule POST and /system/restart indefinitely. The
+    # timeout drains the queue as 503 so the operator sees an error
+    # rather than a frozen UI.
     LOCK_ACQUIRE_TIMEOUT: float = 30.0
 
     def __init__(self) -> None:
@@ -181,6 +232,8 @@ class XrayManager:
 
         env = os.environ.copy()
         env["XRAY_LOCATION_ASSET"] = str(Path(settings.xray_geoip_path).parent)
+        from app.core.resource_limits import xray_env
+        env.update(await xray_env())          # GOMEMLIMIT, only if the operator set one
 
         self._process = await asyncio.create_subprocess_exec(
             xray_bin, "run", "-config", str(config_path),
@@ -319,7 +372,13 @@ async def _auto_restart_if_enabled(*, from_boot: bool = False) -> None:
             settings_map = {r.key: r.value for r in (await session.exec(select(DBSettings))).all()}
             from app.models import RoutingRule
             rules = list((await session.exec(select(RoutingRule).where(RoutingRule.enabled == True))).all())
-            bypass_macs = [r.match_value for r in rules if r.rule_type == "mac" and r.action == "direct"]
+            # Use the same helper as `api/system._apply_nftables`: a rule's
+            # match_value may hold several comma-separated MACs, and a raw
+            # list-comp passed "aa:..,bb:.." through as one token, which
+            # then failed _validate_mac and was silently dropped — so
+            # multi-MAC bypasses evaporated on every crash/boot restore.
+            from app.api.system import _collect_bypass_macs, _safe_int
+            bypass_macs = list(_collect_bypass_macs(rules))
 
             # Restore device routing policies (include/exclude)
             from app.core.device_scanner import get_device_macs_for_mode
@@ -380,9 +439,12 @@ async def _auto_restart_if_enabled(*, from_boot: bool = False) -> None:
                     bypass_dst_cidrs=bypass_dsts,
                     include_macs=device_info["include_macs"] if device_mode == "include_only" else None,
                     device_routing_mode=device_mode,
-                    tproxy_tcp=int(settings_map.get("tproxy_port_tcp", "7893")),
-                    tproxy_udp=int(settings_map.get("tproxy_port_udp", "7894")),
-                    dns_port=int(settings_map.get("dns_port", "5353")),
+                    # `_safe_int`, not raw int(): same hardening as the
+                    # `/system/start` path, so a corrupted Settings value
+                    # degrades to the default here too instead of only there.
+                    tproxy_tcp=_safe_int(settings_map, "tproxy_port_tcp", 7893),
+                    tproxy_udp=_safe_int(settings_map, "tproxy_port_udp", 7894),
+                    dns_port=_safe_int(settings_map, "dns_port", 5353),
                     block_quic=settings_map.get("block_quic", "true").lower() == "true",
                     kill_switch=settings_map.get("kill_switch", "false").lower() == "true",
                     routing_set_specs=routing_set_specs,
@@ -445,6 +507,20 @@ async def _push_log(line: str) -> None:
             pass
     await log_queue.put(line)
 
+    # Fan out to every live viewer. Never await a subscriber: one stalled
+    # WebSocket must not back-pressure the log pump. A full queue drops
+    # its own oldest line instead.
+    for q in list(_log_subscribers):
+        if q.full():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            q.put_nowait(line)
+        except asyncio.QueueFull:
+            pass
+
 
 async def _maybe_process_dns(line: str) -> None:
     global _dns_log_enabled, _dns_log_checked
@@ -465,9 +541,11 @@ async def _maybe_process_dns(line: str) -> None:
                 _dns_log_enabled = bool(row and row.value.lower() == "true")
             _dns_log_checked = now
 
-        if _dns_log_enabled:
+        from app.core import domain_stats
+        stats_on = await domain_stats.collecting()
+        if _dns_log_enabled or stats_on:
             from app.core.dns_logger import process_log_line
-            await process_log_line(line)
+            await process_log_line(line, store_log=_dns_log_enabled, store_stats=stats_on)
     except Exception:
         pass
 

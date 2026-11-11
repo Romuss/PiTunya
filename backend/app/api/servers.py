@@ -55,7 +55,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/servers", tags=["servers"])
+from app.core.net import read_direct
+
+# `read_direct` latches `?direct=` per request → every SSH op honours the
+# "Direct connection" toggle, even endpoints that don't thread it explicitly.
+router = APIRouter(
+    prefix="/servers", tags=["servers"], dependencies=[Depends(read_direct)],
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -170,7 +176,9 @@ async def delete_server(
 
 # ── Connection test ──────────────────────────────────────────────────────────
 
-async def _probe_one(server: Server, session: AsyncSession) -> ServerTestResult:
+async def _probe_one(
+    server: Server, session: AsyncSession, *, direct: bool = False,
+) -> ServerTestResult:
     """Run the SSH probe and persist the outcome on the row.
 
     Note: snapshot `server.id` BEFORE `await session.commit()`. The async
@@ -186,6 +194,7 @@ async def _probe_one(server: Server, session: AsyncSession) -> ServerTestResult:
         password=server.password if server.auth_type == "password" else None,
         private_key=server.private_key if server.auth_type == "key" else None,
         passphrase=server.passphrase if server.auth_type == "key" else None,
+        direct=direct,
     )
 
     server_id = server.id  # snapshot before commit (see docstring)
@@ -208,12 +217,14 @@ async def _probe_one(server: Server, session: AsyncSession) -> ServerTestResult:
 
 @router.post("/{server_id:int}/test", response_model=ServerTestResult)
 async def test_server(
-    server_id: int, session: AsyncSession = Depends(get_session)
+    server_id: int,
+    direct: bool = False,
+    session: AsyncSession = Depends(get_session),
 ):
     server = await session.get(Server, server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
-    return await _probe_one(server, session)
+    return await _probe_one(server, session, direct=direct)
 
 
 @router.post(
@@ -224,6 +235,7 @@ async def test_server(
 async def deploy_to_server(
     server_id: int,
     body: ServerDeployRequest,
+    direct: bool = False,
     session: AsyncSession = Depends(get_session),
 ):
     """Auto-deploy a proxy install script over SSH (since v1.3.0).
@@ -407,6 +419,7 @@ async def deploy_to_server(
             env=plan.env,
             on_line=on_line,
             extra_files=extra_files,
+            direct=direct,
         )
 
         parsed_uri: Optional[str] = None
@@ -467,6 +480,52 @@ async def deploy_to_server(
                     from app.api.system import refresh_panel_bypass
                     await refresh_panel_bypass(s)
 
+                # A fresh panel runs on xray's defaults, where `connIdle`
+                # kills an idle pooled connection after 5 minutes and the
+                # half-close timers cut streaming responses. Set our
+                # timeouts now so a newly deployed server doesn't
+                # reintroduce the problem every time. Best-effort: this
+                # must never fail an install that otherwise succeeded.
+                try:
+                    # Function-level imports: `api.xui` owns the base-URL
+                    # composition (bare vs xui-pro differ), and importing
+                    # it at module scope would close a router cycle.
+                    from app.api.system import _load_settings_map
+                    from app.api.xui import _api_base_url
+                    from app.core.xui_policy import apply_policy_to_panel
+
+                    async with AsyncSession(get_async_engine()) as s:
+                        xs_row = await s.get(XuiServer, new_xui_server_id)
+                        srv_row = await s.get(Server, srv_id)
+                        base_url = (
+                            _api_base_url(xs_row, srv_row)
+                            if xs_row and srv_row else None
+                        )
+                        # Operator-tuned values, not the built-in
+                        # recommendations: otherwise every new deploy lands
+                        # on a different policy than the rest of the fleet
+                        # and the next "apply to all" silently rewrites it.
+                        settings_map = await _load_settings_map(s)
+                    if base_url is None:
+                        raise RuntimeError("panel row vanished after commit")
+
+                    policy_res = await apply_policy_to_panel(
+                        base_url=base_url,
+                        api_token=xui_cfg.api_token,
+                        panel_user=xui_cfg.panel_user,
+                        panel_pass=xui_cfg.panel_pass,
+                        settings_map=settings_map,
+                    )
+                    logger.info(
+                        "Deploy: xray policy on panel %s — %s",
+                        new_xui_server_id, policy_res.detail,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Deploy: could not apply xray policy to panel %s: %s — "
+                        "apply it manually from the X-ui page",
+                        new_xui_server_id, exc,
+                    )
                 final_status = "deployed"
             else:
                 final_status = "deployed_no_uri"
@@ -727,6 +786,7 @@ async def deploy_to_server(
 async def uninstall_server(
     server_id: int,
     protocol: str,
+    direct: bool = False,
     session: AsyncSession = Depends(get_session),
 ):
     """Wipe the server-side state for `protocol` on `server_id` over
@@ -800,6 +860,7 @@ async def uninstall_server(
             env={"YES": "1"},  # non-interactive: skip confirm prompt
             timeout=300.0,     # 5 min hard cap; uninstall is fast
             on_line=on_line,
+            direct=direct,
         )
 
         # Whether the script's exit code says "ok" or not, drop the
@@ -1615,6 +1676,13 @@ async def export_servers_json(
     for d in deployments:
         by_server.setdefault(d.server_id, []).append(d)
 
+    # The panel registration lives in its own table, and without it a
+    # restored server arrives with x-ui plainly installed and the X-ui page
+    # empty — the operator has to reconnect it by hand on every migration.
+    from app.models import XuiServer as _XuiServer
+    panels = (await session.exec(select(_XuiServer))).all()
+    panel_by_server = {p.server_id: p for p in panels}
+
     servers_out: List[dict] = []
     for s in rows:
         item = {
@@ -1647,11 +1715,30 @@ async def export_servers_json(
             }
             for d in deps
         ]
+
+        # The panel, when there is one. Its shape travels either way so a
+        # secret-stripped bundle still says "this server had a panel here";
+        # the token and password follow the same opt-in as the SSH
+        # credentials above, because they are exactly as sensitive.
+        panel = panel_by_server.get(s.id)
+        if panel is not None:
+            panel_out = {
+                "panel_port": panel.panel_port,
+                "panel_basepath": panel.panel_basepath,
+                "domain": panel.domain,
+                "mode": panel.mode,
+                "panel_user": panel.panel_user,
+            }
+            if include_secrets:
+                panel_out["api_token"] = panel.api_token
+                panel_out["panel_pass"] = panel.panel_pass
+            item["panel"] = panel_out
+
         servers_out.append(item)
 
     payload = {
         "kind": "pitun-servers-export",
-        "version": 2,
+        "version": 3,
         "exported_at": _dt.now(_tz.utc).isoformat(timespec="seconds"),
         "pitun_version": _APP_VERSION,
         "include_secrets": include_secrets,
@@ -1669,10 +1756,98 @@ async def export_servers_json(
     )
 
 
+async def _restore_panel(session: AsyncSession, server_id: int, panel_in: object) -> Optional[bool]:
+    """Register the x-ui panel carried by an import bundle on `server_id`.
+
+    Returns True when a panel was added, False when the bundle said there was
+    one but carried nothing to authenticate with (a secret-stripped export),
+    None when there is nothing to do (no panel in the bundle, or the server
+    already has one — an existing registration is never overwritten).
+    Not probed: a bundle is a copy of state that already worked, and the box
+    restoring it may not have a route to the panel yet.
+    """
+    if not isinstance(panel_in, dict):
+        return None
+    from app.models import XuiServer as _XuiServer
+    already = (await session.exec(
+        select(_XuiServer).where(_XuiServer.server_id == server_id)
+    )).first()
+    if already is not None:
+        # Registered earlier without its "x-ui configured" mark? Repair that.
+        from app.core.xui_deployment import ensure_xui_deployment
+        await ensure_xui_deployment(session, already)
+        return None
+    token = panel_in.get("api_token") or ""
+    p_user = panel_in.get("panel_user") or ""
+    p_pass = panel_in.get("panel_pass") or ""
+    # Either is enough to reach the panel later: the token directly, or the
+    # login the backend can fetch one with.
+    port = int(panel_in.get("panel_port") or 0)
+    # Without a port the panel cannot be reached, whatever else the bundle has.
+    if not port or not (token or (p_user and p_pass)):
+        return False
+    xs = _XuiServer(
+        server_id=server_id,
+        api_token=token,
+        panel_user=p_user,
+        panel_pass=p_pass,
+        panel_port=port,
+        panel_basepath=panel_in.get("panel_basepath") or "/",
+        domain=panel_in.get("domain") or None,
+        mode=panel_in.get("mode") or "bare",
+    )
+    session.add(xs)
+    await session.flush()
+    from app.core.xui_deployment import ensure_xui_deployment
+    await ensure_xui_deployment(session, xs)
+    return True
+
+
+async def _overwrite_server(session: AsyncSession, srv: Server, validated: ServerCreate, sd: dict) -> None:
+    """Bring an existing server (same name+host+port) to the bundle's state, in place.
+
+    The row keeps its id, so panels, clients and node links hanging off it
+    survive. Credentials the bundle does not carry (a secret-stripped export)
+    are left as they are rather than blanked.
+    """
+    srv.description = validated.description
+    srv.user = validated.user
+    srv.auth_type = validated.auth_type
+    for field in ("password", "private_key", "passphrase"):
+        value = getattr(validated, field, None)
+        if value:
+            setattr(srv, field, value)
+    session.add(srv)
+
+    deps_in = sd.get("deployments") or []
+    if not isinstance(deps_in, list):
+        return
+    have = {d.protocol: d for d in (await session.exec(
+        select(ServerDeployment).where(ServerDeployment.server_id == srv.id)
+    )).all()}
+    for dep in deps_in:
+        if not isinstance(dep, dict) or "protocol" not in dep:
+            continue
+        cfg = dep.get("config") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        proto = str(dep["protocol"])
+        row = have.get(proto)
+        if row is None:
+            session.add(ServerDeployment(
+                server_id=srv.id, protocol=proto, config_json=json.dumps(cfg),
+                status=str(dep.get("status") or "configured"),
+            ))
+        else:
+            row.config_json = json.dumps(cfg)
+            row.status = str(dep.get("status") or row.status)
+            session.add(row)
+
+
 @router.post("/import-json")
 async def import_servers_json(
     payload: dict,
-    replace: bool = Query(False, description="If true, delete existing servers before import"),
+    replace: bool = Query(False, description="Overwrite servers that already exist (same name+host+port); others are never touched"),
     session: AsyncSession = Depends(get_session),
 ):
     """Restore servers from a previously-exported JSON bundle.
@@ -1691,35 +1866,21 @@ async def import_servers_json(
     # deployments — since 1.2.5). v1 imports skip deployments restoration
     # entirely. Anything else is rejected so we don't silently lose data
     # if a future v3 introduces structural changes.
-    if bundle_version not in (1, 2):
+    # v3 adds the nested x-ui panel registration. Older bundles simply
+    # don't carry one, which restores exactly as before.
+    if bundle_version not in (1, 2, 3):
         raise HTTPException(400, f"Unsupported export version: {bundle_version}")
     servers_in = payload.get("servers")
     if not isinstance(servers_in, list):
         raise HTTPException(400, "Bundle missing 'servers' array")
     has_secrets = bool(payload.get("include_secrets", False))
 
-    if replace:
-        # Cascade: deleting Server rows takes their ServerDeployment rows
-        # with them via FK. last_node_id on deployments is set to NULL
-        # by the Node FK's ON DELETE SET NULL — but Node rows aren't
-        # touched here, so node linkage of NEW deployments stays clean
-        # if we re-create the same servers.
-        existing = (await session.exec(select(Server))).all()
-        for srv in existing:
-            # Manually clear deployments first to avoid relying on cascade
-            # at the SQLite level (we don't set up cascade in the schema
-            # — the ServerDeployment FK is a plain FK without ON DELETE).
-            existing_deps = (await session.exec(
-                select(ServerDeployment).where(ServerDeployment.server_id == srv.id)
-            )).all()
-            for d in existing_deps:
-                await session.delete(d)
-            await session.delete(srv)
-        await session.flush()
-
     imported = 0
     skipped = 0
+    overwritten = 0
     deployments_restored = 0
+    panels_restored = 0
+    panels_without_credentials = 0
     errors: List[str] = []
     for sd in servers_in:
         try:
@@ -1730,19 +1891,32 @@ async def import_servers_json(
             # auth_type / port ranges.
             validated = ServerCreate(**clean)
 
-            if not replace:
-                # Dedup by (name, host, port). Two servers at the same
-                # endpoint with the same display name collapse — a
-                # "name collision but different host" still inserts.
-                stmt = (
-                    select(Server)
-                    .where(Server.name == validated.name)
-                    .where(Server.host == validated.host)
-                    .where(Server.port == validated.port)
-                )
-                if (await session.exec(stmt)).first():
+            # Dedup by (name, host, port). Two servers at the same endpoint
+            # with the same display name collapse — a "name collision but
+            # different host" still inserts. Nothing outside the bundle is
+            # ever deleted: `replace` only decides what happens to a match.
+            stmt = (
+                select(Server)
+                .where(Server.name == validated.name)
+                .where(Server.host == validated.host)
+                .where(Server.port == validated.port)
+            )
+            existing_srv = (await session.exec(stmt)).first()
+            if existing_srv is not None:
+                if replace:
+                    await _overwrite_server(session, existing_srv, validated, sd)
+                    overwritten += 1
+                else:
                     skipped += 1
-                    continue
+                # A panel the server does not have yet still comes along —
+                # otherwise importing onto a box that already lists the
+                # server loses the registration.
+                restored = await _restore_panel(session, existing_srv.id, sd.get("panel"))
+                if restored is True:
+                    panels_restored += 1
+                elif restored is False:
+                    panels_without_credentials += 1
+                continue
 
             server = Server(**validated.model_dump())
             session.add(server)
@@ -1774,6 +1948,19 @@ async def import_servers_json(
                     )
                     session.add(new_dep)
                     deployments_restored += 1
+
+            # v3 envelope: the panel registration. Restored WITHOUT probing
+            # it — a bundle is a copy of state that already worked, and a
+            # box restoring one may not have a route to the panel yet
+            # (fresh install, node not up, VPS still booting). Refusing the
+            # row for that would lose the credentials the operator has, and
+            # the existing probe on the X-ui page surfaces a dead panel
+            # anyway.
+            restored = await _restore_panel(session, server.id, sd.get("panel"))
+            if restored is True:
+                panels_restored += 1
+            elif restored is False:
+                panels_without_credentials += 1
         except Exception as exc:  # noqa: BLE001 — per-row error reporting
             # Three colliding concerns (CWE-209/532/117) — see
             # api/nodes.py for the full layered defence rationale.
@@ -1797,7 +1984,10 @@ async def import_servers_json(
     return {
         "imported": imported,
         "skipped": skipped,
+        "overwritten": overwritten,
         "deployments_restored": deployments_restored,
+        "panels_restored": panels_restored,
+        "panels_without_credentials": panels_without_credentials,
         "errors": errors,
         "has_secrets": has_secrets,
     }

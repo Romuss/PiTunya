@@ -15,6 +15,9 @@ from app.models import Node, Settings as DBSettings
 
 logger = logging.getLogger(__name__)
 
+# Protocols that live on UDP: a TCP connect to their port always fails.
+UDP_PROTOCOLS = ("wireguard", "hy2")
+
 
 class HealthChecker:
     def __init__(self) -> None:
@@ -121,16 +124,6 @@ class HealthChecker:
                 db_node.last_check = datetime.now(tz=timezone.utc)
                 db_node.is_online = result["is_online"]
                 session.add(db_node)
-                # Write SLA record (v2.0) — one row per active-node check
-                try:
-                    from app.models import NodeSLARecord
-                    session.add(NodeSLARecord(
-                        node_id=node_id,
-                        is_online=result["is_online"],
-                        latency_ms=result.get("latency_ms"),
-                    ))
-                except Exception:
-                    pass  # SLA table may not exist on pre-v2.0 DBs
                 await session.commit()
 
             if result["is_online"]:
@@ -260,6 +253,20 @@ class HealthChecker:
                             cand["id"],
                         )
                         continue
+                    # Also re-check that the FAILED node is still the active
+                    # one. Probing candidates takes seconds, and the operator
+                    # may well have noticed the outage first and switched
+                    # manually — writing here would silently revert their
+                    # choice and send traffic somewhere they didn't pick.
+                    current = await self._get_setting(session, "active_node_id")
+                    if current and current != str(failed_node_id):
+                        logger.info(
+                            "Failover aborted: active node changed to %s while "
+                            "probing candidates (was %d)",
+                            current, failed_node_id,
+                        )
+                        self._fail_counts[failed_node_id] = 0
+                        return
                     await self._set_setting(session, "active_node_id", str(cand["id"]))
                     await session.commit()
                     logger.info(
@@ -360,8 +367,9 @@ class HealthChecker:
         - Chained node: probe the chain parent's real endpoint. The child's
           own endpoint (e.g. a WG server blocked by the ISP) is unreachable
           directly by design — the chain exists precisely to tunnel to it.
-        - WireGuard (no chain): WG is UDP-only and silently drops random
-          packets, so TCP SYN is meaningless. We mark it with udp=True
+        - WireGuard and Hysteria2 (no chain): UDP-only (Hysteria2 is QUIC), and they
+          silently drop random packets, so TCP SYN is meaningless — a TCP probe
+          of the port reports a healthy node as offline. We mark it with udp=True
           and use a lightweight UDP probe (sends 0 bytes, expects no
           reply — any ICMP unreachable / network error fails it).
         - Naive node: returns the UPSTREAM Caddy server endpoint so we
@@ -381,7 +389,7 @@ class HealthChecker:
             cur = parent
             seen.add(cur.id)
 
-        udp = (cur.protocol == "wireguard")
+        udp = cur.protocol in UDP_PROTOCOLS
         return cur.address, cur.port, udp
 
     async def _probe_node(
@@ -609,16 +617,6 @@ class HealthChecker:
                     db_node.latency_ms = result["latency_ms"]
                     db_node.last_check = datetime.now(tz=timezone.utc)
                     session.add(db_node)
-                    # Write SLA record (v2.0)
-                    try:
-                        from app.models import NodeSLARecord
-                        session.add(NodeSLARecord(
-                            node_id=nd["id"],
-                            is_online=result["is_online"],
-                            latency_ms=result.get("latency_ms"),
-                        ))
-                    except Exception:
-                        pass
 
                 output.append({
                     "node_id": nd["id"],

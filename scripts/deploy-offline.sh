@@ -71,7 +71,21 @@ ssh_run "mkdir -p ~/${REMOTE_DIR}/docker/offline ~/${REMOTE_DIR}/data"
 
 # ── 2. Ship source tree (compose, backend code, migrations, frontend dist, naive Dockerfile, scripts) ─
 log "Syncing source tree..."
-SRC_PATHS=(docker-compose.yml backend docker/naive scripts)
+# nginx.conf and frontend/nginx-spa.conf are mounted as FILES by
+# docker-compose.yml. If they aren't in the bundle, Docker creates each mount
+# point as an empty directory on the target — pitun-frontend never goes
+# healthy, and the `service_healthy` gate then fails the whole `compose up`.
+# The offline path could not bring the stack up at all without these.
+#
+# docker/dnsmasq and docker/hostapd are the router-mode sidecar build
+# contexts; without them an airgapped box can never enable router mode.
+SRC_PATHS=(
+    docker-compose.yml nginx.conf backend scripts
+    docker/naive docker/dnsmasq docker/hostapd
+)
+if [ -f frontend/nginx-spa.conf ]; then
+    SRC_PATHS+=(frontend/nginx-spa.conf)
+fi
 if [ -d frontend/dist ]; then
     SRC_PATHS+=(frontend/dist)
 else
@@ -140,6 +154,11 @@ if [ ! -f .env ]; then
     echo "[+] Generating .env"
     SECRET_KEY=\$(openssl rand -hex 32 2>/dev/null || echo changeme-\$(date +%s))
     VM_IP=\$(hostname -I | awk '{print \$1}')
+    # LAN port is detected, not assumed: a wrong INTERFACE means the TPROXY
+    # rules attach to a port that doesn't exist and the proxy silently sees
+    # no traffic at all.
+    DETECTED_IF=\$(ip -o -4 route show to default 2>/dev/null | awk '{print \$5}' | head -n1)
+
     cat > .env <<ENV
 SECRET_KEY=\${SECRET_KEY}
 BACKEND_PORT=8000
@@ -152,7 +171,7 @@ XRAY_LOG_LEVEL=warning
 TPROXY_PORT_TCP=7893
 TPROXY_PORT_UDP=7894
 DNS_PORT=5353
-INTERFACE=eth0
+INTERFACE=\${DETECTED_IF:-eth0}
 LAN_CIDR=192.168.1.0/24
 GATEWAY_IP=\${VM_IP}
 VITE_API_BASE_URL=/api
@@ -160,6 +179,11 @@ VITE_WS_BASE_URL=
 CORS_ORIGINS=http://\${VM_IP},http://\${VM_IP}:3000,http://localhost
 ENV
 fi
+
+# nginx aborts on `listen 443 ssl` with no certificate, and it is the only
+# service publishing 80 and 443 — so a missing cert takes the panel down on
+# BOTH ports, not just HTTPS. Nothing generated one on this path.
+sudo bash scripts/gen-cert.sh "\$VM_IP"     || echo "[!] cert generation failed — the panel may not start"
 
 sudo mkdir -p /etc/pitun/naive /tmp/pitun
 sudo chown "\$(id -un)":"\$(id -gn)" /etc/pitun/naive 2>/dev/null || true

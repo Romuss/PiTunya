@@ -50,6 +50,7 @@ class NodeBase(BaseModel):
     fingerprint: str = "chrome"
     alpn: Optional[str] = None
     allow_insecure: bool = False
+    pinned_cert_sha256: Optional[str] = None
     ws_path: str = "/"
     ws_host: Optional[str] = None
     ws_headers: Optional[str] = None
@@ -73,6 +74,8 @@ class NodeBase(BaseModel):
     wg_local_address: Optional[str] = None
     hy2_obfs: Optional[str] = None
     hy2_obfs_password: Optional[str] = None
+    hy2_hop_ports: Optional[str] = None
+    hy2_hop_interval: Optional[str] = None
     # NaiveProxy
     internal_port: Optional[int] = None
     naive_padding: bool = True
@@ -93,8 +96,10 @@ class NodeBase(BaseModel):
     @field_validator("transport", mode="before")
     @classmethod
     def validate_transport(cls, v: str) -> str:
-        # Xray v25.x renamed "tcp" → "raw"; panels emit type=raw in share
-        # links. Fold it back so every bundled xray version accepts it.
+        # Xray renamed the plain "tcp" transport to "raw" (v25.x). A
+        # subscription importing a node with type=raw stored it verbatim,
+        # and this validator then rejected it on read — 500ing the WHOLE
+        # /nodes list off one node. They are the same transport.
         if v == "raw":
             v = "tcp"
         valid = {"tcp", "ws", "grpc", "h2", "xhttp", "httpupgrade", "kcp", "quic"}
@@ -109,6 +114,14 @@ class NodeBase(BaseModel):
         if v not in valid:
             raise ValueError(f"tls must be one of {valid}")
         return v
+
+    @field_validator("pinned_cert_sha256", mode="before")
+    @classmethod
+    def validate_pin(cls, v):
+        from app.core.cert_pin import normalize_pin
+        if v is None or str(v).strip() == "":
+            return None
+        return normalize_pin(v)
 
 
 class NodeCreate(NodeBase):
@@ -136,8 +149,7 @@ class NodeUpdate(NodeBase):
     def validate_transport(cls, v: Optional[str]) -> Optional[str]:  # type: ignore[override]
         if v is None:
             return v
-        # Fold raw → tcp (xray v25 rename).
-        if v == "raw":
+        if v == "raw":  # Xray's new name for the "tcp" transport
             v = "tcp"
         valid = {"tcp", "ws", "grpc", "h2", "xhttp", "httpupgrade", "kcp", "quic"}
         if v not in valid:
@@ -160,7 +172,8 @@ class NodeRead(NodeBase):
     latency_ms: Optional[int] = None
     last_check: Optional[datetime] = None
     is_online: bool = True
-    # v1.4.8 — speed test results
+    # Last speed reading (Mbps) + when it was taken. The UI shows the age
+    # and greys/reddens a reading older than ~6h.
     speed_mbps: Optional[float] = None
     speed_max_mbps: Optional[float] = None
     speed_tested_at: Optional[datetime] = None
@@ -176,6 +189,13 @@ class NodeRead(NodeBase):
     # the node + raise an `orphan` warning if the upstream peer is gone.
     from_deployment_client_id: Optional[int] = None
     client_orphan: bool = False
+    # `chain_node_id` points at a Node that no longer exists. Computed on
+    # read rather than stored: it reflects what is actually true right
+    # now, so it also catches rows broken by an older version or an
+    # external DB edit. A chained node whose relay is gone silently
+    # stops working — xray skips the outbound, probes and speed tests
+    # return nothing — and nothing in the list used to say why.
+    chain_orphan: bool = False
 
     class Config:
         from_attributes = True
@@ -877,20 +897,43 @@ class NodeCircleBase(BaseModel):
     mode: str = "sequential"
     interval_min: int = 5
     interval_max: int = 15
-    # v1.4.8 — when set, circle auto-syncs its node_ids from this
-    # subscription on every refresh: new nodes appended, removed ones
-    # dropped. Operator "links" a circle to a sub and forgets about
-    # manual edits.
-    subscription_id: Optional[int] = None
-    # v1.4.8 — skip rotation while the active node's speed_mbps is
-    # above this threshold. 0 = always rotate (prior behavior).
-    min_speed_mbps: float = 0.0
+    # Candidate filters (0 = disabled). See circle_scheduler.
     max_latency_ms: int = 0
-    # v1.7.0 — comma-separated ISO country codes to exclude from rotation.
-    # Candidates whose exit country matches any code here are skipped.
-    # Useful for data-limited LTE proxies where you don't want the circle
-    # to burn through a monthly quota. Empty = no exclusions (default).
-    excluded_countries: str = ""
+    min_speed_mbps: float = 0.0
+    # Link to a Subscription (None = manually managed). When set, the
+    # subscription's refresh keeps this circle's membership in sync.
+    subscription_id: Optional[int] = None
+    # Every subscription the circle follows; `subscription_id` mirrors the first.
+    subscription_ids: List[int] = []
+    # Nodes a subscription refresh must not put back into this circle, and
+    # countries (ISO codes) whose nodes never join it.
+    excluded_node_ids: List[int] = []
+    excluded_countries: List[str] = []
+
+    @field_validator("subscription_ids", mode="before")
+    @classmethod
+    def parse_sub_ids(cls, v):
+        from app.core.circle_filters import parse_list
+        return [int(i) for i in parse_list(v)]
+
+    @model_validator(mode="after")
+    def mirror_subscription_id(self):
+        if not self.subscription_ids and self.subscription_id is not None:
+            self.subscription_ids = [self.subscription_id]
+        self.subscription_id = self.subscription_ids[0] if self.subscription_ids else None
+        return self
+
+    @field_validator("excluded_countries", mode="before")
+    @classmethod
+    def norm_countries(cls, v):
+        from app.core.circle_filters import normalize_countries, parse_list
+        return normalize_countries(parse_list(v))
+
+    @field_validator("excluded_node_ids", mode="before")
+    @classmethod
+    def parse_excluded_ids(cls, v):
+        from app.core.circle_filters import parse_list
+        return parse_list(v)
 
     @field_validator("mode")
     @classmethod
@@ -902,8 +945,8 @@ class NodeCircleBase(BaseModel):
     @field_validator("interval_min")
     @classmethod
     def validate_interval_min(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("interval_min must be at least 1 minute")
+        if v < 5:
+            raise ValueError("interval_min must be at least 5 minutes")
         return v
 
     @model_validator(mode="after")
@@ -922,10 +965,21 @@ class NodeCircleUpdate(BaseModel):
     mode: Optional[str] = None
     interval_min: Optional[int] = None
     interval_max: Optional[int] = None
-    subscription_id: Optional[int] = None
-    min_speed_mbps: Optional[float] = None
     max_latency_ms: Optional[int] = None
-    excluded_countries: Optional[str] = None
+    min_speed_mbps: Optional[float] = None
+    # Send an explicit `null` to unlink (falls back to manual management).
+    subscription_id: Optional[int] = None
+    subscription_ids: Optional[List[int]] = None
+    excluded_node_ids: Optional[List[int]] = None
+    excluded_countries: Optional[List[str]] = None
+
+    @field_validator("excluded_countries", mode="before")
+    @classmethod
+    def norm_countries(cls, v):
+        if v is None:
+            return v
+        from app.core.circle_filters import normalize_countries
+        return normalize_countries(v)
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -964,6 +1018,7 @@ class AutoCheckRead(BaseModel):
     scope_kind: str
     scope_value: str
     last_sweep: Optional[datetime] = None
+    # Live status (filled by the endpoint, not stored).
     is_sweeping: bool = False
     is_cancelling: bool = False
     sweep_done: int = 0
@@ -998,8 +1053,6 @@ class AutoCheckUpdate(BaseModel):
 
 class UserAgentTemplateBase(BaseModel):
     """Editable fields of a UA template.
-
-    Ported from upstream DaveBugg/PiTun v1.4.7.
 
     Validation is delegated to `app.core.ua_templates` so the API, the
     import endpoint and the seeding path all enforce one ruleset. The
@@ -1036,6 +1089,8 @@ class UserAgentTemplateBase(BaseModel):
     @classmethod
     def validate_headers_field(cls, v):
         from app.core.ua_templates import parse_headers, validate_headers
+        # Accept the raw DB column (a JSON string) so the same base class
+        # can validate an ORM row on the way out.
         if isinstance(v, str):
             v = parse_headers(v)
         return validate_headers(v)
@@ -1052,7 +1107,12 @@ class UserAgentTemplateCreate(UserAgentTemplateBase):
 
 
 class UserAgentTemplateUpdate(BaseModel):
-    """PATCH body — every field optional, same validators as create."""
+    """PATCH body — every field optional, same validators as create.
+
+    `mode="before"` + an explicit None passthrough on each validator so
+    `exclude_unset` semantics survive: an omitted field stays omitted,
+    and an explicit `null` clears `description`.
+    """
     key: Optional[str] = None
     name: Optional[str] = None
     user_agent: Optional[str] = None
@@ -1104,7 +1164,14 @@ class UserAgentTemplateUpdate(BaseModel):
 
 
 class UserAgentTemplateRead(BaseModel):
-    """Output model — intentionally NOT a subclass of the validating base."""
+    """Output model — intentionally NOT a subclass of the validating base.
+
+    A stored row can hold a headers blob today's validator would reject
+    (hand-edited DB, or a rule tightened after the row was written).
+    Listing templates must not 500 over one bad entry, so the router
+    passes headers through `ua_templates.sanitize_headers`, which drops
+    offenders and logs them, and nothing here re-validates.
+    """
     id: int
     key: str
     name: str
@@ -1113,6 +1180,9 @@ class UserAgentTemplateRead(BaseModel):
     description: Optional[str] = None
     builtin: bool = False
     order: int = 100
+    # How many subscriptions currently reference this template's key.
+    # Filled by the list/read endpoints; drives the "in use" column and
+    # the delete guard's message.
     usage_count: int = 0
 
     class Config:
@@ -1141,9 +1211,7 @@ class SubscriptionBase(BaseModel):
     auto_update: bool = False
     update_interval: int = 86400
     rotate_hwid: bool = False
-    # Opt-in to skip TLS verification when fetching this subscription.
-    # Default False (secure) — see `models.Subscription.allow_insecure`.
-    allow_insecure: bool = False
+    allow_insecure_tls: bool = False
 
     @field_validator("url")
     @classmethod
@@ -1385,6 +1453,12 @@ class SettingsRead(BaseModel):
     fakedns_pool_size: Optional[int] = None
     dns_sniffing: Optional[bool] = None
     bypass_cn_dns: Optional[bool] = None
+    # TLS-ClientHello fragmentation (anti-DPI, client-side). See
+    # config_gen._apply_fragment. Off by default.
+    xray_fragment_enabled: Optional[bool] = None
+    xray_fragment_packets: Optional[str] = None
+    xray_fragment_length: Optional[str] = None
+    xray_fragment_interval: Optional[str] = None
     bypass_ru_dns: Optional[bool] = None
     bypass_private: bool
     log_level: str
@@ -1414,12 +1488,39 @@ class SettingsRead(BaseModel):
     dns_query_log_enabled: bool = False
     # Device routing
     device_routing_mode: str = "all"  # "all" | "include_only" | "exclude_list"
-    # IPv6 — default True since v1.4.7 (finding 3.2): PiTun's TPROXY
-    # pipeline is IPv4-only, and a sticky AAAA cache / RA default
-    # route from the home router lets v6 escape via the router. The
-    # `apply_system_toggles_on_boot` writes `net.ipv6.conf.all.disable
-    # _ipv6=1` from this flag.
-    disable_ipv6: bool = True
+    operating_mode: str = "gateway"
+    wan_interface: str = ""
+    lan_interface: str = ""
+    dhcp_enabled: bool = True
+    dhcp_pool_start: str = ""
+    dhcp_pool_end: str = ""
+    dhcp_lease_hours: int = 12
+    wifi_enabled: bool = False
+    # Uplink exposure — see core/router_mode._refuse_public_wan_exposure.
+    lan_extra_interfaces: str = ""
+    wan_admin_access: bool = False
+    wan_ssh_access: bool = False
+    wan_allow_tcp: str = ""
+    wan_allow_udp: str = ""
+    wifi_ssid: str = "PiTun"
+    # Never returned: the read model is what the UI renders, and a WiFi
+    # password has no business travelling back to a browser on every poll.
+    wifi_country: str = ""
+    wifi_band: str = "2.4"
+    wifi_channel: int = 0
+    wifi_security: str = "wpa2"
+    wifi_hidden: bool = False
+    wan_mode: str = "dhcp"
+    wan_vlan_id: int = 0
+    wan_mac_clone: str = ""
+    wan_static_address: str = ""
+    wan_static_gateway: str = ""
+    wan_static_dns: str = ""
+    wan_pppoe_user: str = ""
+    # PPPoE password is write-only, like the WiFi passphrase.
+    wan_pppoe_service: str = ""
+    # IPv6
+    disable_ipv6: bool = False
     # DNS over TCP
     dns_over_tcp: bool = False
     # Health check
@@ -1439,14 +1540,57 @@ class SettingsRead(BaseModel):
     # see _apply_xray_config in core/config_gen for the threat-model
     # rationale.
     xui_panel_bypass: bool = False
+
     chain_drift_check: bool = True
+    circle_http_probe: bool = True
     lan_proxy_auth_enabled: bool = False
     lan_proxy_auth_user: str = ""
     lan_proxy_auth_pass: str = ""
+    # Xray connection-lifetime policy. Feeds PiTun's own xray AND the
+    # panels' templates, so one place decides how long a connection may
+    # sit idle and whether a half-closed stream gets cut. See
+    # core/xray_policy.py for why the defaults are what they are.
+    xray_handshake: int = 10
+    xray_conn_idle: int = 3600
+    xray_uplink_only: int = 0
+    xray_downlink_only: int = 0
+    xray_tcp_keepalive_idle: int = 100
+    xray_tcp_keepalive_interval: int = 15
 
 
 class SettingsUpdate(BaseModel):
     mode: Optional[str] = None
+    # "gateway" (beside the router, default) | "router" (owns WAN, DHCP+NAT).
+    # Rejected server-side unless the box has 2+ physical NICs.
+    operating_mode: Optional[str] = None
+    wan_interface: Optional[str] = None
+    lan_interface: Optional[str] = None
+    dhcp_enabled: Optional[bool] = None
+    dhcp_pool_start: Optional[str] = None
+    dhcp_pool_end: Optional[str] = None
+    dhcp_lease_hours: Optional[int] = None
+    wifi_enabled: Optional[bool] = None
+    lan_extra_interfaces: Optional[str] = None
+    wan_admin_access: Optional[bool] = None
+    wan_ssh_access: Optional[bool] = None
+    wan_allow_tcp: Optional[str] = None
+    wan_allow_udp: Optional[str] = None
+    wifi_ssid: Optional[str] = None
+    wifi_passphrase: Optional[str] = None
+    wifi_country: Optional[str] = None
+    wifi_band: Optional[str] = None
+    wifi_channel: Optional[int] = None
+    wifi_security: Optional[str] = None
+    wifi_hidden: Optional[bool] = None
+    wan_mode: Optional[str] = None
+    wan_vlan_id: Optional[int] = None
+    wan_mac_clone: Optional[str] = None
+    wan_static_address: Optional[str] = None
+    wan_static_gateway: Optional[str] = None
+    wan_static_dns: Optional[str] = None
+    wan_pppoe_user: Optional[str] = None
+    wan_pppoe_password: Optional[str] = None
+    wan_pppoe_service: Optional[str] = None
     active_node_id: Optional[int] = None
     failover_enabled: Optional[bool] = None
     failover_node_ids: Optional[List[int]] = None
@@ -1470,6 +1614,12 @@ class SettingsUpdate(BaseModel):
     fakedns_pool_size: Optional[int] = None
     dns_sniffing: Optional[bool] = None
     bypass_cn_dns: Optional[bool] = None
+    # TLS-ClientHello fragmentation (anti-DPI, client-side). See
+    # config_gen._apply_fragment. Off by default.
+    xray_fragment_enabled: Optional[bool] = None
+    xray_fragment_packets: Optional[str] = None
+    xray_fragment_length: Optional[str] = None
+    xray_fragment_interval: Optional[str] = None
     bypass_ru_dns: Optional[bool] = None
     bypass_private: Optional[bool] = None
     log_level: Optional[str] = None
@@ -1511,10 +1661,21 @@ class SettingsUpdate(BaseModel):
     timezone: Optional[str] = None
     # LAN proxy auth (see SettingsRead docstring)
     xui_panel_bypass: Optional[bool] = None
+
     chain_drift_check: Optional[bool] = None
+    circle_http_probe: Optional[bool] = None
     lan_proxy_auth_enabled: Optional[bool] = None
     lan_proxy_auth_user: Optional[str] = None
     lan_proxy_auth_pass: Optional[str] = None
+    # Xray policy (see SettingsRead). Bounds are enforced in the endpoint
+    # against core/xray_policy.BOUNDS — a too-small connIdle looks like a
+    # flaky network, which is miserable to debug from the symptom.
+    xray_handshake: Optional[int] = None
+    xray_conn_idle: Optional[int] = None
+    xray_uplink_only: Optional[int] = None
+    xray_downlink_only: Optional[int] = None
+    xray_tcp_keepalive_idle: Optional[int] = None
+    xray_tcp_keepalive_interval: Optional[int] = None
 
 
 # ─── GeoData ──────────────────────────────────────────────────────────────────
@@ -1760,6 +1921,7 @@ class DeviceRead(BaseModel):
     first_seen: datetime
     last_seen: datetime
     is_online: bool = True
+    dhcp_reserved_ip: Optional[str] = None
     routing_policy: str = "default"
     # NULL = unassigned (only global routing rules apply). Set to a
     # RoutingSet.id to apply that set's rules in addition to globals.
@@ -1771,6 +1933,8 @@ class DeviceRead(BaseModel):
 
 class DeviceUpdate(BaseModel):
     name: Optional[str] = None
+    # Send "" to clear a reservation; omit to leave it alone.
+    dhcp_reserved_ip: Optional[str] = None
     routing_policy: Optional[str] = None
     # Sentinel-free: pass `null` to unassign (back to global-only),
     # omit the field entirely to leave the current assignment alone.

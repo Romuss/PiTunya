@@ -1,4 +1,5 @@
 """FastAPI application entry point."""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -119,6 +120,7 @@ async def lifespan(app: FastAPI):
 
     from app.core.autocheck_scheduler import autocheck_scheduler
     from app.core.chain_drift import chain_drift_scheduler
+    from app.core.domain_stats import domain_stats_scheduler
 
     health_checker.start()
     subscription_scheduler.start()
@@ -128,6 +130,15 @@ async def lifespan(app: FastAPI):
     geo_scheduler.start()
     autocheck_scheduler.start()
     chain_drift_scheduler.start()
+    domain_stats_scheduler.start()
+    from app.core.resource_limits import reapply_on_boot
+    await reapply_on_boot()
+
+    try:
+        from app.core.xui_deployment import backfill as _backfill_xui_deployments
+        await _backfill_xui_deployments()
+    except Exception as exc:  # noqa: BLE001 — cosmetic, never blocks startup
+        logger.warning("xui deployment backfill skipped: %s", exc)
 
     # Country-flag prefixes, applied at the model rather than at each of the
     # nine places a node gets created — which is how nodes from a server
@@ -138,6 +149,33 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 — cosmetic, never blocks startup
         logger.warning("Country-flag enrichment not installed: %s", exc)
 
+    # Reconcile router mode with the dataplane on boot: nftables tables and
+    # the DHCP container don't survive a reboot, so a box configured as a
+    # router would come back up as a plain host and take the LAN with it.
+    try:
+        from sqlmodel.ext.asyncio.session import AsyncSession as _AsyncSession
+        from app.database import get_async_engine as _engine
+        from app.core import router_mode, router_watchdog
+        # An unconfirmed apply found at boot was never proven to work — most
+        # likely it took the box down hard enough that nobody could confirm.
+        # Revert it before reconciling, or every boot repeats the failure.
+        await router_watchdog.recover_on_boot()
+        async with _AsyncSession(_engine()) as _s:
+            # Not `apply()` directly: boot has to wait for hardware that is
+            # still arriving, and has to clean up after itself if it can't.
+            await router_mode.reconcile_on_boot(_s)
+    except Exception as exc:  # noqa: BLE001 — never block startup on this
+        logger.warning("Router mode not applied on boot: %s", exc)
+
+    # Started separately, and deliberately NOT inside the try above: a boot
+    # reconcile that raised is exactly when the watchdog matters most, and
+    # sharing the try meant the only thing able to rescue a wedged box was
+    # disabled precisely on the boxes that were already misbehaving.
+    try:
+        from app.core.router_watchdog import router_watchdog as _watchdog
+        _watchdog.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Router watchdog failed to start: %s", exc)
     # Service-supervisor bookkeeping (architecture review finding 4.1 +
     # 4.2): register the already-started services so the singleton's
     # snapshot() can report live state to a future /api/health/services
@@ -151,20 +189,6 @@ async def lifespan(app: FastAPI):
     from app.core.speed_scheduler import speed_test_scheduler
     speed_test_scheduler.start()
     _sup.register("speed_test", speed_test_scheduler.start, speed_test_scheduler.stop)
-    # v2.0 — SLA aggregator: daily uptime aggregates + prune old records
-    try:
-        from app.core.sla_aggregator import sla_aggregator
-        sla_aggregator.start()
-        _sup.register("sla", sla_aggregator.start, sla_aggregator.stop)
-        # v2.0 — Traffic collector: polls xray stats every 30s
-        try:
-            from app.core.traffic_collector import traffic_collector
-            traffic_collector.start()
-            _sup.register("traffic", traffic_collector.start, traffic_collector.stop)
-        except Exception as exc:
-            logger.warning("Traffic collector failed to start: %s", exc)
-    except Exception as exc:
-        logger.warning("SLA aggregator failed to start: %s", exc)
     # v1.6.0 — background autocheck scheduler (upstream merge): periodic
     # speed-test sweep scoped to all / subscription / group / specific nodes.
     try:
@@ -173,18 +197,6 @@ async def lifespan(app: FastAPI):
         _sup.register("autocheck", autocheck_scheduler.start, autocheck_scheduler.stop)
     except Exception as exc:
         logger.warning("AutoCheck scheduler failed to start: %s", exc)
-    try:
-        from app.core.quota_checker import quota_checker
-        quota_checker.start()
-        _sup.register("quota", quota_checker.start, quota_checker.stop)
-    except Exception as exc:
-        logger.warning("Quota checker failed to start: %s", exc)
-    try:
-        from app.core.rule_suggester import rule_suggester
-        rule_suggester.start()
-        _sup.register("rule_suggestions", rule_suggester.start, rule_suggester.stop)
-    except Exception as exc:
-        logger.warning("Rule suggester failed to start: %s", exc)
     _sup.register("health",       health_checker.start,        health_checker.stop)
     _sup.register("subs",         subscription_scheduler.start, subscription_scheduler.stop)
     _sup.register("circle",       circle_scheduler.start,       circle_scheduler.stop)
@@ -382,6 +394,9 @@ async def lifespan(app: FastAPI):
     device_scanner.stop()
     metrics_collector.stop()
     geo_scheduler.stop()
+    autocheck_scheduler.stop()
+    chain_drift_scheduler.stop()
+    domain_stats_scheduler.stop()
     try:
         from app.core.speed_scheduler import speed_test_scheduler
         speed_test_scheduler.stop()
@@ -390,26 +405,6 @@ async def lifespan(app: FastAPI):
     try:
         from app.core.autocheck_scheduler import autocheck_scheduler
         autocheck_scheduler.stop()
-    except Exception:
-        pass
-    try:
-        from app.core.sla_aggregator import sla_aggregator
-        sla_aggregator.stop()
-    except Exception:
-        pass
-    try:
-        from app.core.traffic_collector import traffic_collector
-        traffic_collector.stop()
-    except Exception:
-        pass
-    try:
-        from app.core.quota_checker import quota_checker
-        quota_checker.stop()
-    except Exception:
-        pass
-    try:
-        from app.core.rule_suggester import rule_suggester
-        rule_suggester.stop()
     except Exception:
         pass
     try:
@@ -515,7 +510,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api import nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, xui, network, config_io, user_agents, autocheck, sla, traffic_api, quota_api, suggestions, connections
+from app.api import domain_stats as domain_stats_api, resources as resources_api, nodes, routing, routing_sets, subscriptions, system, geodata, logs, dns, balancers, auth, nodecircle, devices, diagnostics, events, servers, scripts, server_tasks, server_clients, templates, user_agents, xui, network, autocheck, backup, config_io, connections
 from app.core.auth import get_current_user
 
 app.include_router(auth.router, prefix="/api")
@@ -526,11 +521,18 @@ app.include_router(nodes.router, prefix="/api", dependencies=_auth)
 app.include_router(routing.router, prefix="/api", dependencies=_auth)
 app.include_router(routing_sets.router, prefix="/api", dependencies=_auth)
 app.include_router(subscriptions.router, prefix="/api", dependencies=_auth)
+# User-Agent templates (since v1.4.7) — the editable catalogue behind the
+# subscription UA dropdown. Managed from the Subscriptions page.
+app.include_router(user_agents.router, prefix="/api", dependencies=_auth)
 app.include_router(system.router, prefix="/api", dependencies=_auth)
 app.include_router(geodata.router, prefix="/api", dependencies=_auth)
 app.include_router(dns.router, dependencies=_auth)
 app.include_router(balancers.router, prefix="/api", dependencies=_auth)
 app.include_router(nodecircle.router, prefix="/api", dependencies=_auth)
+app.include_router(autocheck.router, prefix="/api", dependencies=_auth)
+app.include_router(domain_stats_api.router, prefix="/api", dependencies=_auth)
+app.include_router(resources_api.router, prefix="/api", dependencies=_auth)
+app.include_router(backup.router, prefix="/api", dependencies=_auth)
 app.include_router(devices.router, prefix="/api", dependencies=_auth)
 app.include_router(diagnostics.router, prefix="/api", dependencies=_auth)
 app.include_router(events.router, prefix="/api", dependencies=_auth)
@@ -555,14 +557,6 @@ app.include_router(config_io.router, prefix="/api", dependencies=_auth)
 # v1.6.0 — UA Templates + Autocheck (upstream merge)
 app.include_router(user_agents.router, prefix="/api", dependencies=_auth)
 app.include_router(autocheck.router, prefix="/api", dependencies=_auth)
-# v2.0 — SLA (uptime dashboard)
-app.include_router(sla.router, prefix="/api", dependencies=_auth)
-# v2.0 — Traffic (bandwidth per device)
-app.include_router(traffic_api.router, prefix="/api", dependencies=_auth)
-# v2.0 — Quotas (traffic caps)
-app.include_router(quota_api.router, prefix="/api", dependencies=_auth)
-# v2.0 — Rule suggestions (DNS-log analysis)
-app.include_router(suggestions.router, prefix="/api", dependencies=_auth)
 # v2.0 — Connection tracker (live conntrack view)
 app.include_router(connections.router, prefix="/api", dependencies=_auth)
 

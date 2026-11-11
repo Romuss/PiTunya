@@ -56,6 +56,18 @@ fi
 validate_ip "$STATIC_IP" "STATIC_IP" || { echo "Aborting."; exit 1; }
 validate_ip "$GATEWAY" "GATEWAY" || { echo "Aborting."; exit 1; }
 
+# The gateway must be a DIFFERENT device (your router). If it equals the
+# static IP, the box routes to itself — the "PiTun gateway points at
+# itself" self-loop that kills all outbound traffic. Same guard as
+# change-network.sh; catching it here stops the loop being baked in at
+# first boot.
+if [ "$STATIC_IP" = "$GATEWAY" ]; then
+    warn "STATIC_IP and GATEWAY are identical ($STATIC_IP)."
+    warn "The gateway must be your router (a DIFFERENT device), else the box"
+    warn "routes to itself and has no internet (routing self-loop). Aborting."
+    exit 1
+fi
+
 log "PiTun First Boot Setup"
 log "User: $CURRENT_USER"
 log "Static IP: $STATIC_IP"
@@ -101,10 +113,25 @@ fi
 # ── 3. Set static IP ──
 log "Setting static IP: $STATIC_IP..."
 
+# Never assume the LAN port is called eth0. Predictable interface names
+# (enp1s0, enx<mac>, wlp2s0) are the norm on anything x86 and on many RPi
+# images, and the old hardcoded name made this script *appear* to succeed
+# while configuring an interface that does not exist. Detect the port that
+# currently carries the default route, and only fall back to eth0 when
+# there is nothing to detect.
+IFACE=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
+[ -z "$IFACE" ] && IFACE=$(ip -o link show 2>/dev/null     | awk -F': ' '$2 !~ /^(lo|docker|br-|veth|wg|tun|tap)/ {print $2; exit}')
+[ -z "$IFACE" ] && IFACE=eth0
+log "Using interface: $IFACE"
+
 # Check which network manager is in use
 if command -v nmcli &> /dev/null; then
     # NetworkManager (RPi OS Trixie/Bookworm)
-    CON_NAME=$(nmcli -t -f NAME,DEVICE con show --active | grep eth0 | cut -d: -f1)
+    # `|| true`: with no active profile for $IFACE the grep exits 1, and under
+    # `set -euo pipefail` that killed the script right here — after sshd was
+    # restarted but before the static IP, forwarding and hostname were applied.
+    # It also made the fallback two lines down unreachable.
+    CON_NAME=$(nmcli -t -f NAME,DEVICE con show --active | grep ":$IFACE$" | cut -d: -f1 || true)
     if [ -z "$CON_NAME" ]; then
         CON_NAME="Wired connection 1"
     fi
@@ -116,11 +143,11 @@ if command -v nmcli &> /dev/null; then
     log "Static IP set via NetworkManager"
 elif [ -f /etc/dhcpcd.conf ]; then
     # dhcpcd (older RPi OS)
-    if ! grep -q "interface eth0" /etc/dhcpcd.conf; then
+    if ! grep -q "interface $IFACE" /etc/dhcpcd.conf; then
         cat >> /etc/dhcpcd.conf << EOF
 
 # PiTun static IP
-interface eth0
+interface $IFACE
 static ip_address=$STATIC_IP/24
 static routers=$GATEWAY
 static domain_name_servers=1.1.1.1 8.8.8.8
@@ -129,9 +156,9 @@ EOF
     log "Static IP set via dhcpcd"
 else
     # Fallback: /etc/network/interfaces
-    cat > /etc/network/interfaces.d/eth0 << EOF
-auto eth0
-iface eth0 inet static
+    cat > /etc/network/interfaces.d/"$IFACE" << EOF
+auto $IFACE
+iface $IFACE inet static
     address $STATIC_IP/24
     gateway $GATEWAY
     dns-nameservers 1.1.1.1 8.8.8.8
@@ -147,7 +174,11 @@ sudo sysctl -p /etc/sysctl.d/99-pitun.conf > /dev/null
 # ── 5. Set hostname ──
 log "Setting hostname to pitun..."
 sudo hostnamectl set-hostname pitun
-echo "127.0.1.1 pitun" | sudo tee -a /etc/hosts > /dev/null
+# Idempotent: only add the 127.0.1.1 mapping if it isn't already there —
+# re-running this script must not pile up duplicate /etc/hosts lines.
+if ! grep -qE '^\s*127\.0\.1\.1\s+pitun(\s|$)' /etc/hosts; then
+    echo "127.0.1.1 pitun" | sudo tee -a /etc/hosts > /dev/null
+fi
 
 # ── 6. Update system ──
 log "Updating system packages..."

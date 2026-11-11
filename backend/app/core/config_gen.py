@@ -1,19 +1,43 @@
 """Generate xray JSON configuration from DB models."""
+import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from sqlmodel import select
 
 from app.config import settings
+from app.core.xray_policy import inbound_keepalive, level_zero
 from app.models import BalancerGroup, Device, DNSRule, Node, RoutingRule, RoutingSet
 
 if TYPE_CHECKING:
     from sqlmodel.ext.asyncio.session import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+# Guards the whole write→validate sequence in `write_config` — every
+# writer goes through that one function.
+#
+# One lock PER EVENT LOOP, not a single module-level lock: an
+# `asyncio.Lock` binds itself to the first loop that awaits it and then
+# raises "bound to a different event loop" everywhere else. The app runs
+# one loop, but helpers and tests call `asyncio.run()`, which makes a
+# fresh one each time. Keyed weakly-ish by loop, with closed loops pruned.
+_write_locks: "dict[Any, asyncio.Lock]" = {}
+
+
+def _write_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _write_locks.get(loop)
+    if lock is None:
+        for dead in [lp for lp in _write_locks if lp.is_closed()]:
+            _write_locks.pop(dead, None)
+        lock = asyncio.Lock()
+        _write_locks[loop] = lock
+    return lock
 
 
 async def collect_routing_set_context(
@@ -74,12 +98,13 @@ def _tls_settings(node: Node) -> Optional[Dict[str, Any]]:
             reality["spiderX"] = node.reality_spx
         return reality
 
-    # Standard TLS
+    # Standard TLS. `allowInsecure` is gone from xray (a hard error when
+    # true); a self-signed server is trusted by pinning its certificate.
     tls: Dict[str, Any] = {
         "enabled": True,
         "serverName": node.sni or node.address,
-        "allowInsecure": node.allow_insecure,
     }
+    _apply_pin(tls, node)
     if node.fingerprint:
         tls["fingerprint"] = node.fingerprint
     if node.alpn:
@@ -89,11 +114,11 @@ def _tls_settings(node: Node) -> Optional[Dict[str, Any]]:
 
 
 def _stream_settings(node: Node) -> Dict[str, Any]:
-    # Xray v25.x renamed "tcp" → "raw"; if a node was stored with
-    # transport="raw" (from a subscription that emitted type=raw),
-    # fold it back so every bundled xray version accepts the config.
-    transport = "tcp" if node.transport == "raw" else node.transport
-    stream: Dict[str, Any] = {"network": transport}
+    # A node imported before the schema learned Xray's "raw" alias may be
+    # stored with transport="raw". It is the "tcp" transport under a newer
+    # name; emit "tcp" so every bundled xray version accepts the config.
+    network = "tcp" if node.transport == "raw" else node.transport
+    stream: Dict[str, Any] = {"network": network}
 
     if node.transport == "ws":
         # xray deprecated "Host" inside "headers" — use top-level "host" field instead
@@ -258,15 +283,26 @@ def _outbound_wireguard(node: Node) -> Dict[str, Any]:
 
     # xray's wireguard outbound requires interface addresses to be /32 (IPv4)
     # or /128 (IPv6). Standard WG configs often use /24 or /64 — normalize.
-    local_addrs: List[str] = []
+    #
+    # Keep only IPv4 when an IPv4 address is present. A commercial WG config
+    # almost always hands out both (`10.x/32, fdxx::/128`); passing the IPv6
+    # interface address makes xray's userspace WG bring up an IPv6 netstack,
+    # which fails with "failed to find available ipv6 table" on an IPv4-only
+    # host — and PiTun is IPv4-first anyway (queryStrategy UseIPv4). Fall back
+    # to IPv6 only if that's all the config gives us.
+    ipv4_addrs: List[str] = []
+    ipv6_addrs: List[str] = []
     if node.wg_local_address:
         for raw in node.wg_local_address.split(","):
             a = raw.strip()
             if not a:
                 continue
             ip_part = a.split("/", 1)[0]
-            mask = "/128" if ":" in ip_part else "/32"
-            local_addrs.append(ip_part + mask)
+            if ":" in ip_part:
+                ipv6_addrs.append(ip_part + "/128")
+            else:
+                ipv4_addrs.append(ip_part + "/32")
+    local_addrs: List[str] = ipv4_addrs or ipv6_addrs
 
     reserved = [0, 0, 0]
     if node.wg_reserved:
@@ -333,35 +369,96 @@ def _outbound_naive(node: Node) -> Dict[str, Any]:
     }
 
 
-def _outbound_hy2(node: Node) -> Dict[str, Any]:
-    settings: Dict[str, Any] = {
-        "address": node.address,
-        "port": node.port,
-        "version": 2,
-        "password": node.password or "",
-    }
-    if node.hy2_obfs and node.hy2_obfs_password:
-        settings["obfs"] = node.hy2_obfs
-        settings["obfs-password"] = node.hy2_obfs_password
+def _apply_pin(tls: Dict[str, Any], node: Node) -> None:
+    """Trust a specific certificate by hash — what replaced `allowInsecure`.
 
+    xray removed `allowInsecure` and rejects the whole config if it is
+    emitted, so it never is. A node flagged "skip verification" with no pin
+    keeps full verification and fails its own handshake rather than taking
+    the proxy down; pin it to make a self-signed server work."""
+    pin = getattr(node, "pinned_cert_sha256", None)
+    if pin:
+        tls["pinnedPeerCertSha256"] = pin
+    elif getattr(node, "allow_insecure", False):
+        logger.warning(
+            "Node %s is flagged allow_insecure, which xray no longer supports — "
+            "pin its certificate to trust a self-signed server", getattr(node, "id", "?"),
+        )
+
+
+_HOP_PORTS_RE = re.compile(r"^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$")
+_HOP_INTERVAL_RE = re.compile(r"^\d{1,4}(-\d{1,4})?$")
+
+
+def hop_params(node: Node) -> Optional[Dict[str, str]]:
+    """The port range and interval (seconds) of a node that hops ports, or None.
+
+    Values that do not look like a port list / a seconds range are dropped
+    rather than written into a config xray would refuse to load."""
+    ports = (getattr(node, "hy2_hop_ports", None) or "").strip().replace(" ", "")
+    if not ports or not _HOP_PORTS_RE.match(ports):
+        return None
+    interval = (getattr(node, "hy2_hop_interval", None) or "").strip() or "10-30"
+    if not _HOP_INTERVAL_RE.match(interval):
+        interval = "10-30"
+    return {"ports": ports, "interval": interval}
+
+
+def _outbound_hy2(node: Node) -> Dict[str, Any]:
+    """Hysteria2 over xray's `hysteria` transport.
+
+    xray rejects the older shape (password under `settings`, no `network`)
+    with "not hysteria transport", so the auth lives in `hysteriaSettings`.
+    Salamander obfuscation is a UDP finalmask; the previous `settings.obfs`
+    keys were silently ignored, which left obfuscated servers unreachable.
+    """
     tls_cfg: Dict[str, Any] = {
         "serverName": node.sni or node.address,
-        "allowInsecure": node.allow_insecure,
+        "alpn": [a.strip() for a in node.alpn.split(",")] if node.alpn else ["h3"],
     }
     if node.fingerprint:
         tls_cfg["fingerprint"] = node.fingerprint
-    if node.alpn:
-        tls_cfg["alpn"] = [a.strip() for a in node.alpn.split(",")]
+    _apply_pin(tls_cfg, node)
+
+    stream: Dict[str, Any] = {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": tls_cfg,
+        "hysteriaSettings": {"version": 2, "auth": node.password or ""},
+        "sockopt": {"mark": 255},
+    }
+    if node.hy2_obfs and node.hy2_obfs_password:
+        if node.hy2_obfs == "salamander":
+            stream["finalmask"] = {
+                "udp": [{"type": "salamander", "settings": {"password": node.hy2_obfs_password}}],
+            }
+        else:
+            logger.warning(
+                "Node %s: hysteria2 obfs %r is not supported by xray — emitted without it",
+                node.id, node.hy2_obfs,
+            )
+    hop = hop_params(node)
+    if hop:
+        # The `udphop` mask in remote mode moves the DESTINATION port across the
+        # range (the server redirects the range to its port). Measured on xray
+        # 26.10.31: `quicParams.udpHop` is accepted but never hops, and the local
+        # mode only changes the source port, so neither is used. Order matters:
+        # obfuscation first, hopping after it.
+        fm = stream.setdefault("finalmask", {})
+        fm.setdefault("udp", []).append({
+            "type": "udphop",
+            "settings": {
+                "mode": "intervalremote",
+                "interval": hop["interval"],
+                "remotePorts": hop["ports"],
+            },
+        })
 
     return {
         "tag": f"node-{node.id}",
         "protocol": "hysteria",
-        "settings": settings,
-        "streamSettings": {
-            "security": "tls",
-            "tlsSettings": tls_cfg,
-            "sockopt": {"mark": 255},
-        },
+        "settings": {"version": 2, "address": node.address, "port": node.port},
+        "streamSettings": stream,
     }
 
 
@@ -382,17 +479,17 @@ def _apply_chain(
     """Wire `node`'s chain into the config — RECURSIVELY, for multi-hop.
 
     `node.chain_node_id` is the relay this node dials through. We point
-    `node`'s proxySettings at that relay's outbound tag, build the relay's
+    `node`'s `sockopt.dialerProxy` at that relay's outbound tag, build the relay's
     outbound if it isn't in the config yet, then RECURSE so the relay's own
     chain is wired too. That gives a full path, e.g. exit → mid → entry
     (`WG2 → WG1 → VLESS`). Previously only the first hop was wired and any
     deeper relay silently dialed direct, collapsing a 3-node chain to 2.
 
-    `proxySettings.transportLayer = true` is xray's documented chaining
-    knob — it's converted to `sockopt.dialerProxy`, so the relay carries
+    `sockopt.dialerProxy` is xray's chaining knob, so the relay carries
     this outbound's traffic over its own transport (works for vless /
     trojan / ss / wireguard / …; the WireGuard-over-WireGuard hop is valid
-    config but worth runtime-testing). Self-chains, cycles, and an
+    config but worth runtime-testing). The older `proxySettings` form is a
+    hard error since xray 26.9. Self-chains, cycles, and an
     over-deep chain are truncated with a warning instead of emitting a
     broken (or infinite) config.
     """
@@ -444,12 +541,71 @@ def _apply_chain(
         outbounds.insert(0, chain_ob)
         used_ids.add(chain.id)
 
-    outbound["proxySettings"] = {"tag": chain_tag, "transportLayer": True}
+    outbound.setdefault("streamSettings", {}).setdefault("sockopt", {})["dialerProxy"] = chain_tag
 
     # Recurse so the relay's OWN chain is wired (multi-hop). `_seen` grows
     # per branch → cycles truncate; `_depth` caps runaway nesting.
     _apply_chain(chain, chain_ob, outbounds, used_ids, all_nodes,
                  _seen | {chain.id}, _depth + 1)
+
+
+def _apply_fragment(outbounds: List[Dict[str, Any]], settings_map: Dict[str, str]) -> None:
+    """Route every proxy ENTRY hop through a TLS-fragmenting freedom outbound.
+
+    Client-side anti-DPI: xray's `freedom` outbound with a `fragment` block
+    splits the TLS ClientHello into pieces so a censor's SNI/keyword filter
+    can't match it in one packet. The server is unaware — it reassembles the
+    stream normally — so this is entirely PiTun's (the client's) call.
+
+    Wiring: a real proxy dials through the fragment outbound via
+    `sockopt.dialerProxy`. We only touch ENTRY hops — outbounds that dial the
+    internet directly (no `dialerProxy`). A chained node's own outbound has
+    `dialerProxy` (it dials through its relay), so it is skipped; the relay
+    outbound at the bottom of the chain IS the entry hop and gets fragmented.
+    freedom/blackhole/dns and the reserved direct/block/dns-out tags are never
+    touched.
+
+    Off by default. Enable with Settings `xray_fragment_enabled=true`.
+    """
+    if settings_map.get("xray_fragment_enabled", "false").lower() != "true":
+        return
+
+    packets = settings_map.get("xray_fragment_packets", "tlshello") or "tlshello"
+    length = settings_map.get("xray_fragment_length", "100-200") or "100-200"
+    interval = settings_map.get("xray_fragment_interval", "10-20") or "10-20"
+
+    # hysteria is QUIC/UDP: a TCP fragmenter has nothing to fragment there.
+    _NON_PROXY = {"freedom", "blackhole", "dns", "hysteria"}
+    _RESERVED_TAGS = {"direct", "block", "blocked", "dns-out", "fragment", "api"}
+
+    touched = False
+    for ob in outbounds:
+        if ob.get("protocol") in _NON_PROXY or ob.get("tag") in _RESERVED_TAGS:
+            continue
+        # Only the hop that actually dials out — a hop with a dialerProxy
+        # tunnels through another outbound, so fragmenting it is a no-op at
+        # best and a double-dialer conflict at worst.
+        if (ob.get("streamSettings") or {}).get("sockopt", {}).get("dialerProxy"):
+            continue
+        stream = ob.setdefault("streamSettings", {})
+        sockopt = stream.setdefault("sockopt", {})
+        sockopt["dialerProxy"] = "fragment"
+        touched = True
+
+    if not touched:
+        return
+
+    # The fragment outbound is the one that now makes the real connection,
+    # so it carries the SO_MARK that keeps it out of the TPROXY loop.
+    outbounds.append({
+        "tag": "fragment",
+        "protocol": "freedom",
+        "settings": {
+            "domainStrategy": "AsIs",
+            "fragment": {"packets": packets, "length": length, "interval": interval},
+        },
+        "streamSettings": {"sockopt": {"mark": 255}},
+    })
 
 
 def _build_outbound(node: Node) -> Dict[str, Any]:
@@ -546,19 +702,18 @@ def _routing_rule_to_xray(
         xray_rule["ip"] = [f"geoip:{v}" for v in values]
     elif rule.rule_type == "geosite":
         xray_rule["domain"] = [f"geosite:{v}" for v in values]
-
     elif rule.rule_type == "mac":
         # MAC is handled by nftables, not xray routing
         return None
     else:
         return None
+
     return xray_rule
 
 
 def _build_dns_section(
     settings_map: Dict[str, str],
     dns_rules: Optional[List[DNSRule]] = None,
-    active_node_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build the xray DNS configuration section from settings and DNS rules."""
     dns_mode = settings_map.get("dns_mode", "plain")
@@ -691,7 +846,7 @@ def _build_dns_section(
             ip = m.group(1)
             dns_hosts[ip] = ip  # identity mapping — skip resolution
 
-    # Pin every DNS server entry to a fixed outbound (since v1.3.5).
+    # Pin every DNS server entry to the `direct` outbound (since v1.3.5).
     #
     # xray-core treats DNS-upstream connections as regular outbound dials
     # — meaning they pass through the user's routing rules. That's a
@@ -700,63 +855,31 @@ def _build_dns_section(
     # captures the DNS resolver's own connection to 8.8.8.8:53,
     # tunnelling it through the active node. If the node is flaky or
     # under handshake-failure, the whole DNS layer dies — and with
-    # broken DNS, nothing else resolves either. Observed in the wild on
-    # the 1256-node burn-in (192.168.1.4): user added "Port Range
-    # 0-65535 → proxy", node had a transient handshake failure, the
-    # whole API and proxy locked up.
+    # broken DNS, nothing else resolves either. A catch-all proxy rule
+    # plus one transient handshake failure is enough to lock up both
+    # the API and the proxy.
     #
     # The `outboundTag` field on a DNS server config is exactly the
     # escape hatch — xray short-circuits routing for THAT server's
-    # upstream connections and dials via the named outbound.
-    #
-    # ── v1.4.7 (finding 3.1) ─────────────────────────────────────────
-    # The outbound is now `dns_route_via`-configurable:
-    #   * "direct" (default) — DNS over the host's normal path, robust
-    #     against VPN flakiness. The previous blanket pin.
-    #   * "proxy" — DNS rides the active node's outbound (same as a
-    #     `proxy` routing rule, but applied *only* to the resolver
-    #     connection, not the user's traffic that followed the
-    #     resolved IP). Hides cleartext DNS / DoH-from-the-box from
-    #     the local ISP — important under aggressive DPI regimes.
-    #   * "node:<id>" — DNS rides a *specific* node's outbound, useful
-    #     when the operator wants DNS-via-stable-VPS but proxy traffic
-    #     via a different / rotating node.
-    # Any other value falls back to "direct" (the safe default).
-    dns_route_via = settings_map.get("dns_route_via", "direct").strip() or "direct"
-    if dns_route_via not in ("direct", "proxy") and not dns_route_via.startswith("node:"):
-        # Unrecognised → safe default (don't ever emit a stray tag,
-        # xray would error out on reload and the box would go dark).
-        dns_route_via = "direct"
-    # `proxy` means "ride the active node's outbound" — but the generated
-    # config has NO outbound tagged `proxy` (outbounds are `direct`,
-    # `block`, `dns-out`, `node-<id>`). Emitting `outboundTag: proxy`
-    # would cause xray's "not all dependencies are resolved" fatal error.
-    # We resolve to the concrete `node-<id>` tag here (or `direct` when
-    # no active node is set). Same fix applied to the port-53 routing
-    # rule below.
-    if dns_route_via == "proxy":
-        dns_outbound_tag = f"node-{active_node_id}" if active_node_id else "direct"
-    elif dns_route_via.startswith("node:"):
-        try:
-            nid = int(dns_route_via.split(":", 1)[1])
-            dns_outbound_tag = f"node-{nid}"
-        except (ValueError, IndexError):
-            dns_outbound_tag = "direct"
-    else:
-        dns_outbound_tag = "direct"
-
+    # upstream connections and dials via the named outbound. Pinning
+    # to `direct` means DNS always resolves over the host's normal
+    # network path, regardless of what the user's routing rules say.
+    # Privacy-wise this is the standard pattern: DNS-over-TCP/53 is
+    # not encrypted anyway, and forcing it through the proxy adds a
+    # circular dependency (the proxy node's address itself needs to
+    # be resolved before the proxy can be used).
     pinned_servers: List[Any] = []
     for srv in dns_servers:
         if srv == "fakedns":
             pinned_servers.append(srv)  # sentinel — no outbound
             continue
         if isinstance(srv, str):
-            pinned_servers.append({"address": srv, "outboundTag": dns_outbound_tag})
+            pinned_servers.append({"address": srv, "outboundTag": "direct"})
         elif isinstance(srv, dict):
             # Preserve any existing outboundTag (currently none, but
             # defensive against future per-server overrides).
             if "outboundTag" not in srv:
-                srv = {**srv, "outboundTag": dns_outbound_tag}
+                srv = {**srv, "outboundTag": "direct"}
             pinned_servers.append(srv)
         else:
             pinned_servers.append(srv)  # unknown shape — leave alone
@@ -832,10 +955,14 @@ def resolve_active_circle(circles, active_node_id):
     return None, None
 
 
-# Live-tunnel speed-probe inbound (loopback). Only useful when a node is
-# active; the top routing rule below pins it to the active outbound, so a
-# live-tunnel measurement reuses the session that's already up. Ported from
-# upstream DaveBugg/PiTun v1.5.1.
+# Loopback SOCKS inbound the backend uses to speed-test the ACTIVE node
+# through the LIVE tunnel instead of spinning a second temp xray. A temp
+# instance re-opens the node's outbound — for WireGuard that means a SECOND
+# session with the same peer key, which the server can only hold once, so the
+# temp test and the live tunnel fight and the reading fails (and the live
+# tunnel is briefly disrupted). This inbound is force-routed to the active
+# outbound (see the top routing rule), so measuring through it reuses the
+# session that's already up. Present only when there's an active node.
 SPEED_PROBE_PORT = 10809
 SPEED_PROBE_TAG = "speed-probe"
 
@@ -907,7 +1034,7 @@ def generate_config(
         )
 
     # DNS section (full, with rules)
-    dns_section = _build_dns_section(settings_map, dns_rules, active_node.id if active_node else None)
+    dns_section = _build_dns_section(settings_map, dns_rules)
 
     # Sniffing destOverride: include fakedns if enabled
     sniff_dest = ["http", "tls"]
@@ -978,7 +1105,6 @@ def generate_config(
 
     # Live-tunnel speed-probe inbound (loopback). Only useful when a node is
     # active; the top routing rule below pins it to the active outbound.
-    # Ported from upstream DaveBugg/PiTun v1.5.1.
     if active_node is not None:
         inbounds.append({
             "tag": SPEED_PROBE_TAG,
@@ -1065,6 +1191,20 @@ def generate_config(
     if inbound_mode in ("tun", "both"):
         inbounds.insert(0, _build_tun_inbound(settings_map))
 
+    # TCP keep-alive on the LAN-facing proxy inbounds. Xray leaves inbound
+    # keep-alive off by default, so with `connIdle` at an hour a client
+    # that vanished without a FIN (slept laptop, dropped NAT mapping) would
+    # hold its slot for that whole hour. Probing detects the dead ones
+    # without touching connections that are merely idle. Outbounds are left
+    # alone — xray already keeps those alive at Chrome's 45 s/45 s.
+    keepalive = inbound_keepalive(settings_map)
+    if keepalive:
+        for inbound in inbounds:
+            if inbound.get("tag") not in ("socks-in", "http-in"):
+                continue
+            stream = inbound.setdefault("streamSettings", {})
+            stream.setdefault("sockopt", {}).update(keepalive)
+
     # Outbounds
     outbounds: List[Dict[str, Any]] = []
 
@@ -1137,27 +1277,23 @@ def generate_config(
                         except Exception as exc:
                             logger.warning("Balancer node %d skip: %s", nid, exc)
 
+    _apply_fragment(outbounds, settings_map)
+
     outbounds += [
-        {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIP"}, "streamSettings": {"sockopt": {"mark": 255}}},
+        {"tag": "direct", "protocol": "freedom", "streamSettings": {"sockopt": {"mark": 255, "domainStrategy": "UseIP"}}},
         {"tag": "block", "protocol": "blackhole"},
-        # `proxySettings.tag: direct` forces every DNS-upstream dial
-        # (the connection to 8.8.8.8:53 / 1.1.1.1:53 / etc) through
-        # the `direct` outbound, bypassing the user's routing rules
-        # entirely. Without this, a "catch-all → proxy" rule (e.g.
-        # `port: 0-65535 → proxy`, `geoip:!ru → proxy`) intercepts
-        # the DNS dial too and tunnels it through the active VPN
-        # node — if that node has any handshake issue, DNS dies and
-        # nothing else can resolve. Observed in the wild on
-        # 192.168.1.4 during 1.3.4 burn-in (1256-node subscription
-        # + Port Range 0-65535 → proxy rule). Pair with the
-        # `outboundTag: direct` per-DNS-server pin in `_build_dns_section`
-        # — that one wins for any internal xray query that goes
-        # through the routing engine BEFORE hitting the outbound.
+        # The DNS-upstream dial (8.8.8.8:53 / 1.1.1.1:53 / etc) must not be
+        # caught by a user "catch-all → proxy" rule and tunnelled through the
+        # active node — if that node has any handshake issue, DNS dies and
+        # nothing else can resolve. Two things keep it direct: the system
+        # `port 53 → direct` rule placed ahead of user rules below, and the
+        # per-DNS-server `outboundTag: direct` pin in `_build_dns_section`.
+        # (The outbound-level `proxySettings` that used to back this up is a
+        # hard error since xray 26.9.)
         {
             "tag": "dns-out",
             "protocol": "dns",
             "streamSettings": {"sockopt": {"mark": 255}},
-            "proxySettings": {"tag": "direct"},
         },
     ]
 
@@ -1211,8 +1347,8 @@ def generate_config(
     # so a user `port: 0-65535 → proxy` (or `geoip:!ru → proxy`) rule
     # would otherwise capture the DNS dial and tunnel it through the
     # active VPN node, breaking the resolver when that node has any
-    # handshake issue. Burn-in on 192.168.1.4 nailed the exact case:
-    # add the catch-all rule → kill DNS → kill everything.
+    # handshake issue: add the catch-all rule → kill DNS → kill
+    # everything.
     #
     # Why we don't pin via dns-out's `proxySettings.tag`: that field
     # chains outbounds (dns-out's resolved data flows through direct)
@@ -1220,27 +1356,10 @@ def generate_config(
     # Why we don't strip dangerous user rules: surgical user-rule
     # rewriting is brittle and user-surprising. A system rule that
     # always wins is robust and stays explicit in the generated config.
-    # `dns_route_via` (v1.4.7 — finding 3.1): the `outboundTag` of
-    # this rule mirrors the same computation used in
-    # `_build_dns_section`. We recompute here (cheap string check)
-    # rather than carry a parameter through the helper signatures —
-    # otherwise _build_dns_section would have to thread the value
-    # through every caller. Drift risk: low, both compute the same
-    # way. Tests cover both paths.
-    _drv = settings_map.get("dns_route_via", "direct").strip() or "direct"
-    if _drv == "proxy":
-        _dns_sys_tag = f"node-{active_node.id}" if active_node else "direct"
-    elif _drv.startswith("node:"):
-        try:
-            _dns_sys_tag = f"node-{int(_drv.split(':', 1)[1])}"
-        except (ValueError, IndexError):
-            _dns_sys_tag = "direct"
-    else:
-        _dns_sys_tag = "direct"
     routing_rules.append({
         "type": "field",
         "port": "53",
-        "outboundTag": _dns_sys_tag,
+        "outboundTag": "direct",
     })
 
     if mode == "bypass":
@@ -1317,7 +1436,6 @@ def generate_config(
     # Force the speed-probe inbound straight to the active outbound, ahead of
     # every other rule, so a live-tunnel measurement always egresses via the
     # active node (never diverted by a geoip/domain/set rule).
-    # Ported from upstream DaveBugg/PiTun v1.5.1.
     if active_node is not None:
         routing_rules.insert(0, {
             "type": "field",
@@ -1337,7 +1455,11 @@ def generate_config(
             "tag": "api",
             "services": ["StatsService", "HandlerService", "RoutingService"],
         },
+        # Level 0 carries the connection-lifetime timeouts; without it
+        # xray's defaults apply and a pooled LAN connection idle for
+        # 5 minutes gets killed under the client. See core/xray_policy.py.
         "policy": {
+            "levels": {"0": level_zero(settings_map)},
             "system": {
                 "statsOutboundUplink": True,
                 "statsOutboundDownlink": True,
@@ -1399,19 +1521,6 @@ _VALIDATION_HINTS: list[tuple[str, str]] = [
         "vanilla XTLS/Xray-core which doesn't implement `protocol: tun` "
         "(that's a sing-box feature). Switch Inbound Mode back to "
         "TPROXY in the Dashboard.",
-    ),
-    # A routing rule or DNS server entry references an outbound/balancer
-    # tag that doesn't exist in the outbounds/balancers sections.
-    # Typically caused by dns_route_via=proxy without an active node,
-    # a routing rule pointing at a node:<id> that was deleted/disabled,
-    # or a balancer:<id> referencing a disabled BalancerGroup.
-    (
-        r"not all dependencies are resolved",
-        "A routing rule or DNS server references an outbound/balancer tag "
-        "that does not exist. Common causes: a routing rule uses node:<id> "
-        "for a deleted/disabled node, a balancer group is disabled, or "
-        "DNS Route Via is set to 'proxy' while no active node is selected. "
-        "Check Routing rules and Settings → DNS Route Via.",
     ),
 ]
 
@@ -1556,6 +1665,23 @@ async def write_config(
     config: Dict[str, Any], *, validate: bool = True,
     settings_map: Optional[Dict[str, str]] = None,
 ) -> Optional[tuple[str, str]]:
+    """Serialize + validate the xray config, serialized against itself.
+
+    Several independent writers exist (API reload, circle rotation,
+    failover, crash watchdog). Overlapping runs used to truncate the same
+    file in place and validate each other's half-written JSON. The lock
+    covers write AND `xray run -test`, since the test re-reads the path.
+    """
+    async with _write_lock():
+        return await _write_config_unlocked(
+            config, validate=validate, settings_map=settings_map,
+        )
+
+
+async def _write_config_unlocked(
+    config: Dict[str, Any], *, validate: bool = True,
+    settings_map: Optional[Dict[str, str]] = None,
+) -> Optional[tuple[str, str]]:
     """Serialize config to JSON, write to disk, then (when `validate`)
     run a pre-flight `xray run -test` to catch obviously-invalid configs
     (typically a routing rule referencing a geosite/geoip tag absent
@@ -1578,8 +1704,19 @@ async def write_config(
     def _write() -> None:
         path = Path(settings.xray_config_path)
         os.makedirs(path.parent, exist_ok=True)
-        with open(path, "w") as f:
+        # Write to a sibling temp file and rename over the target.
+        # `open(path, "w")` truncates in place, so a concurrent writer
+        # (scheduled circle rotation vs. an operator hitting "Reload
+        # config", failover vs. the watchdog) could interleave into a
+        # torn JSON file — which the `-test` below then validated, or
+        # worse, which xray was asked to load. os.replace is atomic on
+        # the same filesystem, so every reader sees one whole config.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w") as f:
             json.dump(config, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     await asyncio.to_thread(_write)
     logger.info("xray config written to %s", settings.xray_config_path)

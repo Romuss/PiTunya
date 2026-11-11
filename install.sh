@@ -111,7 +111,7 @@
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
-GITHUB_REPO="${PITUN_REPO:-Romuss/PiTunya}"
+GITHUB_REPO="Romuss/PiTunya"
 INSTALL_DIR="${PITUN_DIR:-/opt/pitun}"
 VERSION="${PITUN_VERSION:-latest}"
 USE_BUILD="${PITUN_BUILD:-0}"
@@ -138,6 +138,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+# Colour only for a person at a terminal. Piped (the update agent reads this
+# output and puts the step text into a JSON status file), the escape codes are
+# noise that also made that JSON invalid.
+if [[ ! -t 1 ]]; then RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''; fi
 
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 step()  { echo -e "${BLUE}[STEP]${NC}  $*"; }
@@ -573,12 +577,22 @@ fi
 # Use `sort -V` (version sort) as a cheap semver comparator. Strips a
 # leading `v`, then asks whether running > resolved. If yes, abort.
 # Same-version (running == resolved) handled separately below.
+#
+# The prerelease separator is swapped for `~` first. `sort -V` is not semver
+# aware: it reads `1.6.0-beta.3` as `1.6.0` plus extra characters and sorts it
+# AFTER the finished release, so upgrading from any beta to the release it was
+# a beta of looked like a downgrade and was refused — which is the single most
+# common upgrade there is. `~` is the one character version sort orders before
+# end-of-string, which is exactly the semver rule that a prerelease precedes
+# the version it leads to.
 if [[ "$IS_UPDATE" == "1" \
       && -n "$RUNNING_VERSION" && "$RUNNING_VERSION" != "?" ]]; then
     _running_num="${RUNNING_VERSION#v}"
     _target_num="${DISPLAY_VERSION#v}"
+    _running_cmp="${_running_num/-/\~}"
+    _target_cmp="${_target_num/-/\~}"
     if [[ "$_running_num" != "$_target_num" \
-          && "$(printf '%s\n%s\n' "$_running_num" "$_target_num" | sort -V | tail -1)" == "$_running_num" ]]; then
+          && "$(printf '%s\n%s\n' "$_running_cmp" "$_target_cmp" | sort -V | tail -1)" == "$_running_cmp" ]]; then
         echo ""
         warn "════════════════════════════════════════════════════════════════════"
         warn "  ⛔ DOWNGRADE DETECTED — aborting."
@@ -818,13 +832,21 @@ if [[ "$SKIP_HOST_PREP" != "1" ]]; then
         sqlite3 git
 
     # avahi-daemon binds UDP/5353 — same port xray uses for DNS forwarding.
-    if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+    # Stopping the service is not enough: the SOCKET unit re-activates it, and
+    # Debian also ships a D-Bus activation file, so the daemon comes back
+    # within seconds and still owns 5353. Mask both units, then stop again —
+    # masking never kills a process that is already running.
+    if systemctl is-active --quiet avahi-daemon 2>/dev/null \
+       || systemctl is-active --quiet avahi-daemon.socket 2>/dev/null; then
         info "Disabling avahi-daemon (frees UDP/5353)…"
+        run systemctl disable --now avahi-daemon avahi-daemon.socket || true
+        run systemctl mask avahi-daemon avahi-daemon.socket || true
         run systemctl stop avahi-daemon avahi-daemon.socket || true
-        run systemctl disable avahi-daemon avahi-daemon.socket || true
-        run systemctl mask avahi-daemon || true
+        if pgrep -x avahi-daemon >/dev/null 2>&1; then
+            warn "avahi-daemon survived masking — killing it (it holds UDP/5353)."
+            run pkill -x avahi-daemon || true
+        fi
     fi
-
     # Whoever holds 5353, say so: xray's DNS inbound will fail to bind and
     # name resolution through PiTun silently stops working.
     # xray excluded, because on an upgrade xray is exactly what holds this
@@ -1021,8 +1043,10 @@ fi
 # was skipped on every upgrade of an affected box.
 #
 # BACKUP_PATH stays empty until the file is on disk and non-empty. It used to
-# be assigned before the attempt, so the summary's fallback could never fire
-# and the post-upgrade advice named a rollback file that did not exist.
+# be assigned before the attempt, so the summary's `${BACKUP_PATH:-no
+# snapshot}` fallback could never fire and the post-upgrade advice named a
+# rollback file that did not exist — discovered, if ever, by someone whose
+# upgrade had just gone wrong.
 BACKUP_PATH=""
 if [[ "$IS_UPDATE" == "1" && "$DRY_RUN" != "1" ]]; then
     step "Backing up SQLite (pre-upgrade snapshot)"
@@ -1030,6 +1054,8 @@ if [[ "$IS_UPDATE" == "1" && "$DRY_RUN" != "1" ]]; then
     _bak_staged="$INSTALL_DIR/data/.pre-upgrade-snapshot.db"
     rm -f "$_bak_staged"
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'pitun-backend'; then
+        # sqlite's online backup API rather than `cp`: the backend is running
+        # and a raw copy of a live database can tear.
         if docker exec pitun-backend python -c "
 import sqlite3
 src = sqlite3.connect('/app/data/pitun.db')
@@ -1072,9 +1098,9 @@ if [[ "$USE_BUILD" != "1" ]]; then
         # while the release tarball itself was bit-perfect — see the
         # post-mortem in notes.md). The Dockerfile also pins these at
         # build-time; this is the runtime check on the target device.
-        XRAY_SHA_AMD64="${PITUN_XRAY_SHA_AMD64:-64d46afb80adea1bf97a0d467e83f4a9ac1ebd0995891e84bca3f1a1d1affb1d}"
-        XRAY_SHA_ARM64="${PITUN_XRAY_SHA_ARM64:-4b8af237444801bf17b3dc10a1c5c24581fbe3d433eba3d78c6c3a0da1df56fc}"
-        XRAY_SHA_ARM="${PITUN_XRAY_SHA_ARM:-63a2fb09b928d1bde3a0df9b663d1936f13b53cd0db40c8ce85e4accdc779860}"
+        XRAY_SHA_AMD64="${PITUN_XRAY_SHA_AMD64:-cc4b84d3069569f297a61f04b914f2bb37e9d202fd7b84cb50def1fc30fd40e1}"
+        XRAY_SHA_ARM64="${PITUN_XRAY_SHA_ARM64:-5939649960deaf535bcd5f7ce0467a2b1d63b72a2758a6f42eade714ae8d5328}"
+        XRAY_SHA_ARM="${PITUN_XRAY_SHA_ARM:-2a893d5b5f7cf5a33168c102f01771ed69a674abeab0b8fb085b1ddf098cf52c}"
 
         # Wrap docker load + xray-sha verification in a retry loop. Each
         # attempt: nuke any stale tag, load fresh, run sha256sum on the
@@ -1126,7 +1152,7 @@ if [[ "$USE_BUILD" != "1" ]]; then
         }
 
         if ! load_backend_with_verify; then
-            error "Backend image's xray binary is corrupted after $((attempt:-3)) load attempts.
+            error "Backend image's xray binary is corrupted after 3 load attempts.
 
 This usually means the host's filesystem or storage hardware is
 flipping bytes during write — the release tarball itself is fine
@@ -1240,12 +1266,38 @@ fi
 step "Starting Docker stack"
 if [[ "$DRY_RUN" != "1" ]]; then
     cd "$INSTALL_DIR"
+
+    # TLS cert MUST exist before nginx starts. `nginx.conf` has carried an
+    # unconditional `listen 443 ssl` since v1.5.2, and nginx aborts outright
+    # when the cert files are missing — taking port 80 down with it, since
+    # nginx is the only service publishing either port. The symptom is a
+    # crash-looping container and a panel unreachable on both ports, which
+    # reads as "the installer did nothing". Idempotent: reuses the existing
+    # CA and reissues the leaf only if the box's IP changed.
+    if [[ -f "$INSTALL_DIR/scripts/gen-cert.sh" ]]; then
+        bash "$INSTALL_DIR/scripts/gen-cert.sh" \
+            || warn "Certificate generation failed — nginx will not start and the panel will be unreachable on 80 and 443. Run scripts/gen-cert.sh manually, then: docker compose up -d"
+    else
+        warn "scripts/gen-cert.sh missing — nginx cannot start without a TLS cert."
+    fi
+
     if [[ "$USE_BUILD" == "1" ]]; then
         # Source-build path: needs constant internet for pip + npm pulls.
         warn "Build mode — Docker will rebuild images. This needs reliable internet."
         docker compose up -d --build
     else
         docker compose up -d
+    fi
+    # The frontend container bind-mounts nginx-spa.conf and dist/. `up -d` does not
+    # recreate it when only those files changed, so it could keep serving the old
+    # config (or an unlinked dist). A restart is a blink for the page, nothing more.
+    docker restart pitun-frontend >/dev/null 2>&1 || true
+    # Router-mode sidecars are not compose services (the backend starts them
+    # on demand), so `compose up` never builds them. Boxes installed through
+    # this path had no dnsmasq/hostapd image at all and router mode failed on
+    # first enable. Warn-only: a box without them is still a fine proxy.
+    if [ -f "$INSTALL_DIR/scripts/build-sidecars.sh" ]; then
+        bash "$INSTALL_DIR/scripts/build-sidecars.sh" "$INSTALL_DIR" "docker" || true
     fi
 
     # The panel's Update button writes a request file; a host-side systemd
@@ -1303,8 +1355,31 @@ fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+# Don't claim success without looking. A container that starts and then dies
+# leaves `compose up -d` reporting success, so the installer used to print
+# "PiTun is up" over a crash-looping nginx and an unreachable panel.
+STACK_OK=1
+if [[ "$DRY_RUN" != "1" ]]; then
+    for _ in $(seq 1 20); do
+        curl -sk -o /dev/null --max-time 3 "https://localhost/health" && break
+        curl -s  -o /dev/null --max-time 3 "http://localhost/health"  && break
+        sleep 2
+    done
+    DEAD=$(docker compose -f "$INSTALL_DIR/docker-compose.yml" ps \
+             --format '{{.Name}} {{.State}}' 2>/dev/null \
+           | awk '$2 != "running" {print $1}' | tr '\n' ' ')
+    if [[ -n "${DEAD// /}" ]]; then
+        STACK_OK=0
+        warn "These containers are not running: ${DEAD}"
+        warn "Inspect with: docker compose -f $INSTALL_DIR/docker-compose.yml logs"
+    fi
+fi
+
 echo ""
-if [[ "$IS_UPDATE" == "1" ]]; then
+if [[ "$STACK_OK" != "1" ]]; then
+    warn "Install finished, but the stack is NOT healthy — see the warnings above."
+elif [[ "$IS_UPDATE" == "1" ]]; then
     info "PiTun upgraded: $RUNNING_VERSION → $DISPLAY_VERSION"
 else
     info "PiTun is up."
@@ -1325,6 +1400,8 @@ if [[ "$IS_UPDATE" == "1" ]]; then
         echo "  • If anything broke: $BACKUP_PATH"
         echo "    can be restored: stop backend, replace data/pitun.db, start backend"
     else
+        # Saying "restore the snapshot" when none was taken is worse than
+        # saying nothing: it is read at the exact moment it matters.
         echo "  • NOTE: no pre-upgrade snapshot was taken — see the warnings"
         echo "    above. Older snapshots, if any: $INSTALL_DIR/data-backup-pre-*.db"
     fi

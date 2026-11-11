@@ -26,6 +26,10 @@ class RoutingSetSpec:
 logger = logging.getLogger(__name__)
 
 _TABLE = "pitun"
+# Router-mode NAT/forward lives in its OWN table so it has an independent
+# lifecycle and cannot interfere with the TPROXY table above: applying or
+# tearing down one never touches the other.
+_ROUTER_TABLE = "pitun_router"
 
 # Private IPv4 ranges to bypass
 _PRIVATE_RANGES = [
@@ -484,3 +488,264 @@ table inet {_TABLE} {{
 
 
 nftables_manager = NftablesManager()
+
+
+# ── Router mode: NAT + forward filter ────────────────────────────────────────
+#
+# Only used when `operating_mode = router`. In the default gateway mode the
+# upstream router does this and these chains are absent entirely.
+#
+# Deliberately a separate table (`inet pitun_router`): the TPROXY table is
+# load-bearing for the proxy and is rewritten on every rule/DNS/settings edit,
+# so entangling the router dataplane with it would mean one bad router apply
+# could take out proxying too.
+
+_IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+
+
+def _validate_iface(name: str) -> bool:
+    """Interface names go into an nft script, so constrain them tightly.
+    Linux caps names at IFNAMSIZ-1 = 15 chars."""
+    return bool(name and _IFACE_RE.match(name))
+
+
+async def apply_router_nat(
+    wan: str,
+    lan: str,
+    *,
+    wan_allow_tcp: Sequence[int] = (),
+    wan_allow_udp: Sequence[int] = (),
+) -> bool:
+    """Masquerade LAN→WAN and filter forwarding, statefully.
+
+    The forward chain defaults to DROP: a router that forwards everything by
+    default is not a router, it's a hole. Return traffic is allowed by
+    conntrack state rather than by an open policy, so the WAN side can't
+    initiate into the LAN.
+
+    The input chain gives the uplink a clean posture: **nothing new arrives
+    from the internet**. Only replies to connections the box itself opened are
+    accepted, so every local service — the panel, SSH, and xray's DNS / SOCKS /
+    HTTP inbounds, all of which bind 0.0.0.0 — is reachable over the LAN and
+    invisible from the WAN. That matters because gateway mode had no
+    internet-facing interface at all, so binding everything to 0.0.0.0 was
+    harmless; an uplink turns the same listeners into an open resolver (abused
+    for DNS amplification) and open proxies.
+
+    It's a blanket `ct state new drop` on the WAN rather than a list of ports
+    to close, because a list has to be maintained: add a service later, forget
+    its port, and it's exposed. The blanket rule covers whatever we add next.
+
+    Two exceptions are required for the uplink itself to work: DHCP-client
+    replies (they arrive as NEW, not RELATED, so conntrack won't admit them),
+    and the ICMP types PMTU discovery and traceroute rely on — dropping those
+    produces connections that hang rather than fail. `wan_allow_tcp` /
+    `wan_allow_udp` open specific ports when something is deliberately
+    published.
+
+    The chain's policy stays ACCEPT and every drop is scoped to `iifname wan`:
+    the LAN path is untouched, so tightening the uplink cannot lock the
+    operator out of a box they administer over the LAN.
+    """
+    if not (_validate_iface(wan) and _validate_iface(lan)):
+        logger.error("Router NAT: invalid interface names (wan=%r lan=%r)", wan, lan)
+        return False
+    if wan == lan:
+        logger.error("Router NAT: wan and lan must differ (both %r)", wan)
+        return False
+
+    tcp_ports = sorted({int(p) for p in wan_allow_tcp if 0 < int(p) < 65536})
+    udp_ports = sorted({int(p) for p in wan_allow_udp if 0 < int(p) < 65536})
+    rules = [
+        "        # The uplink brings its own address up over DHCP, and those",
+        "        # replies arrive as NEW — conntrack alone would not admit them.",
+        f'        iifname "{wan}" udp sport 67 udp dport 68 counter name "wan_dhcp_in" accept',
+        "        # PMTU discovery and traceroute fail by hanging rather than",
+        "        # erroring if these are dropped, which is miserable to debug.",
+        f'        iifname "{wan}" icmp type {{ echo-request, destination-unreachable, time-exceeded, parameter-problem }} accept',
+    ]
+    if tcp_ports:
+        rules.append(
+            f'        iifname "{wan}" tcp dport {{ {", ".join(map(str, tcp_ports))} }} accept'
+        )
+    if udp_ports:
+        rules.append(
+            f'        iifname "{wan}" udp dport {{ {", ".join(map(str, udp_ports))} }} accept'
+        )
+    rules += [
+        "        # Everything else arriving from the internet is refused. Every",
+        "        # local service — panel, SSH, xray's DNS/SOCKS/HTTP — stays",
+        "        # reachable over the LAN and invisible from the WAN.",
+        f'        iifname "{wan}" ct state new counter name "wan_blocked" drop',
+    ]
+    wan_service_rules = "\n".join(rules)
+
+    # The same ports again, in FORWARD — because opening them in INPUT is only
+    # half the story. Services on the host (SSH) are delivered locally and hit
+    # INPUT. The panel is an nginx container with published ports, so a request
+    # to this box's address is DNAT'd and then FORWARDED to the container: it
+    # never reaches INPUT at all, and the forward policy is drop.
+    #
+    # Observed exactly that: with both toggles on, SSH answered from the uplink
+    # and the panel did not.
+    #
+    # Scoped to `ct status dnat` AND the allowed ports, so this admits the
+    # services the operator published and not every other container port that
+    # happens to be mapped.
+    fwd = []
+    if tcp_ports:
+        fwd.append(
+            f'        iifname "{wan}" ct status dnat tcp dport '
+            f'{{ {", ".join(map(str, tcp_ports))} }} accept'
+        )
+    if udp_ports:
+        fwd.append(
+            f'        iifname "{wan}" ct status dnat udp dport '
+            f'{{ {", ".join(map(str, udp_ports))} }} accept'
+        )
+    wan_published_rules = ("\n" + "\n".join(fwd)) if fwd else ""
+
+    # One transaction, not two. `delete table` followed by a separate load
+    # meant a script that failed to parse left NO ruleset behind — the box
+    # ends up with neither the old firewall nor the new one. Declaring the
+    # table empty first makes `delete` valid even on the very first apply,
+    # which also stops that run logging an nft error for normal operation.
+    script = f"""
+table inet {_ROUTER_TABLE} {{}}
+delete table inet {_ROUTER_TABLE}
+
+table inet {_ROUTER_TABLE} {{
+    # Named counters so the two silent failure modes are observable rather
+    # than guessed at: a WAN that never gets an address (no DHCP replies) and
+    # a PMTU black hole (no ICMP getting back in) look identical from the
+    # outside — "the internet is broken" — without these.
+    counter wan_dhcp_in {{}}
+    counter wan_icmp_in {{}}
+    counter wan_blocked {{}}
+
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        # Everything leaving the uplink is rewritten to the box's WAN address.
+        oifname "{wan}" masquerade
+    }}
+
+    chain input {{
+        type filter hook input priority filter; policy accept;
+        # Counted BEFORE conntrack, and with no verdict of its own so the rule
+        # falls through. The ICMP this exists to observe — "fragmentation
+        # needed" for a flow already in progress — is exactly what conntrack
+        # marks RELATED, so a counter placed after the accept below can never
+        # see it. Sitting there, it read zero on a perfectly healthy link and
+        # could not have detected the PMTU black hole it was added for.
+        iifname "{wan}" meta l4proto icmp counter name "wan_icmp_in"
+        ct state established,related accept
+        ct state invalid drop
+{wan_service_rules}
+    }}
+
+    chain forward {{
+        type filter hook forward priority filter; policy drop;
+        # Replies and related flows for connections the LAN opened.
+        # Clamp TCP MSS to whatever the outgoing route can carry, before any
+        # verdict — the rule sets an option and falls through.
+        #
+        # A PPPoE uplink has an MTU of 1492, and a tagged VLAN 1496. LAN
+        # clients know nothing about that: they announce MSS 1460 for their
+        # own 1500-byte link, the server sends full-size segments, and those
+        # do not fit. The router cannot fragment them (DF is set), so it
+        # depends on ICMP "fragmentation needed" getting back to the sender —
+        # which is dropped often enough on the public internet that relying on
+        # it is not a plan. The symptom is the nastiest kind: DNS resolves,
+        # ping works, small pages load, and large transfers hang forever.
+        #
+        # `rt mtu` reads the actual route, so this is a no-op on a plain
+        # 1500-byte uplink and adjusts itself if the uplink changes shape.
+        # Unqualified by interface on purpose: the SYN and the SYN-ACK cross
+        # in opposite directions and both carry an MSS that needs clamping.
+        tcp flags syn tcp option maxseg size set rt mtu
+        ct state established,related accept
+        ct state invalid drop
+        # LAN out to the internet, and LAN talking to itself.
+        iifname "{lan}" oifname "{wan}" accept
+        iifname "{lan}" oifname "{lan}" accept
+        # The panel itself. PiTun's web UI is an nginx container with published
+        # ports, so a LAN request to this box's own address is DNAT'd to the
+        # container and then traverses FORWARD — not INPUT. Without this the
+        # first apply cuts every LAN device off the panel, which also means
+        # nobody can press the confirm button and the watchdog reverts a
+        # working router purely because we blocked the way to its own UI.
+        iifname "{lan}" ct status dnat accept{wan_published_rules}
+        # Container-to-container (the reverse proxy reaching the SPA) once
+        # bridge-nf-call-iptables puts bridged traffic through this hook.
+        iifname "br-*" oifname "br-*" accept
+        iifname "docker0" oifname "docker0" accept
+        # Containers reaching the internet (image pulls, panel healthchecks).
+        #
+        # These four rules are qualified on purpose. As bare `iifname docker0
+        # accept` / `oifname docker0 accept` they quietly undid the input
+        # chain: a packet arriving on the WAN and DNAT'd to a published port
+        # traverses FORWARD, not INPUT, so it matched `oifname docker0` and was
+        # accepted. xray binds its DNS, SOCKS and HTTP inbounds to 0.0.0.0, so
+        # that was an open resolver and an open proxy — and `wan_blocked` read
+        # zero the whole time, because nothing ever reached the drop.
+        iifname "docker0" oifname "{wan}" accept
+        iifname "br-*" oifname "{wan}" accept
+        # xray's tunnel interface, when the proxy is carrying the traffic.
+        iifname "xray0" accept
+        oifname "xray0" accept
+        # Anything else — notably WAN-initiated into the LAN — hits policy drop.
+    }}
+}}
+"""
+    # The delete now lives inside `script`, so replacing the ruleset is a
+    # single nft transaction. As two calls, a script that failed to parse left
+    # the box with no ruleset at all — worse than either the old or the new one
+    # — and the first-ever apply logged an nft error for deleting a table that
+    # was never supposed to exist yet.
+    ok = await _nft(script)
+    if ok:
+        logger.info("Router NAT applied: %s (LAN) -> %s (WAN)", lan, wan)
+    else:
+        logger.error("Router NAT apply FAILED for %s -> %s", lan, wan)
+    return ok
+
+
+async def remove_router_nat() -> bool:
+    """Drop the router table. Idempotent — an absent table is success.
+
+    Returns whether the table is now gone. The previous unconditional `True`
+    told teardown the firewall had come down even when nft refused, which is
+    the one thing teardown must not lie about. The absent-table case is
+    checked first so a gateway-mode box — where this runs on every boot and
+    the table never exists — stops logging an nft error for normal operation.
+    """
+    rc, _out, _err = await _run_exec("nft", "list", "table", "inet", _ROUTER_TABLE)
+    if rc != 0:
+        return True  # nothing to remove
+    ok = await _nft(f"delete table inet {_ROUTER_TABLE}")
+    if ok:
+        logger.info("Router NAT removed")
+    else:
+        logger.error("Router NAT table could not be removed — it is still active")
+    return ok
+
+
+async def router_counters() -> dict:
+    """Read the WAN-side counters, or {} when router mode isn't applied."""
+    rc, out, _ = await _run_exec("nft", "-j", "list", "table", "inet", _ROUTER_TABLE)
+    if rc != 0:
+        return {}
+    import json as _json
+    try:
+        data = _json.loads(out)
+    except ValueError:
+        return {}
+    counters = {}
+    for item in data.get("nftables", []):
+        c = item.get("counter")
+        if isinstance(c, dict) and "name" in c:
+            counters[c["name"]] = {
+                "packets": c.get("packets", 0),
+                "bytes": c.get("bytes", 0),
+            }
+    return counters

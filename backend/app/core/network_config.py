@@ -30,7 +30,7 @@ Manager detection priority
 --------------------------
 1. NetworkManager  — modern desktop / RPi OS Bookworm+
 2. systemd-networkd — Debian server modern
-3. ifupdown         — Debian server classic (our test box 192.168.1.4)
+3. ifupdown         — Debian server classic
 4. dhcpcd           — legacy RPi OS
 
 Multiple managers can be installed but only one actively controlling
@@ -93,7 +93,7 @@ _NSENTER_BASE = [
 # accept user input.
 _ALLOWED_PROGRAMS = frozenset({
     "arping", "cat", "chmod", "chown", "command", "dhcpcd", "ifdown",
-    "ifup", "ip", "mkdir", "mv", "netplan", "networkctl", "nmcli",
+    "ifup", "ip", "iw", "mkdir", "mv", "netplan", "networkctl", "nmcli",
     "nsenter", "ping", "resolvectl", "rm", "sh", "stat", "systemctl",
     "tee", "test",
 })
@@ -555,6 +555,23 @@ def read_state() -> NetworkState:
     mode = detect_mode(manager, ifname or "")
 
     warnings: List[str] = []
+    # Self-loop takes top billing: the default route points at THIS box's
+    # own IP, so every off-LAN packet is handed straight back to us and
+    # dies. This is the "new device set its PiTun gateway to itself"
+    # footgun on a fresh install left on DHCP in gateway mode — the box
+    # gets its own address as option 3. Checked BEFORE _upstream_is_pitun
+    # because a self-loop also matches PiTun's own /health fingerprint and
+    # would otherwise be mislabelled as a *different* PiTun upstream.
+    self_loop = bool(gateway and ip and gateway == ip)
+    if self_loop:
+        warnings.append(
+            f"Default gateway {gateway} is THIS PiTun's own IP — a routing "
+            "self-loop. Outbound traffic has nowhere to go. Set the default "
+            "route to your actual ISP router (usually 192.168.x.1) under "
+            "'Change gateway / DNS' below. If the box was installed on DHCP "
+            "in gateway mode, also give it a static IP so it stops receiving "
+            "its own address as the gateway."
+        )
     if manager == "unknown":
         warnings.append(
             "Could not detect an active network manager on the host. "
@@ -566,7 +583,7 @@ def read_state() -> NetworkState:
             f"Interface {ifname} configuration mode could not be parsed "
             f"from {manager}'s config — apply is disabled until resolved."
         )
-    if _upstream_is_pitun(gateway):
+    if not self_loop and _upstream_is_pitun(gateway):
         warnings.append(
             f"Upstream gateway {gateway} appears to be ANOTHER PiTun "
             "(matches PiTun's /health fingerprint). This creates a "
@@ -585,3 +602,258 @@ def read_state() -> NetworkState:
         dns=dns,
         warnings=warnings,
     )
+
+
+# ── Interface inventory (router mode, phase 0) ───────────────────────────────
+#
+# Router mode needs to know how many REAL NICs the box has: the UI only offers
+# it on hardware with two or more, and the operator has to pick which one faces
+# the ISP. Everything here is read-only — nothing in phase 0 changes behaviour.
+
+# Interfaces that exist because of virtualisation, containers or our own tunnel.
+# They must never be offered as a WAN/LAN candidate: picking `docker0` as the
+# uplink would be nonsense, and `xray0` is created by PiTun itself.
+_VIRTUAL_PREFIXES = (
+    "lo", "docker", "br-", "veth", "virbr", "tun", "tap", "xray",
+    "wg", "ppp", "bond", "dummy", "sit", "gre", "vxlan", "tailscale", "zt",
+)
+
+
+def _is_physical(name: str, link: dict) -> bool:
+    """True when `name` looks like a real NIC we could assign a role to.
+
+    Prefix matching alone is not enough — a USB-Ethernet dongle can be
+    `enx<mac>` and a VLAN sub-interface is `eth0.835` — so we also drop
+    anything the kernel reports as having a `link_type` we can't route on,
+    and anything that is a sub-interface of another link.
+    """
+    if name.startswith(_VIRTUAL_PREFIXES):
+        return False
+    if link.get("link_type") != "ether":
+        return False
+    # VLAN sub-interfaces (eth0.835) are not standalone role candidates.
+    if "." in name:
+        return False
+    # Being enslaved is NOT disqualifying. Router mode bridges the LAN ports
+    # into `br-lan` itself, so the moment it comes up, the very ports the
+    # operator assigned would vanish from this inventory — the panel would
+    # report one port on a three-port box, and role validation would reject
+    # the stored configuration, including the request to switch back to
+    # gateway. Callers that care can look at `master`.
+    return True
+
+
+def list_interfaces() -> List[dict]:
+    """Inventory of physical NICs with enough state to choose roles.
+
+    Returns one dict per interface: name, mac, up (admin state), carrier
+    (cable actually plugged in), ipv4/cidr, and `is_default_route` marking
+    the one currently carrying traffic to the internet.
+
+    Physical-only: virtual/container/tunnel interfaces are filtered out, so
+    `len(...) >= 2` is a meaningful "this box can be a router" test.
+    """
+    try:
+        r = subprocess.run(
+            ["ip", "-j", "link", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        links = json.loads(r.stdout or "[]")
+    except ValueError:
+        return []
+
+    default_iface, _ = read_default_route()
+    out: List[dict] = []
+    for link in links:
+        name = link.get("ifname") or ""
+        if not name or not _is_physical(name, link):
+            continue
+        ip, cidr = read_interface_address(name)
+        # Wireless NICs count as ports, but serving WiFi needs AP mode — a
+        # chipset property. Probe it here so the UI never offers "use this as
+        # the LAN's WiFi" on a client-only adapter.
+        wifi = wifi_capabilities(name)
+        out.append({
+            "wireless": wifi["wireless"],
+            "ap_capable": wifi["ap_capable"],
+            "wifi_detail": wifi["detail"],
+            "wifi_modes": wifi["modes"],
+            "name": name,
+            "mac": link.get("address") or "",
+            # `operstate` is the kernel's view; "UP" needs a carrier too, and
+            # a NIC with no cable reports LOWER_UP missing from its flags.
+            "up": link.get("operstate") == "UP",
+            "carrier": "LOWER_UP" in (link.get("flags") or []),
+            "ipv4": ip,
+            "cidr": cidr,
+            "is_default_route": name == default_iface,
+            # Set while router mode has the port in the LAN bridge; the
+            # address then lives on the bridge, not here.
+            "master": link.get("master") or "",
+        })
+    out.sort(key=lambda i: i["name"])
+    return out
+
+
+# ── Hardware present but not usable ──────────────────────────────────────────
+
+# `/sys/bus/pci/devices/*/class` — 0x02xxxx is a network controller of some
+# kind (0x0200 Ethernet, 0x0280 "other", which is where wifi lands).
+_PCI_DEVICES = "/sys/bus/pci/devices"
+
+
+def _read_sysfs(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def unclaimed_network_devices() -> List[dict]:
+    """Network controllers on the bus that produced no interface.
+
+    "No wireless adapters found" is the wrong thing to tell someone whose card
+    is sitting right there on the PCI bus. It happened here: a firmware package
+    had been purged, mt7921e loaded, `hardware init failed`, and no netdev was
+    ever created — so every layer above reported an absence and nobody would
+    have thought to look for a missing binary blob.
+
+    The distinction the caller needs is between:
+      * nothing bound the device at all — no driver for this hardware, and
+      * a driver IS bound and still produced no interface — which in practice
+        is almost always firmware it could not load.
+    """
+    out: List[dict] = []
+    try:
+        slots = sorted(os.listdir(_PCI_DEVICES))
+    except OSError:
+        return out
+
+    for slot in slots:
+        base = os.path.join(_PCI_DEVICES, slot)
+        cls = _read_sysfs(os.path.join(base, "class"))
+        if not cls.startswith("0x02"):
+            continue
+        # A device that produced an interface is working by definition.
+        try:
+            if os.listdir(os.path.join(base, "net")):
+                continue
+        except OSError:
+            pass
+
+        # `uevent` carries `DRIVER=` when something is bound, and it is a
+        # plain file — unlike the `driver` symlink, which needs privileges to
+        # even create on some hosts, making this awkward to test.
+        driver = ""
+        for line in _read_sysfs(os.path.join(base, "uevent")).splitlines():
+            if line.startswith("DRIVER="):
+                driver = line.partition("=")[2].strip()
+                break
+
+        out.append({
+            "slot": slot,
+            "kind": "wireless" if cls.startswith("0x0280") else "wired",
+            "vendor": _read_sysfs(os.path.join(base, "vendor")).replace("0x", ""),
+            "device": _read_sysfs(os.path.join(base, "device")).replace("0x", ""),
+            "driver": driver,
+            # Both readings are actionable, and they point somewhere different.
+            "reason": "no_driver" if not driver else "driver_but_no_interface",
+        })
+    return out
+
+
+# ── Wireless capability probe (router mode, phase 1b gate) ───────────────────
+#
+# Serving WiFi means putting the radio into AP mode, and that is a property of
+# the chipset + driver, not of "it's a wireless NIC". Plenty of parts —
+# most cheap USB dongles, some built-in Realtek/Broadcom — are client-only.
+# Trying hostapd on those fails at runtime, after we've already torn down the
+# working setup. So: probe first, and only offer AP mode on a positive answer.
+#
+# Deliberately tri-state. `None` means "we could not determine" (usually `iw`
+# isn't installed) and must NOT be shown as "not supported" — the operator can
+# fix a missing tool, and telling them their hardware is incapable when it may
+# be fine is worse than admitting we don't know.
+
+
+def _phy_for(ifname: str) -> Optional[str]:
+    """Kernel phy name (`phy0`) backing a wireless interface, else None."""
+    try:
+        with open(f"/sys/class/net/{ifname}/phy80211/name") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def is_wireless(ifname: str) -> bool:
+    """True for a WiFi interface. Filesystem check — no tooling required."""
+    return os.path.exists(f"/sys/class/net/{ifname}/wireless") or _phy_for(ifname) is not None
+
+
+def wifi_capabilities(ifname: str) -> dict:
+    """Can `ifname` act as an access point?
+
+    Returns {wireless, ap_capable, modes, bands, detail}. `ap_capable` is
+    True / False / None, where None means undetermined (see module note).
+    """
+    if not is_wireless(ifname):
+        return {"wireless": False, "ap_capable": False, "modes": [], "bands": [],
+                "detail": "not a wireless interface"}
+
+    phy = _phy_for(ifname)
+    if not phy:
+        return {"wireless": True, "ap_capable": None, "modes": [], "bands": [],
+                "detail": "no phy80211 for this interface — cannot query the driver"}
+
+    r = host_run(["iw", "phy", phy, "info"], timeout=8)
+    if r.returncode != 0:
+        # Missing tool is the common case and it's fixable, so say so plainly.
+        err_l = (r.stderr or "").lower()
+        # The message differs by path: bare exec says "not found", nsenter
+        # reports "failed to execute iw: No such file or directory".
+        missing = (
+            "not found" in err_l
+            or "no such file" in err_l
+            or r.returncode == 127
+            or not (r.stdout or r.stderr)
+        )
+        return {
+            "wireless": True, "ap_capable": None, "modes": [], "bands": [],
+            "detail": ("`iw` is not installed — install it to check whether this "
+                       "adapter supports AP mode" if missing
+                       else f"iw failed: {(r.stderr or '').strip()[:120]}"),
+        }
+
+    # `iw phy info` prints an indented list under "Supported interface modes:",
+    # each entry as "\t\t * AP". Collect until the indentation block ends.
+    modes: List[str] = []
+    in_modes = False
+    bands: List[str] = []
+    for line in (r.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Supported interface modes"):
+            in_modes = True
+            continue
+        if in_modes:
+            if stripped.startswith("*"):
+                modes.append(stripped.lstrip("* ").strip())
+                continue
+            in_modes = False
+        if stripped.startswith("Band "):
+            bands.append(stripped.rstrip(":"))
+
+    ap = "AP" in modes
+    return {
+        "wireless": True,
+        "ap_capable": ap,
+        "modes": modes,
+        "bands": bands,
+        "detail": ("adapter supports AP mode" if ap
+                   else "adapter is client-only — it cannot serve WiFi"),
+    }

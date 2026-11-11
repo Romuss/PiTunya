@@ -10,6 +10,8 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
+from app.core.cert_pin import try_normalize_pin
+
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ def _parse_vless(uri: str) -> Optional[Dict[str, Any]]:
         "sni": _qs(params, "sni") or _qs(params, "host") or parsed.hostname or "",
         "fingerprint": _qs(params, "fp", "chrome"),
         "alpn": _qs(params, "alpn"),
+        "pinned_cert_sha256": try_normalize_pin(_qs(params, "pcs")) or None,
         "flow": _qs(params, "flow"),
         # WS
         "ws_path": _qs(params, "path", "/"),
@@ -121,6 +124,7 @@ def _parse_trojan(uri: str) -> Optional[Dict[str, Any]]:
         "sni": _qs(params, "sni") or parsed.hostname or "",
         "fingerprint": _qs(params, "fp", "chrome"),
         "alpn": _qs(params, "alpn"),
+        "pinned_cert_sha256": try_normalize_pin(_qs(params, "pcs")) or None,
         "ws_path": _qs(params, "path", "/"),
         "ws_host": _qs(params, "host"),
         "grpc_service": _qs(params, "serviceName"),
@@ -337,8 +341,13 @@ def _parse_hy2(uri: str) -> Optional[Dict[str, Any]]:
         "fingerprint": _qs(params, "fp", "chrome"),
         "alpn": _qs(params, "alpn"),
         "allow_insecure": _qs(params, "insecure", "0") == "1",
+        "pinned_cert_sha256": try_normalize_pin(_qs(params, "pinSHA256") or _qs(params, "pcs")) or None,
         "hy2_obfs": _qs(params, "obfs"),
         "hy2_obfs_password": _qs(params, "obfs-password"),
+        # `mport` is the standard hysteria2 name for a hop range; the interval has
+        # no standard spelling, `hop-interval` is PiTun's own.
+        "hy2_hop_ports": _qs(params, "mport") or None,
+        "hy2_hop_interval": _qs(params, "hop-interval") or None,
     }
     return node
 
@@ -360,13 +369,25 @@ _PARSERS = {
 }
 
 
+def _normalize_transport(node: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Fold Xray's "raw" transport back to its canonical name "tcp".
+
+    Xray renamed the plain TCP transport to "raw"; panels emit `type=raw`
+    in share links. Storing the canonical "tcp" keeps the DB consistent and
+    matches what the rest of PiTun expects.
+    """
+    if node and node.get("transport") == "raw":
+        node["transport"] = "tcp"
+    return node
+
+
 def parse_uri(uri: str) -> Optional[Dict[str, Any]]:
     """Parse a single proxy URI. Returns a node dict or None."""
     uri = uri.strip()
     for prefix, parser in _PARSERS.items():
         if uri.lower().startswith(prefix):
             try:
-                return parser(uri)
+                return _normalize_transport(parser(uri))
             except Exception as exc:
                 logger.debug("Failed to parse %s: %s", uri[:60], exc)
                 return None
@@ -393,13 +414,13 @@ def parse_uri_list(text: str) -> List[Dict[str, Any]]:
             obj = json.loads(text)
             nodes = _parse_xray_json(obj)
             if nodes:
-                return nodes
+                return [_normalize_transport(n) for n in nodes]
         except (json.JSONDecodeError, ValueError):
             pass  # not JSON, continue to other parsers
 
     # Try Clash YAML
     if re.search(r"proxies\s*:", text):
-        return _parse_clash_yaml(text)
+        return [_normalize_transport(n) for n in _parse_clash_yaml(text)]
 
     # Try base64 decode if it looks like a single base64 blob
     if "\n" not in text and len(text) > 20 and not text.startswith(tuple(_PARSERS)):
@@ -515,6 +536,8 @@ def _clash_proxy_to_node(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "sni": p.get("sni", "") or server,
             "hy2_obfs": (p.get("obfs") or ""),
             "hy2_obfs_password": (p.get("obfs-password") or ""),
+            "hy2_hop_ports": (str(p.get("ports") or "") or None),
+            "hy2_hop_interval": (str(p.get("hop-interval") or "") or None),
         })
     elif ptype == "wireguard":
         base.update({

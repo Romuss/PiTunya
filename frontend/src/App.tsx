@@ -7,12 +7,14 @@ import { Routing } from '@/pages/Routing'
 import { Subscriptions } from '@/pages/Subscriptions'
 import { GeoData } from '@/pages/GeoData'
 import { DNS } from '@/pages/DNS'
+import { DomainStats } from '@/pages/DomainStats'
 import { Logs } from '@/pages/Logs'
 import { KnowledgeBase } from '@/pages/KnowledgeBase'
 import { Balancers } from '@/pages/Balancers'
 import { NodeCircles } from '@/pages/NodeCircles'
 import { Devices } from '@/pages/Devices'
 import { Diagnostics } from '@/pages/Diagnostics'
+import RouterPage from '@/pages/Router'
 import { Settings } from '@/pages/Settings'
 import { Servers } from '@/pages/Servers'
 import { ServerTasks } from '@/pages/ServerTasks'
@@ -64,10 +66,12 @@ export default function App() {
         <Route path="/subscriptions" element={<Subscriptions />} />
         <Route path="/devices"       element={<Devices />} />
         <Route path="/dns"           element={<DNS />} />
+        <Route path="/domains"       element={<DomainStats />} />
         <Route path="/geodata"       element={<GeoData />} />
         <Route path="/logs"          element={<Logs />} />
         <Route path="/diagnostics"   element={<Diagnostics />} />
         <Route path="/connections"    element={<Connections />} />
+        <Route path="/router"        element={<RouterPage />} />
         <Route path="/settings"      element={<Settings />} />
         <Route path="/kb"            element={<KnowledgeBase />} />
       </Route>

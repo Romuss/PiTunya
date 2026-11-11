@@ -4,17 +4,20 @@ import {
   Layers, Loader2, AlertTriangle, ExternalLink, Trash2, Plus, RefreshCw,
   ShieldCheck, ShieldAlert, Server as ServerIcon, KeyRound, Copy, Check,
   ChevronRight, ChevronDown, Upload, Shuffle, UploadCloud, QrCode, Radar,
-  Network,
-} from 'lucide-react'
+  Link2, Network,} from 'lucide-react'
 
 import { xuiApi, diagnosticsApi, type SniScanResult } from '@/api/client'
 import { useT } from '@/hooks/useT'
+import { XrayPolicySection } from '@/components/XrayPolicySection'
+import { XuiImportModal } from '@/components/XuiImportModal'
 import { useConfirm } from '@/components/ConfirmModal'
 import { ModalShell } from '@/components/ModalShell'
 import { ClientQrModal } from '@/components/ClientQrModal'
 import { DirectToggle } from '@/components/DirectToggle'
 import { PortCheck } from '@/components/PortCheck'
 import { copyToClipboard } from '@/lib/clipboard'
+import { PanelXrayCard } from '@/components/PanelXrayCard'
+import { PanelUpdateCard } from '@/components/PanelUpdateCard'
 import type { InboundPreset, XuiClient, XuiInbound, XuiServer } from '@/types'
 
 /**
@@ -31,6 +34,7 @@ import type { InboundPreset, XuiClient, XuiInbound, XuiServer } from '@/types'
  * page where multiple XuiServers are wired together end-to-end.
  */
 export default function XuiPage() {
+  const [importOpen, setImportOpen] = useState(false)
   const t = useT()
   const qc = useQueryClient()
 
@@ -66,7 +70,17 @@ export default function XuiPage() {
             'Управляйте VLESS / Trojan / SOCKS инбаундами на панелях x-ui-pro / 3x-ui, развёрнутых через PiTun',
           )}
         </p>
+        <span className="flex-1" />
+        <button
+          onClick={() => setImportOpen(true)}
+          className="flex items-center gap-1.5 rounded-lg border border-gray-800 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-800 transition-colors"
+        >
+          <Link2 className="h-4 w-4" />
+          {t('Connect existing', 'Подключить установленную')}
+        </button>
       </header>
+
+      {importOpen && <XuiImportModal onClose={() => setImportOpen(false)} />}
 
       <div className="space-y-4">
       {srvLoading && (
@@ -93,8 +107,8 @@ export default function XuiPage() {
               </div>
               <p className="text-xs text-gray-500 mt-1 leading-snug">
                 {t(
-                  'Go to Servers → Deploy on a registered VPS → pick "x-ui" protocol. Once the install finishes, the panel registers itself here automatically.',
-                  'Перейдите в Servers → Deploy на зарегистрированном VPS → выберите протокол "x-ui". После установки панель появится здесь автоматически.',
+                  'Deploy one from Servers → Deploy → "x-ui" and it registers itself here. A panel that already exists — installed by hand, or inherited with the server — is connected with the button above; nothing is reinstalled.',
+                  'Разверните через Servers → Deploy → «x-ui», и панель зарегистрируется здесь сама. Уже установленную — поднятую вручную или доставшуюся вместе с сервером — подключите кнопкой выше; ничего не переустанавливается.',
                 )}
               </p>
             </div>
@@ -102,13 +116,20 @@ export default function XuiPage() {
         </div>
       )}
 
+      {/* Connection-lifetime policy — global values, shown here because
+          this is the page that owns the panels they get pushed to. */}
+      {servers.length > 0 && <XrayPolicySection servers={servers} />}
+
       {servers.length > 0 && (
         <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
           <ServerList
             servers={servers}
             selectedId={selectedId}
             onSelect={setSelectedId}
-            onChanged={() => qc.invalidateQueries({ queryKey: ['xui', 'servers'] })}
+            onChanged={() => {
+              qc.invalidateQueries({ queryKey: ['xui', 'servers'] })
+              qc.invalidateQueries({ queryKey: ['servers'] })
+            }}
           />
           {selectedServer && (
             <ServerDetail
@@ -194,6 +215,39 @@ function ServerList({
 
 
 // ── Server detail (right pane) ──────────────────────────────────────────────
+
+// Copies the panel's `xui://` URI (it carries the API token and the panel
+// login, so it only goes to the clipboard, never onto the page).
+function CopyUriButton({ serverId }: { serverId: number }) {
+  const t = useT()
+  const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
+  const run = async () => {
+    setState('busy')
+    try {
+      const uri = await xuiApi.panelUri(serverId)
+      setState((await copyToClipboard(uri)) ? 'done' : 'error')
+    } catch {
+      setState('error')
+    }
+    setTimeout(() => setState('idle'), 2500)
+  }
+  return (
+    <button
+      type="button"
+      onClick={run}
+      disabled={state === 'busy'}
+      title={t('Copy the xui:// address to import this panel on another PiTun box. It contains the API token and the panel login.', 'Скопировать адрес xui:// для импорта этой панели на другой коробке PiTun. В нём токен API и логин панели.')}
+      className="inline-flex items-center gap-1 text-brand-400 hover:text-brand-700 dark:hover:text-brand-300 disabled:opacity-50"
+    >
+      {state === 'done' ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+      {state === 'done'
+        ? t('Copied', 'Скопировано')
+        : state === 'error'
+          ? t('Could not copy', 'Не удалось')
+          : 'xui://'}
+    </button>
+  )
+}
 
 function ServerDetail({ server }: { server: XuiServer }) {
   const t = useT()
@@ -296,6 +350,8 @@ function ServerDetail({ server }: { server: XuiServer }) {
               {t('Open panel', 'Открыть панель')}
               <ExternalLink className="h-3 w-3" />
             </a>
+            <span className="text-gray-700">·</span>
+            <CopyUriButton serverId={server.id} />
             <span className="text-gray-700">·</span>
             <span className="font-mono">{server.panel_user}</span>
           </div>
@@ -504,6 +560,8 @@ function ServerDetail({ server }: { server: XuiServer }) {
         </div>
       </header>
 
+      <PanelXrayCard serverId={server.id} />
+      <PanelUpdateCard serverId={server.id} />
       {showPorts && (
         <div className="rounded-lg border border-gray-800 bg-gray-900/30 px-3 py-2 space-y-1">
           <PortCheck
@@ -1265,7 +1323,7 @@ function AddInboundModal({
             <div className="text-[11px] uppercase tracking-wider text-gray-500">
               {t('Preset fields', 'Поля пресета')}
             </div>
-            {preset.fields.map((f) => (
+            {preset.fields.filter((f) => !(f.name.startsWith('hop_') && values.hop !== 'on')).map((f) => (
               <div key={f.name}>
                 <label className="text-xs text-gray-400 block mb-1">
                   {f.label}
@@ -1273,14 +1331,26 @@ function AddInboundModal({
                     <span className="text-gray-600 ml-1">({t('optional', 'необязательно')})</span>
                   )}
                 </label>
-                <input
-                  type={f.type === 'int' ? 'number' : 'text'}
-                  value={values[f.name] ?? ''}
-                  onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
-                  placeholder={f.placeholder || (f.default ?? '')}
-                  className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
-                />
-                {f.name === 'port' && (
+                {f.type === 'select' && f.choices ? (
+                  <select
+                    value={values[f.name] ?? f.default ?? ''}
+                    onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
+                    className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
+                  >
+                    {f.choices.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                ) : (
+                  <input
+                    type={f.type === 'int' ? 'number' : 'text'}
+                    value={values[f.name] ?? ''}
+                    onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
+                    placeholder={f.placeholder || (f.default ?? '')}
+                    className="w-full rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-brand-500 focus:outline-hidden"
+                  />
+                )}
+                {f.type === 'select' && f.help && (
+                  <p className="mt-1 text-[11px] text-gray-500 leading-snug">{f.help}</p>
+                )}                {f.name === 'port' && (
                   <PortCheck
                     className="mt-1.5"
                     serverId={server.id}

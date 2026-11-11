@@ -41,7 +41,7 @@
 #
 set -uo pipefail
 
-REPO="${PITUN_REPO:-Romuss/PiTunya}"
+REPO="${PITUN_REPO:-DaveBugg/PiTun}"
 INSTALL_DIR="${PITUN_DIR:-/opt/pitun}"
 API_URL="${PITUN_API_URL:-http://127.0.0.1:8000}"
 LOG_FILE="${PITUN_UPDATE_LOG:-/var/log/pitun-update.log}"
@@ -208,6 +208,11 @@ status_write() {
     local state="$1" pct="$2" step_id="$3" message="$4"
     local ok="${5:-null}"
     [[ -d "$(dirname "$STATUS_FILE")" ]] || return 0
+    # The daily check must not write over the status of an update the user has
+    # just asked for: that would show an idle/available result instead of progress.
+    if [[ "${MODE:-}" == "check" && ( "$state" == "idle" || "$state" == "available" ) && -f "$REQUEST_FILE" ]]; then
+        return 0
+    fi
     local tmp="${STATUS_FILE}.tmp"
     cat >"$tmp" <<EOF
 {
@@ -233,6 +238,9 @@ json_str() {
     v="${v//$'\n'/ }"
     v="${v//$'\r'/}"
     v="${v//$'\t'/ }"
+    # Colour codes and any other control byte are not valid inside a JSON string:
+    # one of them makes the whole status file unreadable to the UI.
+    v="$(printf '%s' "$v" | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | tr -d '\000-\010\013-\037')"
     printf '"%s"' "$v"
 }
 
@@ -384,7 +392,8 @@ apply_update() {
             mapped="$(step_to_pct "$line")"
             if [[ -n "$mapped" ]]; then
                 pct="${mapped%%|*}"; step_id="${mapped##*|}"
-                status_write running "$pct" "$step_id" "${line#*] }"
+                local clean; clean="$(printf '%s' "$line" | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g')"
+                status_write running "$pct" "$step_id" "${clean#*] }"
             fi
         done
     local rc=${PIPESTATUS[0]}
@@ -434,7 +443,11 @@ agent_once() {
     [[ -f "$REQUEST_FILE" ]] || { log "No update request pending."; return 0; }
 
     local req; req="$(cat "$REQUEST_FILE" 2>/dev/null)"
-    # Consume the request FIRST: a request that crashes the agent must
+    # Say we are running BEFORE the request disappears: until the first real
+    # status is written the file still holds the previous run, and the UI would
+    # see nothing in flight in between.
+    status_write running 1 start "Update requested"
+    # Consume the request: a request that crashes the agent must
     # not be retried forever by the path unit.
     rm -f "$REQUEST_FILE"
 

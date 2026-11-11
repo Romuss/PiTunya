@@ -324,6 +324,23 @@ class TestAgentRequest:
         req, _marker, _ = self._agent(tmp_path, '{"version":"v1.5.0"}')
         assert not req.exists()
 
+    def test_status_says_running_before_the_request_disappears(self, tmp_path):
+        """Until the first real status is written the file holds the PREVIOUS run;
+        the UI would see nothing in flight. So the agent writes "running" first,
+        and by the time run_update starts the status is already ours."""
+        import json
+        req = tmp_path / "update-request.json"
+        req.write_text('{"version":"v1.5.0"}', newline="\n")
+        status = tmp_path / "update-status.json"
+        status.write_text(json.dumps({"state": "done", "pct": 100, "step": "done"}), newline="\n")
+        seen = tmp_path / "seen.txt"
+        run_bash(
+            f'REQUEST_FILE="{req.as_posix()}"; STATUS_FILE="{status.as_posix()}"; LOG_FILE=""; '
+            f'run_update() {{ cp "{status.as_posix()}" "{seen.as_posix()}"; }}; agent_once',
+        )
+        doc = json.loads(seen.read_text())
+        assert doc["state"] == "running" and doc["step"] == "start"
+
     def test_no_request_is_a_clean_no_op(self, tmp_path):
         res = run_bash(
             f'REQUEST_FILE="{(tmp_path / "absent.json").as_posix()}"; LOG_FILE=""; '
@@ -419,3 +436,48 @@ class TestSnapshotRetention:
         assert prune_call > health_gate, (
             "prune_old_snapshots must run after the health check, not before"
         )
+
+
+def test_the_daily_check_does_not_overwrite_a_requested_update():
+    """With a request waiting, a --check run must not write idle/available over it."""
+    import subprocess, tempfile, pathlib, shutil
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "pitun-update.sh"
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        (d / "req.json").write_text("{}")
+        status = d / "status.json"
+        status.write_text("QUEUED")
+        code = (
+            f'source "{script.as_posix()}"; MODE=check; '
+            f'STATUS_FILE="{status.as_posix()}"; REQUEST_FILE="{(d / "req.json").as_posix()}"; '
+            'status_write available 0 available "x"; status_write idle 100 up-to-date "y" true'
+        )
+        subprocess.run([bash, "-c", code], check=True, capture_output=True)
+        assert status.read_text() == "QUEUED"
+
+
+def _bash_out(code: str) -> str:
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "pitun-update.sh"
+    r = subprocess.run(
+        [bash, "-c", f'source "{script.as_posix()}"; {code}'],
+        check=True, capture_output=True,
+    )
+    return r.stdout.decode("utf-8")
+
+
+def test_json_str_drops_colour_codes_and_control_bytes():
+    import json
+    out = _bash_out(r'json_str "$(printf "\033[0;34m[STEP]\033[0m  Preparing host\001")"')
+    assert json.loads(out) == "[STEP]  Preparing host"
+
+
+def test_the_installer_is_not_coloured_when_piped():
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "install.sh").read_text(encoding="utf-8")
+    assert "if [[ ! -t 1 ]]; then RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''; fi" in src

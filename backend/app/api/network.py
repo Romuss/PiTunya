@@ -23,6 +23,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.database import get_session
+from fastapi import Depends
 from app.core import network_config
 from app.core import network_apply
 
@@ -60,6 +62,95 @@ def get_network_state() -> dict:
         len(state.warnings),
     )
     return state.to_dict()
+
+
+@router.get("/interfaces")
+def get_interfaces() -> dict:
+    """Physical NICs plus whether this box could act as a full router.
+
+    `router_capable` is the gate the UI uses: router mode needs a WAN and a
+    LAN, so it is only offered on hardware with two or more real NICs.
+    Virtual/container/tunnel interfaces are filtered out, so the count means
+    what it says.
+    """
+    ifaces = network_config.list_interfaces()
+    # Cards on the bus that produced no interface. Reporting an absence when
+    # the hardware is physically present sends people looking anywhere but at
+    # the driver — a purged firmware package cost an evening here.
+    try:
+        unclaimed = network_config.unclaimed_network_devices()
+    except Exception:  # noqa: BLE001 — an extra hint must never break the list
+        unclaimed = []
+    return {
+        "items": ifaces,
+        "count": len(ifaces),
+        "router_capable": len(ifaces) >= 2,
+        "unclaimed": unclaimed,
+    }
+
+
+@router.get("/router-mode")
+async def router_mode_status(session=Depends(get_session)) -> dict:
+    """Configured mode plus what the dataplane is actually running."""
+    from app.core import router_mode
+    return await router_mode.status(session)
+
+
+@router.post("/router-mode/confirm")
+async def confirm_router_mode(session=Depends(get_session)) -> dict:
+    """Tell the watchdog the network still works, cancelling the auto-revert.
+
+    Deliberately a separate action rather than something the apply implies:
+    the point is that a human confirms from a machine that can still reach the
+    panel. An apply that confirms itself proves nothing.
+    """
+    from app.core import router_watchdog
+    ok = await router_watchdog.confirm(session)
+    return {"confirmed": ok}
+
+
+@router.get("/router-mode/pending")
+async def router_mode_pending(session=Depends(get_session)) -> dict:
+    """Seconds remaining before an unconfirmed apply is rolled back."""
+    from app.core import router_watchdog
+    from datetime import datetime, timezone
+    deadline = await router_watchdog.pending(session)
+    if deadline is None:
+        return {"pending": False, "seconds_left": 0}
+    left = (deadline - datetime.now(timezone.utc)).total_seconds()
+    return {
+        "pending": True,
+        "deadline": deadline.isoformat(),
+        "seconds_left": max(0, int(left)),
+    }
+
+
+@router.get("/router-mode/diagnose")
+async def router_mode_diagnose(session=Depends(get_session)) -> dict:
+    """Read the WAN counters and explain them.
+
+    Exists because the two rules the uplink depends on — DHCP replies and the
+    ICMP that PMTU discovery needs — fail silently. Without this the operator
+    is left with "the internet is broken" and no way to tell which.
+
+    The configured WAN port is passed through so the findings can look at what
+    it actually holds: a counter at zero means something different on a port
+    that already has an address than on one that has none.
+    """
+    from sqlmodel import select as _sel
+    from app.models import Settings as _S
+    from app.core import router_mode
+
+    wan = ""
+    try:
+        # The interface traffic actually leaves by, not the port in the
+        # settings: PPPoE moves it to a ppp link and a VLAN tag renames it,
+        # and every rule and counter the findings read is attached to that.
+        rows = (await session.exec(_sel(_S))).all()
+        wan = router_mode.effective_wan({r.key: r.value for r in rows})
+    except Exception:  # noqa: BLE001 — diagnosis degrades, it doesn't fail
+        wan = ""
+    return {"findings": await router_mode.diagnose_wan(wan)}
 
 
 @router.get("/backups")
@@ -103,8 +194,31 @@ def probe(ip: str = Query(..., description="Candidate gateway IPv4 address")) ->
         raise HTTPException(400, detail=str(e))
 
 
+async def _refuse_in_router_mode(session) -> None:
+    """Block host-network edits while PiTun is the router.
+
+    These endpoints rewrite the default route and the manager's persistent
+    config. In gateway mode that only affects the box itself. In router mode
+    the box IS the route for every LAN client, so one click from a Settings
+    tab left open since before the switch takes the whole network off the
+    internet — and the change survives a reboot. Router mode owns the uplink
+    through its own WAN settings; there is no reason for both paths to be live.
+    """
+    from sqlmodel import select as _sel
+    from app.models import Settings as _S
+    row = (await session.exec(_sel(_S).where(_S.key == "operating_mode"))).first()
+    if row and row.value == "router":
+        raise HTTPException(
+            409,
+            "This box is running as a router, so its uplink is managed under "
+            "Settings → Network → Internet connection. Changing the host route "
+            "here would cut every LAN client off. Switch back to gateway mode "
+            "first if you really need this.",
+        )
+
+
 @router.post("/apply")
-def apply_changes(body: ApplyBody) -> dict:
+async def apply_changes(body: ApplyBody, session=Depends(get_session)) -> dict:
     """Apply gateway and/or DNS changes.
 
     Captures a backup of the current config FIRST so /rollback can
@@ -113,6 +227,7 @@ def apply_changes(body: ApplyBody) -> dict:
     edits the persistent manager config (interfaces / nmconnection)
     so the change survives reboot.
     """
+    await _refuse_in_router_mode(session)
     try:
         backup = network_apply.apply(
             network_apply.ApplyRequest(gateway=body.gateway, dns=body.dns),
@@ -137,7 +252,9 @@ def apply_changes(body: ApplyBody) -> dict:
 
 
 @router.post("/rollback")
-def rollback(body: Optional[RollbackBody] = None) -> dict:
+async def rollback(
+    body: Optional[RollbackBody] = None, session=Depends(get_session),
+) -> dict:
     """Restore a backup.
 
     Default (no body or empty backup_id) → newest backup. Explicit
@@ -150,6 +267,7 @@ def rollback(body: Optional[RollbackBody] = None) -> dict:
     button in the UI sends a body-less POST, so this 422 was a real
     UX paper cut.
     """
+    await _refuse_in_router_mode(session)
     backup_id = body.backup_id if body is not None else None
     try:
         backup = network_apply.rollback(backup_id)

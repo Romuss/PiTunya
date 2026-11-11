@@ -1,10 +1,14 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { systemApi } from '@/api/client'
 import HostNetworkSection from '@/components/HostNetworkSection'
+import BackupSection from '@/components/BackupSection'
 import { UpdateSection } from '@/components/UpdateSection'
+import { ResourceLimitsForm } from '@/components/ResourceLimitsForm'
 import {
   Settings as SettingsIcon,
+  Cpu,
   Network,
   Cable,
   Shield,
@@ -282,6 +286,25 @@ export function Settings() {
       {/* Network */}
       {section(Network, 'Network', t('Interface, gateway and LAN configuration', 'Интерфейс, шлюз и настройки LAN'), (
         <div className="space-y-5">
+          {/* Operating mode, WAN and WiFi moved to their own Router page.
+              They are the only settings that can take the network down, and
+              they are read as a set — leaving a copy here would be a second
+              place to change them from, with its own unsaved draft. */}
+          <Link
+            to="/router"
+            className="flex items-center justify-between gap-3 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2.5 hover:border-gray-700 transition-colors"
+          >
+            <span className="text-xs text-gray-400">
+              {t(
+                'Operating mode, uplink (WAN) and the wireless network are on the Router page.',
+                'Режим работы, аплинк (WAN) и беспроводная сеть — на странице «Роутер».',
+              )}
+            </span>
+            <span className="text-xs text-brand-400 shrink-0">
+              {t('Open', 'Открыть')} →
+            </span>
+          </Link>
+          <div className="border-t border-gray-800" />
           {/* xray-config knobs (DB-backed settings consumed by config_gen) */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             {field('Interface', textInput('interface', 'eth0', t('Network interface for transparent proxy', 'Сетевой интерфейс для прозрачного прокси')))}
@@ -308,6 +331,37 @@ export function Settings() {
             <HostNetworkSection />
           </div>
         </div>
+      ))}
+
+      {/* HTTPS / trust certificate */}
+      {section(Lock, t('HTTPS', 'HTTPS'), t('Serve the panel over TLS and trust its certificate', 'Панель по TLS и доверие сертификату'), (
+        <div className="space-y-3">
+          <p className="text-[12px] text-gray-400">
+            {t(
+              'The panel is also served over HTTPS (443) with a per-install certificate signed by a local PiTun CA. Install the root CA in your OS/browser trust store to drop the "not secure" warning. Plain HTTP on port 80 keeps working, so a cert issue can never lock you out.',
+              'Панель также отдаётся по HTTPS (443) с сертификатом этой установки, подписанным локальным PiTun CA. Добавь root-CA в доверенные в ОС/браузере, чтобы убрать предупреждение «не защищено». Обычный HTTP на порту 80 продолжает работать, так что проблема с сертификатом не заблокирует доступ.',
+            )}
+          </p>
+          <a
+            href="/pitun-ca.crt"
+            download="pitun-ca.crt"
+            className="inline-flex items-center gap-2 rounded-lg bg-brand-600 hover:bg-brand-500 px-3 py-2 text-[12px] text-white font-medium"
+          >
+            <Lock className="h-3.5 w-3.5" />
+            {t('Download PiTun root CA', 'Скачать root-CA PiTun')}
+          </a>
+          <p className="text-[11px] text-gray-600">
+            {t(
+              'After trusting the CA, reopen the panel over https://. macOS: add to Keychain → System and mark "Always Trust". Windows: import into "Trusted Root Certification Authorities". Firefox: Settings → Privacy → Certificates → Import (trust for websites).',
+              'После доверия CA открой панель по https://. macOS: добавь в Keychain → System и поставь «Always Trust». Windows: импорт в «Доверенные корневые центры сертификации». Firefox: Настройки → Приватность → Сертификаты → Импорт (доверять сайтам).',
+            )}
+          </p>
+        </div>
+      ))}
+
+      {/* Backup / restore */}
+      {section(Database, t('Backup & Restore', 'Бэкап и восстановление'), t('Export the whole configuration to a file, or restore from one', 'Экспорт всей конфигурации в файл или восстановление из него'), (
+        <BackupSection />
       ))}
 
       {/* Ports */}
@@ -365,6 +419,9 @@ export function Settings() {
         </div>
       ))}
 
+      {/* Resource limits */}
+      {section(Cpu, 'Resource limits', t('What PiTun may use of this box — off by default', 'Сколько этой системы может использовать PiTun — по умолчанию выключено'), <ResourceLimitsForm />)}
+
       {/* Safety */}
       {section(Shield, 'Safety', t('Traffic protection and auto-recovery', 'Защита трафика и автовосстановление'), (
         <div className="space-y-2">
@@ -373,7 +430,7 @@ export function Settings() {
           {toggle('block_quic', 'Block QUIC', t('Block UDP/443 for better TPROXY compatibility', 'Блокировать UDP/443 для совместимости с TPROXY'))}
           {toggle('bypass_private', 'Bypass Private IPs', t('Skip proxying for 10.x, 192.168.x, etc.', 'Не проксировать трафик 10.x, 192.168.x и т.д.'), t('LAN traffic (including access to this device) will go through VPN.\nYou may lose access to the web panel!\n\nDisable?', 'LAN-трафик (включая доступ к панели) пойдёт через VPN.\nВы можете потерять доступ к веб-панели!\n\nОтключить?'))}
           {toggle('disable_ipv6', 'Disable IPv6 (host only)', t('Disables IPv6 on THIS box only (sysctl). Does NOT stop LAN clients from using IPv6 — they get their IPv6 route from the router directly. To prevent the IPv6 bypass leak for clients, the DNS engine already returns IPv4-only answers (queryStrategy=UseIPv4).', 'Отключает IPv6 только на ЭТОЙ машине (sysctl). НЕ мешает LAN-клиентам использовать IPv6 — они получают IPv6-маршрут от роутера напрямую. Чтобы закрыть IPv6-утечку у клиентов, DNS-движок уже отдаёт только IPv4-ответы (queryStrategy=UseIPv4).'))}
-          {toggle('chain_drift_check', 'Hourly chain check', t('Re-run the chain healthcheck every hour and flag a chain as degraded when a panel inbound or the relay route disappears (e.g. after an x-ui reinstall). Read-only; on by default.', 'Раз в час повторять проверку цепочек и помечать цепочку как degraded, если inbound на панели или маршрут релея пропали (например, после переустановки x-ui). Только чтение; по умолчанию включено.'))}
+          {toggle('circle_http_probe', 'Circle: check internet through the node', t('Before a circle switches to a node, fetch a small page through it, not just open its port, so a node whose port answers but whose upstream is dead is skipped. Falls back to the port check if every node fails it. Adds a few seconds to a rotation; on by default.', 'Перед переключением круга на ноду загружать через неё небольшую страницу, а не только открывать порт, чтобы пропускать ноды, у которых порт отвечает, а апстрим мёртв. Если её не проходит ни одна нода, используется проверка порта. Добавляет несколько секунд к ротации; по умолчанию включено.'))}          {toggle('chain_drift_check', 'Hourly chain check', t('Re-run the chain healthcheck every hour and flag a chain as degraded when a panel inbound or the relay route disappears (e.g. after an x-ui reinstall). Read-only; on by default.', 'Раз в час повторять проверку цепочек и помечать цепочку как degraded, если inbound на панели или маршрут релея пропали (например, после переустановки x-ui). Только чтение; по умолчанию включено.'))}
           {toggle('xui_panel_bypass', 'Bypass x-ui panels', t('Send PiTun\'s own calls to your x-ui panels straight to the VPS, not through the active node, so panels stay manageable while the node is down. Applies to every registered panel; off by default.', 'Направлять собственные запросы бэкенда к вашим x-ui панелям напрямую на VPS, а не через активную ноду, чтобы панели оставались управляемыми, пока нода лежит. Действует на все добавленные панели; по умолчанию выключено.'))}
           {toggle('dns_over_tcp', 'DNS over TCP', t('Use TCP for DNS queries (fixes networks where UDP:53 is blocked)', 'Использовать TCP для DNS (исправляет сети где UDP:53 заблокирован)'))}
           {toggle('xray_fragment_enabled', 'TLS Fragment (anti-DPI)', t('Split the TLS ClientHello into fragments so DPI can\'t match the SNI in one packet. Client-side — the server is unaware and reassembles normally. Routes proxy nodes through a fragmenting outbound; may slightly reduce throughput. Needs xray 26.x.', 'Разбивать TLS ClientHello на фрагменты, чтобы DPI не мог сматчить SNI в одном пакете. Клиентская фича — сервер не в курсе и собирает поток как обычно. Прокси-ноды идут через фрагментирующий outbound; может немного снизить скорость. Требует xray 26.x.'))}
