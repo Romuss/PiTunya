@@ -1026,6 +1026,14 @@ fi
 step "Installing PiTun source to $INSTALL_DIR"
 if [[ "$DRY_RUN" != "1" ]]; then
     mkdir -p "$INSTALL_DIR"
+    # Wipe stale code from a previous version before extracting: tar only
+    # overlays, and files that were renamed or deleted upstream (e.g. the
+    # re-numbered alembic migrations in v2.5.0) would otherwise linger in
+    # the bind-mounted source tree and break the container at runtime
+    # (duplicate revision IDs → "Multiple head revisions").
+    for d in backend frontend docker docs prometheus; do
+        rm -rf "${INSTALL_DIR:?}/$d"
+    done
     # Strip the top-level dir from the tarball (PiTun-x.y.z/ → /).
     tar -xzf "$SRC_TARBALL" -C "$INSTALL_DIR" --strip-components=1
 fi
