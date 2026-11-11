@@ -36,7 +36,7 @@ from app.config import APP_VERSION, settings
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = os.getenv("PITUN_REPO", "DaveBugg/PiTun")
+GITHUB_REPO = os.getenv("PITUN_REPO", "Romuss/PiTunya")
 DATA_DIR = Path(os.getenv("PITUN_DATA_DIR", "/app/data"))
 STATUS_FILE = DATA_DIR / "update-status.json"
 REQUEST_FILE = DATA_DIR / "update-request.json"

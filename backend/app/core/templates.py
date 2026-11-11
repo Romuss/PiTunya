@@ -50,7 +50,7 @@ from typing import List, Literal, Optional
 # without touching every row.
 _REPO_BRANCH = "master"
 _REPO_RAW_BASE = (
-    "https://raw.githubusercontent.com/DaveBugg/PiTun/"
+    "https://raw.githubusercontent.com/Romuss/PiTunya/"
     f"{_REPO_BRANCH}/docker/naive/templates"
 )
 
