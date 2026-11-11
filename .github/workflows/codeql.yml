@@ -14,10 +14,7 @@
 name: CodeQL
 
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+  workflow_dispatch:
   schedule:
     # 03:17 UTC every Monday — off-peak for maintenance, far from the
     # hour boundary that everyone else uses.

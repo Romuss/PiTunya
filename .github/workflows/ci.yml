@@ -5,10 +5,7 @@ name: CI
 # pushing a `vX.Y.Z` tag.
 
 on:
-  push:
-    branches: [master, main]
-  pull_request:
-    branches: [master, main]
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same ref so a quick force-push doesn't
 # burn through all your free Actions minutes.
