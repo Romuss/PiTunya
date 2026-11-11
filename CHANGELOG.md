@@ -4,6 +4,35 @@ All notable user-facing changes to PiTun. Full per-release detail lives in the
 [GitHub Releases](https://github.com/DaveBugg/PiTun/releases); this file is the
 committed summary.
 
+## v2.5.0 — 2026-11-11
+
+**Fork release: merge of upstream PiTun v1.7.8, SLA/billing stack removed.**
+
+### Added (from upstream v1.6.0–v1.7.8)
+
+- **Router mode** — PiTun as a home router (DHCP, AP, uplink, LAN bridge).
+- **Hysteria2** — hop ports/interval, UDP health check, outbound support.
+- **TLS cert pinning** for subscription panels.
+- **Domain stats** — per-domain traffic visibility.
+- **Per-device resource limits** (CPU / memory).
+- **Smart circles** — excluded nodes/countries remembered across refreshes,
+  circles linked to several subscriptions at once.
+- **x-ui-pro server installs without sudo preinstalled**, plus dozens of
+  upstream fixes (see upstream CHANGELOG v1.6.0–v1.7.8).
+
+### Removed
+
+- **The entire SLA/billing stack** (broken, unused): SLA records/aggregation,
+  per-device traffic accounting, traffic quotas, rule suggestions — API,
+  background jobs, models, frontend widgets, and their tables/migrations.
+
+### Migration notes
+
+- Fork migrations 018–033 collided with upstream's numbering and were removed;
+  a new idempotent `034_reconcile_fork_chain` brings any legacy fork DB onto
+  the upstream migration chain (drops fork-only tables, renames
+  `user.locked_until` → `lock_until`, adds missing upstream columns).
+
 ## v1.7.8 — 2026-11-09
 
 **Installing an x-ui-pro server works on VPS images without `sudo`.**
