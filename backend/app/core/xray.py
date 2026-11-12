@@ -69,36 +69,6 @@ class _RestartBackoff:
 crash_backoff = _RestartBackoff()
 
 
-class _RestartBackoff:
-    """Delay before relaunching a crashed xray: quick at first, then slower
-    while it keeps dying, so a broken config doesn't restart every few seconds.
-    A run that stays up for `stable_after` seconds starts the schedule over."""
-
-    SCHEDULE = (3.0, 60.0, 300.0)
-
-    def __init__(self, stable_after: float = 600.0, clock=time.monotonic) -> None:
-        self._stable_after = stable_after
-        self._clock = clock
-        self._streak = 0
-        self._last: Optional[float] = None
-
-    def next_delay(self) -> float:
-        now = self._clock()
-        if self._last is not None and now - self._last > self._stable_after:
-            self._streak = 0
-        self._last = now
-        delay = self.SCHEDULE[min(self._streak, len(self.SCHEDULE) - 1)]
-        self._streak += 1
-        return delay
-
-    def reset(self) -> None:
-        self._streak = 0
-        self._last = None
-
-
-crash_backoff = _RestartBackoff()
-
-
 class XrayManager:
     # Default deadline for acquiring `_lock` before the API endpoint
     # returns 503. Picked to be longer than the longest legitimate

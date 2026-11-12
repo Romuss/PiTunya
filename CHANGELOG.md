@@ -4,6 +4,25 @@ All notable user-facing changes to PiTun. Full per-release detail lives in the
 [GitHub Releases](https://github.com/DaveBugg/PiTun/releases); this file is the
 committed summary.
 
+## v2.5.3 — 2026-11-12
+
+**Domain stats collection works again, and updates come from this fork's repo.**
+
+### Fixed
+
+- The xray crash-restart backoff class was left duplicated after the v1.7.8
+  merge (a merge-script artifact), which broke the module that feeds the
+  Domains page. The duplicate is removed and DNS lines flow into domain
+  stats again. Remember: collection is opt-in and needs xray log level
+  `info` or `debug`.
+
+### Changed
+
+- The updater now pulls releases from this project's own repo
+  (`DaveBugg/PiTun`) instead of `Romuss/PiTunya` — in Settings → Updates,
+  the host-side `pitun-update.sh` agent, and the offline bundle builder.
+  Override with the `PITUN_REPO` env var where needed.
+
 ## v2.5.0 — 2026-11-11
 
 **Fork release: merge of upstream PiTun v1.7.8, SLA/billing stack removed.**
