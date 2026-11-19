@@ -4,6 +4,23 @@ All notable user-facing changes to PiTun. Full per-release detail lives in the
 [GitHub Releases](https://github.com/DaveBugg/PiTun/releases); this file is the
 committed summary.
 
+## v2.6.0 — 2026-11-18
+
+**Merge of upstream PiTun v1.7.9–v1.7.14.**
+
+### Added (from upstream v1.7.9–v1.7.14)
+
+- **Update badge in the header** — PiTun checks GitHub for a new release once
+  a day and shows a badge next to the logo when one is available.
+- **Circles report their decisions** — each circle shows when it was last
+  checked and what it decided; new "rotate on schedule even when the current
+  node is fine" option.
+- **Encrypted subscription links** — subscriptions accept encrypted
+  happ/v2raytun/incy links.
+- **DNS through a chosen node** — DNS can go through a selected node, with a
+  per-node DoH test.
+- **Circles skip dead nodes** and failover checks real traffic.
+
 ## v2.5.3 — 2026-11-12
 
 **Domain stats collection works again, and updates come from this fork's repo.**
@@ -51,6 +68,63 @@ committed summary.
   a new idempotent `034_reconcile_fork_chain` brings any legacy fork DB onto
   the upstream migration chain (drops fork-only tables, renames
   `user.locked_until` → `lock_until`, adds missing upstream columns).
+
+## v1.7.14 — 2026-11-15
+
+**An update badge in the header, and circles say what they decided.**
+
+### Added
+
+- PiTun checks GitHub for a new release once a day. When there is one, a badge with the version appears next to the logo and opens Settings → Updates with the update ready to install.
+- Circles: "Rotate on schedule even when the current node is fine". Off (as before), a scheduled tick keeps an active node that is online and within the max latency; on, every tick picks the best node again.
+- Each circle shows when it was last checked and what it decided ("kept 'X': healthy (61 ms)", "rotated to 'Y'", "all candidates failed…"), so a circle that keeps a good node no longer looks stuck behind an old "Last rotated".
+
+## v1.7.13 — 2026-11-12
+
+**Subscriptions accept encrypted client links.**
+
+### Added
+
+- A subscription can be added from an encrypted client link instead of a plain https URL: `happ://crypt/` … `happ://crypt5/`, `v2raytun://crypt/` and `incy://crypt1/`, plus the plain `happ://add/` and `incy://add/` / `incy://import/` wrappers. The link is stored as pasted and decoded on every refresh; the URL inside goes through the same checks as a typed one.
+- Panels that encrypt the subscription body (`?key=keyNN` in the URL and an `Encrypt-Tag` response header) are decrypted transparently.
+- Subscriptions → key button: add keys for encrypted links when a client starts using new ones, without waiting for a release. Key values are write-only; the list shows a fingerprint.
+- Quick Add decodes the link first, names the subscription after it, and says plainly when a key is missing.
+
+## v1.7.12 — 2026-11-12
+
+**Circles stop falling back to dead nodes, and saving DNS settings no longer hangs.**
+
+### Fixed
+
+- A circle with a speed target could rotate onto a node that carried no traffic at all, because a node whose test could not connect was treated as "not measured yet" and used as the fallback. Such a node is now treated as offline.
+- A node that just failed its internet check is skipped for a few minutes instead of being probed again on every rotation.
+- Saving DNS settings could show "Network Error" and leave the button on "Saving...": the page waited for a refetch that the xray reload dropped. The save now completes as soon as the server answers, and the reload is deferred briefly.
+- The "unreachable" message of a failed node test is no longer empty when the underlying error has no text.
+- With failover on, the active node is now checked for real traffic (about every 3 minutes), not only an open port. A node that accepts connections but returns nothing — typically an account whose traffic ran out — triggers failover, and failover no longer picks such a node as the replacement. Only a tunnel that came up and carried nothing counts against a node — a check that could not start its own test tunnel never does — and the check follows the same Settings switch as the circle's internet check.
+- A subscription whose panel answers with placeholder nodes now says why when the panel reports it: "traffic quota used up (601 of 600 GB)" or "subscription expired on <date>", instead of the unhelpful "Panel: proxy".
+- "Test through a node" on the DNS page works when the saved upstream is DoT/DoQ/plain or a LAN resolver (it tests DoH against the same public host, or a public resolver), refuses disabled nodes, and names the node that was actually tested.
+
+## v1.7.11 — 2026-11-12
+
+**Choose which node DNS goes through, and test DoH through a node.**
+
+### Added
+
+- Settings → DNS → "DNS goes through": send queries to the DNS upstream (primary, secondary, fallback) through a specific node, directly (bypassing the proxy), or leave the default (follows the routing rules, unchanged). If the chosen node is removed or disabled, DNS falls back to the default instead of breaking.
+- "Test through a node" on the DNS page: resolves a domain over DoH through any node in a throwaway tunnel, so you can see whether DoH really works over that path.
+
+## v1.7.9 — 2026-11-11
+
+**Circles with a speed target rotate again, and the active node is shown consistently.**
+
+### Fixed
+
+- A "Best" circle with a minimum speed never rotated: its speed checks outlasted the rotation deadline, so every rotation was cancelled halfway. Such circles now get time to finish measuring.
+- A circle now reports the node that is really active as its current one, so the Dashboard and the circle list no longer disagree with the Nodes page after a manual switch or a failover.
+
+### Changed
+
+- The active node is pinned at the top of the Nodes page on every page and under any filter, and is no longer repeated in the list below.
 
 ## v1.7.8 — 2026-11-09
 

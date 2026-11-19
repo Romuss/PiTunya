@@ -64,6 +64,14 @@ async def _record_boot_event_safe(service_name: str, exc: Exception) -> None:
         pass
 
 
+async def _reapply_limits() -> None:
+    """Put the saved container limits back a little after boot, once Docker
+    answers. Nothing is limited unless the operator set a limit."""
+    await asyncio.sleep(20)
+    from app.core.resource_limits import reapply_on_boot
+    await reapply_on_boot()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
@@ -131,8 +139,9 @@ async def lifespan(app: FastAPI):
     autocheck_scheduler.start()
     chain_drift_scheduler.start()
     domain_stats_scheduler.start()
-    from app.core.resource_limits import reapply_on_boot
-    await reapply_on_boot()
+    asyncio.create_task(_reapply_limits())
+    from app.core.updater import auto_check_loop
+    _update_check_task = asyncio.create_task(auto_check_loop())
 
     try:
         from app.core.xui_deployment import backfill as _backfill_xui_deployments
@@ -388,6 +397,7 @@ async def lifespan(app: FastAPI):
     logger.info("PiTun backend shutting down")
     from app.core.geo_scheduler import geo_scheduler
 
+    _update_check_task.cancel()
     health_checker.stop()
     subscription_scheduler.stop()
     circle_scheduler.stop()

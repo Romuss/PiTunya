@@ -37,6 +37,11 @@ async def _get_active_node(session) -> Optional[Node]:
 class CircleScheduler:
     def __init__(self) -> None:
         self._speed_tokens: dict[int, float] = {}
+        # node id -> (loop time until which a node that just failed its internet
+        # check is not probed again, whether its port still answered). A rotation
+        # would otherwise walk the same dead nodes first every time.
+        self._dead_until: dict[int, tuple[float, bool]] = {}
+        self._outcome: dict[int, str] = {}
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._next_rotate: dict[int, datetime] = {}
@@ -49,6 +54,24 @@ class CircleScheduler:
         # of the first. Per-circle (not global) so rotations of
         # different circles don't queue behind each other.
         self._rotate_locks: dict[int, asyncio.Lock] = {}
+
+    def _note(self, circle_id: int, text: str) -> None:
+        """What this rotation attempt decided, for `last_check_result`."""
+        self._outcome[circle_id] = text[:200]
+
+    async def _save_outcome(self, circle_id: int, rotated: bool) -> None:
+        text = self._outcome.pop(circle_id, None) or ("rotated" if rotated else "kept the current node")
+        try:
+            async with AsyncSession(get_async_engine()) as session:
+                circle = await session.get(NodeCircle, circle_id)
+                if circle is None:
+                    return
+                circle.last_checked = datetime.now(tz=timezone.utc)
+                circle.last_check_result = text
+                session.add(circle)
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 — bookkeeping only
+            logger.debug("NodeCircle %d: could not store the check outcome: %s", circle_id, exc)
 
     def _get_rotate_lock(self, circle_id: int) -> asyncio.Lock:
         lock = self._rotate_locks.get(circle_id)
@@ -181,6 +204,7 @@ class CircleScheduler:
     _SPEED_SLOW_MIN_S = 1800
     _SPEED_SLOW_MAX_S = 14400
     _HTTP_PROBE_EXTRA_DEADLINE_S = 30.0
+    _DEAD_MEMORY_S = 300.0
 
     @staticmethod
     async def _http_probe_enabled() -> bool:
@@ -193,7 +217,7 @@ class CircleScheduler:
     async def _speed_verdict(
         self, cand: dict, target_mbps: float, fresh_s: int, slow_s: int, *, allow_test: bool,
     ) -> tuple[str, Optional[float], bool]:
-        """("ok" | "slow" | "unknown", mbps, ran_a_test) for one candidate.
+        """("ok" | "slow" | "unknown" | "offline", mbps, ran_a_test) for one candidate.
 
         A good measurement younger than `fresh_s`, or a slow one younger than
         `slow_s`, is used as it is; an older one is replaced by a live test while
@@ -229,6 +253,9 @@ class CircleScheduler:
                 logger.warning("NodeCircle speed check of node %s failed: %s", cand.get("id"), exc)
                 return ("unknown", None, True)
             if mbps is None:
+                if result.get("reachable") is False:
+                    cand["_speed_err"] = str(result.get("error") or "")[:120]
+                    return ("offline", None, True)
                 return ("unknown", None, True)
             return ("ok" if float(mbps) >= target_mbps else "slow", float(mbps), True)
         if stored is not None:
@@ -252,6 +279,10 @@ class CircleScheduler:
         except Exception as exc:  # noqa: BLE001
             from app.core import error_log
             error_log.record("circle.http_probe", exc, node_id=node_id)
+            return True, ""
+        from app.core.speedtest import no_traffic_through_tunnel
+        if not res.get("ok") and not no_traffic_through_tunnel(res):
+            # The tunnel itself could not be built or started: not the node's fault.
             return True, ""
         return bool(res.get("ok")), str(res.get("detail") or "")
 
@@ -279,16 +310,31 @@ class CircleScheduler:
                     deadline += self._HTTP_PROBE_EXTRA_DEADLINE_S
             except Exception:  # noqa: BLE001 — never block a rotation on a settings read
                 pass
+            # A "best" circle with a speed target measures candidates, which takes
+            # far longer than a ping: without this room every rotation hit the
+            # deadline mid-measurement and was thrown away, so the circle never
+            # moved.
+            try:
+                async with AsyncSession(get_async_engine()) as _s:
+                    _c = await _s.get(NodeCircle, circle_id)
+                    if _c and _c.mode == "best" and (_c.min_speed_mbps or 0) > 0:
+                        deadline += self._SPEED_BUDGET_S + 60.0
+            except Exception:  # noqa: BLE001
+                pass
+            self._outcome.pop(circle_id, None)
             try:
                 async with asyncio.timeout(deadline):
-                    return await self._do_rotate(circle_id, from_scheduler)
+                    rotated = await self._do_rotate(circle_id, from_scheduler)
             except asyncio.TimeoutError:
                 logger.warning(
                     "NodeCircle %d: rotation exceeded %.0fs deadline — aborted, "
                     "will retry on next tick",
                     circle_id, deadline,
                 )
-                return False
+                self._note(circle_id, f"check took longer than {deadline:.0f}s, aborted")
+                rotated = False
+            await self._save_outcome(circle_id, rotated)
+            return rotated
 
     async def _do_rotate(self, circle_id: int, from_scheduler: bool = False) -> bool:
         """Pre-ping + rotate to first alive candidate.
@@ -380,7 +426,7 @@ class CircleScheduler:
             # churn off an active node that's still online and within budget.
             # Manual "rotate now" and failover pass from_scheduler=False and
             # always rotate. Untested latency (None) never blocks a rotation.
-            if from_scheduler and max_latency_ms > 0:
+            if from_scheduler and max_latency_ms > 0 and not getattr(circle, "rotate_when_healthy", False):
                 active = await _get_active_node(session)
                 if (active is not None and active.is_online
                         and active.latency_ms is not None
@@ -389,6 +435,7 @@ class CircleScheduler:
                         "NodeCircle %d: active node %d healthy (%dms <= %dms) — skip rotation",
                         circle_id, active.id, active.latency_ms, max_latency_ms,
                     )
+                    self._note(circle_id, f"kept '{active.name}': healthy ({active.latency_ms} ms)")
                     return False
 
             # Build candidate order: random/best collect all, sequential walks
@@ -445,6 +492,7 @@ class CircleScheduler:
 
         if not candidates:
             logger.warning("NodeCircle %d: no enabled candidates to rotate to", circle_id)
+            self._note(circle_id, "no enabled candidate passed the filters")
             return False
 
         # ── Phase 2: probe each candidate, take the first that's alive ───────
@@ -487,7 +535,17 @@ class CircleScheduler:
         slow: list[tuple[float, dict]] = []
         unmeasured: Optional[dict] = None
 
+        now_loop = asyncio.get_event_loop().time()
         for cand in candidates:
+            dead_until, port_answered = self._dead_until.get(cand["id"], (0.0, False))
+            if dead_until > now_loop:
+                # Failed its internet check a moment ago — not worth probing again.
+                # Only an HTTP-probe failure may serve as the TCP-only fallback,
+                # the same as when it is probed live; a dead speed test may not.
+                if port_answered and tcp_only is None:
+                    tcp_only = cand
+                failed.append((cand["name"], "failed its internet check recently"))
+                continue
             # Probe with single retry — `_probe_with_retry` catches
             # transient SYN drops / brief packet loss that would
             # otherwise mark a healthy node as dead and cost us a
@@ -501,6 +559,7 @@ class CircleScheduler:
                 http_probes_left -= 1
                 http_ok, http_detail = await self._http_probe(cand["id"])
                 if not http_ok:
+                    self._dead_until[cand["id"]] = (now_loop + self._DEAD_MEMORY_S, True)
                     if tcp_only is None:
                         tcp_only = cand
                     result = {
@@ -515,6 +574,14 @@ class CircleScheduler:
                 )
                 if ran:
                     speed_checks_left -= 1
+                if verdict == "offline":
+                    # The node could not carry traffic at all: it is dead, not
+                    # "unmeasured", so it must never become the fallback.
+                    self._dead_until[cand["id"]] = (now_loop + self._DEAD_MEMORY_S, False)
+                    result = {
+                        "is_online": False,
+                        "error": f"no internet through the node ({cand.pop('_speed_err', '') or 'speed test could not connect'})",
+                    }
                 if verdict == "slow":
                     slow.append((mbps or 0.0, cand))
                     logger.info(
@@ -622,6 +689,7 @@ class CircleScheduler:
                 entity_id=circle_id,
                 dedup_window_sec=300,
             )
+            self._note(circle_id, f"all {len(candidates)} candidates failed their checks, kept the current node")
             return False
 
         next_node_id = selected["id"]
@@ -683,6 +751,7 @@ class CircleScheduler:
         )
 
         await self._seamless_rotate(prev_node_id, next_node_id)
+        self._note(circle_id, f"rotated to '{next_node_name}'")
         return True
 
     async def _seamless_rotate(

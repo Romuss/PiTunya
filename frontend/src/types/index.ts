@@ -356,6 +356,33 @@ export interface ArpDevice {
 
 // ── Subscription ──────────────────────────────────────────────────────────────
 
+export interface DecodedLink {
+  kind: string
+  url: string
+  host: string
+  name?: string | null
+}
+
+export type LinkKeyKind = 'happ_crypt5' | 'happ_rsa' | 'v2raytun' | 'incy' | 'body_aes'
+
+export interface LinkKey {
+  id: string
+  kind: LinkKeyKind
+  name: string
+  fingerprint: string
+}
+
+export interface LinkKeyCreate {
+  kind: LinkKeyKind
+  name: string
+  value: string
+}
+
+export interface LinkKeyList {
+  custom: LinkKey[]
+  builtin: Record<LinkKeyKind, number>
+}
+
 export interface Subscription {
   id: number
   name: string
@@ -674,6 +701,15 @@ export interface DnsSettings {
   dns_query_strategy?: string
   /** Comma-separated IPv4 fallback resolvers for the box's OWN DNS. */
   host_fallback_dns?: string
+  /** "" = follow routing rules, "direct" = bypass proxy, "node-<id>" = via that node. */
+  dns_outbound?: string
+}
+
+export interface DnsTestNodeRequest {
+  domain: string
+  node_id: number
+  /** DoH URL or host; backend defaults to the configured upstream. */
+  server?: string
 }
 
 export interface DnsTestResult {
@@ -758,6 +794,11 @@ export interface NodeCircle {
   excluded_node_ids?: number[]
   current_index: number
   last_rotated?: string
+  /** Rotate on every scheduled tick, even when the active node is healthy. */
+  rotate_when_healthy?: boolean
+  /** When the scheduler last looked at the circle, and what it decided. */
+  last_checked?: string | null
+  last_check_result?: string | null
   current_node_name?: string
 }
 export type AutoCheckScope = 'all' | 'subscription' | 'group' | 'nodes'
@@ -778,7 +819,7 @@ export interface AutoCheck {
 
 export type AutoCheckUpdate = Partial<Pick<AutoCheck, 'enabled' | 'interval_minutes' | 'scope_kind' | 'scope_value'>>
 
-export type NodeCircleCreate = Omit<NodeCircle, 'id' | 'current_index' | 'last_rotated' | 'current_node_name'>
+export type NodeCircleCreate = Omit<NodeCircle, 'id' | 'current_index' | 'last_rotated' | 'current_node_name' | 'last_checked' | 'last_check_result'>
 export type NodeCircleUpdate = Partial<NodeCircleCreate>
 
 // ── Device Management ─────────────────────────────────────────────────────────

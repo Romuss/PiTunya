@@ -7,12 +7,13 @@ import type {
   RoutingRule, RoutingRuleCreate, RoutingRuleUpdate, ArpDevice,
   BulkRuleCreate, BulkRuleResult,
   Subscription, SubscriptionCreate, SubscriptionUpdate,
+  DecodedLink, LinkKey, LinkKeyCreate, LinkKeyList,
   UserAgentTemplate, UserAgentTemplateCreate, UserAgentTemplateUpdate,
   UserAgentTemplateImportResult,
   SystemStatus, SystemSettings, SystemVersions, ProxyMode,
   GeoDataStatus, GeoUpdateProgress,
   DecoyTemplate,
-  DnsRule, DnsRuleCreate, DnsRuleUpdate, DnsSettings, DnsTestResult,
+  DnsRule, DnsRuleCreate, DnsRuleUpdate, DnsSettings, DnsTestResult, DnsTestNodeRequest,
   DnsQueryLog, DnsQueryStats,
   HealthResult, SpeedTestResult,
   BalancerGroup, BalancerGroupCreate, BalancerGroupUpdate,
@@ -354,6 +355,19 @@ export const subsApi = {
 
   refresh: (id: number) =>
     http.post(`/subscriptions/${id}/refresh`).then(r => r.data),
+
+  /** Resolve a happ:// / v2raytun:// / incy:// link to its https URL. */
+  decodeLink: (link: string) =>
+    http.post<DecodedLink>('/subscriptions/decode-link', { link }).then(r => r.data),
+
+  linkKeys: () =>
+    http.get<LinkKeyList>('/subscriptions/link-keys').then(r => r.data),
+
+  addLinkKey: (data: LinkKeyCreate) =>
+    http.post<LinkKey>('/subscriptions/link-keys', data).then(r => r.data),
+
+  deleteLinkKey: (id: string) =>
+    http.delete(`/subscriptions/link-keys/${id}`),
 }
 
 // ── User-Agent templates ──────────────────────────────────────────────────────
@@ -506,6 +520,10 @@ export const dnsApi = {
 
   testViaXray: (domain: string) =>
     http.post<DnsTestResult>('/dns/test-xray', { domain }).then(r => r.data),
+
+  // Throwaway tunnel + DoH query: can take ~25 s on the backend.
+  testViaNode: (data: DnsTestNodeRequest) =>
+    http.post<DnsTestResult>('/dns/test-node', data, { timeout: 60_000 }).then(r => r.data),
 
   getQueryLogs: (params?: { domain?: string; limit?: number; offset?: number; cache_only?: boolean }) =>
     http.get<DnsQueryLog[]>('/dns/queries', { params }).then(r => r.data),
@@ -756,7 +774,18 @@ export interface UpdateStatus {
   request_pending: boolean
 }
 
+export interface UpdateAvailable {
+  current: string
+  latest: string | null
+  update_available: boolean
+  checked_at: string | null
+}
+
 export const updateApi = {
+  /** Cached result of the backend's daily check — no GitHub call. */
+  available: () =>
+    http.get<UpdateAvailable>('/system/update/available').then(r => r.data),
+
   check: (prerelease = false) =>
     http.get<UpdateCheckResult>('/system/update/check', { params: { prerelease } })
       .then(r => r.data),
